@@ -38,18 +38,22 @@ func TestEnvConfigUnsetVarExpandsToEmpty(t *testing.T) {
 	}
 }
 
-// TestEnvConfigNonStringPassThrough 非字符串值原样返回，不被 ExpandEnv 触碰
-// （数字里若含 $ 不应被误伤）。
+// TestEnvConfigNonStringPassThrough 非字符串值原样返回，既不被 ExpandEnv 触碰，
+// 也不被转成字符串。
 func TestEnvConfigNonStringPassThrough(t *testing.T) {
 	c, err := Resolve("local", Options{Path: "testdata/local.yaml"})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if got := c.GetString("service.name"); got != "test-svc" {
-		t.Fatalf("service.name = %q, want %q", got, "test-svc")
+	v := c.Get("service.port")
+	if v == nil {
+		t.Fatal("service.port = nil, want 8080")
 	}
-	if !c.IsSet("service.mode") {
-		t.Fatal("service.mode should be set")
+	if _, isStr := v.(string); isStr {
+		t.Fatalf("service.port = %T(%v), want non-string", v, v)
+	}
+	if got := c.GetInt("service.port"); got != 8080 {
+		t.Fatalf("GetInt(service.port) = %d, want 8080", got)
 	}
 }
 

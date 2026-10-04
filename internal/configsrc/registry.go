@@ -37,7 +37,7 @@ func Names() []string {
 	return out
 }
 
-// Resolve 按名选择加载器；Type 为空时用 local。
+// Resolve 按名选择加载器；name 为空时使用 local。
 func Resolve(name string, o Options) (configx.Config, error) {
 	if name == "" {
 		name = "local"

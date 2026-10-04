@@ -1,6 +1,7 @@
 service:
   name: test-svc
   mode: monolith
+  port: 8080
 xmiddleware:
   sqlx:
     driver: gorm
