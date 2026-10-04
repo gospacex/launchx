@@ -1,0 +1,9 @@
+service:
+  name: test-svc
+  mode: monolith
+xmiddleware:
+  sqlx:
+    driver: gorm
+    databases:
+      test-svc:
+        dsn: "order_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/order_db"
