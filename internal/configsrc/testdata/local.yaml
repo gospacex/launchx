@@ -2,6 +2,9 @@ service:
   name: test-svc
   mode: monolith
   port: 8080
+configcenter:
+  nacos:
+    server_addr: "127.0.0.1:1"
 xmiddleware:
   sqlx:
     driver: gorm
