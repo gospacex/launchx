@@ -368,20 +368,32 @@ bash examples/mesh/scripts/bring-up.sh check             # 前置检查
 ```bash
 export PATH=/usr/local/bin:$PATH
 minikube start --driver=docker --cpus=2 --memory=4096     # 宿主总内存仅 8GB，必须限额
-istioctl install --set profile=demo -y                    # 含 tracing 所需组件
-kubectl label namespace launchx-mesh istio-injection=enabled --overwrite
+# 必须用 operator 文件，不要用 --set：Istio 1.30 的 meshConfig.defaultConfig.tracing
+# 是**数组**，--set ...tracing.sampling=100 会让 istioctl 在 values.Map.SetPath 里 panic
+# （实测堆栈 operator/pkg/values/map.go:365）。采样率改由 Telemetry API 下发。
+istioctl install -y -f examples/mesh/istio-operator.yaml
+kubectl apply -f examples/mesh/namespace.yaml             # 带 istio-injection=enabled
 # 镜像：先在 hubx/ 仓库根构建（构建上下文必须是仓库根，见 §13.3 C-0），再
 minikube image load launchx-examples/gateway:dev          # 三服务各一次
 ```
 
 集群内访问宿主中间件用 **`host.minikube.internal`**（minikube 提供的宿主 DNS 名；`host.docker.internal` 是 Docker Desktop 容器内的写法，在 minikube 的 k8s 里**不保证解析**）——这一点由 `configs/*.yaml` 的地址副本体现，也是网格与微服配置的**唯一**差异来源。
 
-- **T10**：同一 trace 下同时有应用 span（`gateway`/`bff`/`srv`）与 sidecar span（形如 `gateway.launchx-mesh`），且应用 span 父子链仍为 gateway → bff → srv。查询时**两侧都要查**：`service=demo-gateway` 与 `service=demo-gateway.<namespace>`。
-- **T11**（反向断言）：只开 sidecar 追踪、应用侧不注册传播器 → 呈分裂形态：1 条 sidecar 链 + 应用侧各自孤儿 trace，**trace 数 ≥ 4**。这是网格特有的伪装——sidecar 自己串得很完整，但 app span 全脱落。
-- **E5**：`hubx.trace` OFF/ON 各跑一次，OFF 无业务 span、ON 有完整链路，结果可复现。
-- **T12**：证据落盘 `examples/mesh/docs/verify.md`，必须含 trace-id、span 总数、应用 span 数 vs sidecar span 数、sidecar 服务名、Jaeger API 原始响应片段、OFF/ON 对比、minikube/kubectl/istioctl/Istio 版本。
+- **T10** ✅ **PASS（2026-10-05 真机实测，证据 `examples/mesh/docs/verify.md` §1）**：同一 trace 下同时有应用 span（`demo-gateway`/`demo-bff`/`demo-srv`）与 sidecar span（`demo-gateway.launchx-mesh`、`demo-bff.launchx-mesh`），应用 span 父子链仍为 gateway → bff → srv。代表性 trace `8a728dcfe9b47cb29b7b83e348a4bc9e`：16 span（应用 12 / sidecar 4），单根，树深 13。查询时**两侧都要查**：`service=demo-gateway` 与 `service=demo-gateway.launchx-mesh`。
+  判据已可执行：`python3 scripts/trace-audit.py --service demo-gateway --lookback 2m --mesh`（追加 M1 共存 / M2 `component=proxy`+`upstream_cluster` 验真 / M3 覆盖 ≥2 跳）。
+- **T11**（反向断言）⏸ **SKIP**：详见 `docs/verify.md` §3。要点：launchx 的传播器**恒注册**（`telemetry.Init` 注释明确「传播器与是否采样无关」），关 `trace.enabled` 只让应用不产出 span、仍会透传 `traceparent`，得到的是「纯 sidecar 链」而非 T11 描述的「sidecar 链 + 应用孤儿 trace 并存」。**不可用 OFF 档冒充 T11**——那属于偷换判据。真要构造需一个显式标注的非同构变体（`propagator=none`），不在本轮范围。
+- **E5** ✅ **PASS**：`trace.enabled` OFF/ON 各跑一次。OFF 档 4 条 trace 全为 sidecar span、应用 span 数为 **0**；ON 档 15–16 span/trace（应用+sidecar 同 trace）。对比表见 `docs/verify.md` §2。
+- **T12** ✅ **PASS**：证据落盘 `examples/mesh/docs/verify.md`，含 trace-id、span 总数、应用 span 数 vs sidecar span 数、sidecar 服务名、Jaeger API 原始响应片段、OFF/ON 对比、minikube/kubectl/istioctl/Istio 版本。
 
-**待核（不凭记忆定稿）**：Istio 的 extensionProvider 必须选 `opentelemetry`（Envoy OTel tracer 走 W3C `traceparent`，与 launchx 的 `Composite{TraceContext, Baggage}` 对齐）；若用 `zipkin`/`jaeger` provider，Envoy 默认走 B3（`x-b3-*`）会直接断链。真机以 `istioctl proxy-config` + 实测请求头名确认。
+**已核实（不再是待核）**：Istio 的 extensionProvider 必须选 `opentelemetry`（Envoy OTel tracer 走 W3C `traceparent`，与 launchx 的 `Composite{TraceContext, Baggage}` 对齐）；`zipkin` provider 走 B3（`x-b3-*`）会与应用侧断成两条 trace。
+
+**T10 假阴性的三个独立成因（全部修掉才入链，详见 `docs/verify.md` §4）**：
+
+1. provider 目标必须是**集群内 Service**：直接写 `host.minikube.internal` 会被 istiod 拒（`could not find service ... in Istio service registry`）并静默不生成 OTLP cluster → 用无 selector Service + 手工 Endpoints 做宿主门面（`host-middleware.yaml`）。
+2. 采样率必须 100（`Telemetry` API 的 `randomSamplingPercentage`），否则「十次看不到一条」会被误读成断链。
+3. **最隐蔽的一条**：4317 端口名必须是 `grpc-` 前缀。写成 `otlp-grpc` 时 Istio 认不出协议 → cluster 只带 `use_downstream_protocol_config`，而 Envoy 自己的 OTLP 导出没有 downstream，回落 HTTP/1.1，gRPC 流被 reset。默认 warning 日志**看不见**，必须 `curl -X POST localhost:15000/logging?level=debug` 才报 `OTLP trace export failed ... protocol error`。
+
+**反向坑（别改）**：`demo-srv` 的 9013 端口名只能是 `tcp-rpc`。改成 `grpc-rpc` 会让 Istio 按 h2 解析 kitex 的 TTHeader → 网关直接 **502**（改回即 200）。代价是 9013 这一跳协议上就是 L4，没有 sidecar span、也交不出 L7 治理——这是协议事实，不是配置漏项。
 
 ## 12. 依赖面与同构（tasks 3.14 / 4.8）
 

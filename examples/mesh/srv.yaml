@@ -1,0 +1,84 @@
+# 网格形态 · srv（唯一深依赖中间件的一档）
+#
+# 注意 Kitex 的传输：rpcx 走默认 TTHeader over TCP（私有协议），
+# Istio 对未声明 HTTP 的端口按 TCP 处理（tcp_proxy）——所以
+#   * bff -> srv 这一跳**不会有 sidecar span**（Envoy 看不见请求）；
+#   * 该跳的 L7 治理（按请求重试/超时/熔断/灰度）也交不出去。
+# 这两条是同一根因，见 README「交不出去的 L7 治理」。
+#
+# 端口名写成 `tcp-rpc` 是**实测**结论，别改成 grpc-*：
+#   改 grpc-rpc 后 Istio 会为 9013 建 HTTP/2 的出/入向 listener，把 kitex 的
+#   TTHeader 当 h2 解析 → 网关直接 502（改回后立刻 200）。
+#   带 `tcp-` 前缀既显式声明 L4，也顺手消掉 istioctl analyze 的 IST0118 告警。
+#   代价就是 demo-srv 这一跳确实拿不到 sidecar span，T10 只认 gateway/bff 两跳
+#   —— 这是协议事实，不是配置漏了，验收报告里据实记。
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-srv
+  namespace: launchx-mesh
+spec:
+  selector:
+    app: demo-srv
+  ports:
+    - name: tcp-rpc
+      port: 9013
+      targetPort: 9013
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-srv
+  namespace: launchx-mesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-srv
+  template:
+    metadata:
+      labels:
+        app: demo-srv
+    spec:
+      containers:
+        - name: app
+          image: launchx-demo:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/demo-srv"]
+          ports:
+            - name: rpc
+              containerPort: 9013
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # strict.db=true：库连不上即退。跨主机名解析失败会直接 CrashLoop，
+            # 比「起来但落不了库」好排查得多。
+            - name: HUBX_DB_PW
+              value: hubx123
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: srv.yaml
+          livenessProbe:
+            tcpSocket:
+              port: 9013
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 9013
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: demo-configs

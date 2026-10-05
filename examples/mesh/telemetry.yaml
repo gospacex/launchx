@@ -1,0 +1,19 @@
+# =============================================================================
+# 采样率下发（Telemetry API，Istio 1.14+ 的推荐姿势）
+# -----------------------------------------------------------------------------
+# 放在 istio-system 命名空间且不带 selector → 对**全网格**生效。
+#
+# randomSamplingPercentage 必须给 100：Istio 默认采样率极低（历史上是 1%），
+# 人工验收时「十次请求看不到一条 sidecar span」几乎都是采样率没调，
+# 而不是链路断了 —— 这是 T10 最常见的假阴性来源。
+# =============================================================================
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: launchx-tracing
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: jaeger
+      randomSamplingPercentage: 100

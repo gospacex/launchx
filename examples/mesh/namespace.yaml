@@ -1,0 +1,9 @@
+# 网格案例独立命名空间 + sidecar 自动注入
+# istio-injection=enabled 是 T10「应用 span 与 sidecar span 同 trace」的前置：
+# 没有它，Pod 里根本不会有 istio-proxy 容器，也就没有 sidecar span。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: launchx-mesh
+  labels:
+    istio-injection: enabled

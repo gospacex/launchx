@@ -1,0 +1,75 @@
+# =============================================================================
+# 宿主中间件的集群内门面（无 selector 的 Service + 手工 Endpoints）
+# -----------------------------------------------------------------------------
+# 为什么需要这层：
+#   1. Istio 的 tracing extensionProvider **必须指向集群内的 Service**。
+#      直接写 host.minikube.internal 会被 istiod 拒绝，日志是：
+#        could not find service host.minikube.internal in Istio service registry
+#      → Envoy 侧根本不生成 OTLP cluster → 一条 sidecar span 都不会有（T10 假阴性）。
+#   2. 业务配置里统一写一个集群 DNS 名，比散落 host.minikube.internal 更好读，
+#      而且换宿主地址只需改这一处。
+#
+# Endpoints 的 IP = 从 minikube 视角看宿主的地址（本机实测 192.168.65.254）。
+# 换机器时用下面这条取，并由 bring-up.sh 自动替换：
+#   minikube ssh -- "getent hosts host.minikube.internal" | awk '{print $1}'
+#
+# 端口名必须是 `grpc-` 前缀（不要写成 otlp-grpc）：
+#   Istio 靠**端口名前缀**判定上游协议。写成 otlp-grpc 时它认不出来 → 落到
+#   默认 HTTP，cluster 只带 `use_downstream_protocol_config`，也就是「跟着下游
+#   走」。但 Envoy 自己的 OTLP 导出**没有下游**，于是回落 HTTP/1.1，gRPC 流被
+#   对端 reset，sidecar span 全丢，日志只有一句：
+#     OTLP trace export failed with status: Unavailable ...
+#     reset reason: protocol error{upstream_reset_before_response_started{protocol_error}}
+#   这条错误只在 `curl -X POST localhost:15000/logging?level=debug` 之后才可见
+#   （默认 warning 级别不打印），是最难查的一处。
+#   改名 grpc-otlp 后 Istio 会给该 cluster 打上 http2_protocol_options，导出打通。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: host-middleware
+  namespace: launchx-mesh
+spec:
+  # 刻意**不写 selector**：后端由下面的 Endpoints 手工指定（宿主不在 Pod 网络里）
+  ports:
+    - name: mysql
+      port: 3306
+      protocol: TCP
+    - name: redis
+      port: 6379
+      protocol: TCP
+    - name: kafka
+      port: 9092
+      protocol: TCP
+    - name: grpc-otlp
+      port: 4317
+      protocol: TCP
+      appProtocol: grpc # 双保险：即便 Istio 不认端口名前缀，appProtocol 也会强制 h2
+    - name: otlp-http
+      port: 4318
+      protocol: TCP
+    - name: consul-host
+      port: 8500
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: host-middleware
+  namespace: launchx-mesh
+subsets:
+  - addresses:
+      - ip: 192.168.65.254 # HOST_MW_IP，由 bring-up.sh 按实际环境替换
+    ports:
+      - name: mysql
+        port: 3306
+      - name: redis
+        port: 6379
+      - name: kafka
+        port: 9092
+      - name: grpc-otlp
+        port: 4317
+      - name: otlp-http
+        port: 4318
+      - name: consul-host
+        port: 8500

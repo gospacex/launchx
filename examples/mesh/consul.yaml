@@ -1,0 +1,68 @@
+# =============================================================================
+# consul 部署进集群（ACCEPTANCE §C-0c 推荐方案 A）
+# -----------------------------------------------------------------------------
+# 为什么不能继续用宿主 compose 里那台 consul：
+#   Pod 注册进去的自身地址是 **Pod IP（10.244.x.x）**，宿主 consul 做主动健康
+#   检查时打这个地址 —— 宿主根本路由不到 minikube 的内部 Pod 网络，于是全部
+#   实例被判不健康，发现侧（gateway→bff、bff→srv）永远拿不到实例，
+#   表现为「三个服务都活着，但链路一调用就 502」。
+#   把 consul 放进集群，健康检查源和目标都在同一张 Pod 网络里，问题消失。
+#
+# 副作用（已登记，不是 bug）：注册表从此有两份 —— 集群内这份是网格形态的事实
+# 来源，宿主那份只服务 micro 形态。两者不要同时被同一批服务写入。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: consul
+  namespace: launchx-mesh
+spec:
+  selector:
+    app: consul
+  ports:
+    - name: http
+      port: 8500
+      targetPort: 8500
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consul
+  namespace: launchx-mesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: consul
+  template:
+    metadata:
+      labels:
+        app: consul
+    spec:
+      containers:
+        - name: consul
+          # 与宿主 compose 同源同版本（华为云镜像站，国内可达）；
+          # 直连 docker.io 在本机网络下会 pull 超时。
+          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/hashicorp/consul:1.22.4
+          imagePullPolicy: IfNotPresent
+          args:
+            - agent
+            - -dev                 # 单节点开发模式：内存存储，重启即清空
+            - -client=0.0.0.0
+            - -bind=0.0.0.0
+            - -log-level=warn
+          ports:
+            - containerPort: 8500
+          readinessProbe:
+            httpGet:
+              path: /v1/status/leader
+              port: 8500
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi

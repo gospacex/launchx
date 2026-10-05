@@ -3,11 +3,13 @@
 # 端口/DSN/监听地址一律来自本文件，业务 Go 代码不出现任何硬编码地址
 # （同一份二进制与配置副本才能被网格直接复用）。
 #
-# 本 demo 不注册、不用 MQ：刻意**不出现** coordx / consul / mq 段。
+# 本 demo 不注册：刻意**不出现** coordx / consul 段（单体形态不注册，
+# 出现 deregister 日志即说明 mode 串档，见 ACCEPTANCE 陷阱 11）。
+#
 # 运行前导出库密码：export HUBX_DB_PW=hubx123
 
 service:
-  name: demo-monolith   # 服务名 = Jaeger 的 service，也是 dbx 实例名
+  name: demo-monolith   # 服务名 = Jaeger 的 service，也是各组件的实例名
   mode: monolith        # 四档之一：monolith / bff / srv / gateway
 
 webx:
@@ -18,12 +20,18 @@ webx:
   cors_origins: []
   health_prefix: /healthz
 
-# 调用链：全局闸 + 组件级开关。trace.on.db 是 T13 反向断言的唯一开关。
+# 调用链：全局闸 + 组件级开关。各 trace.on.* 既是 T13 反向断言的唯一开关，
+# 也是「能不能在 Jaeger 上看见这个外部依赖」的决定项 —— 关掉任一项，
+# 对应组件的 span 必须消失；关了还看得见，说明埋点没接进统一开关。
 trace:
   enabled: true
   endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
   on:
     db: true
+    cache: true
+    mq: true
+    search: true
+    mongodb: true
 
 logx:
   level: info
@@ -33,10 +41,23 @@ logx:
     endpoint: "127.0.0.1:4318"
 
 # 地基失败即退：db 连不上就启动失败，而不是降级成"起来但落不了库"。
+# 其余组件不设 strict —— 它们缺失时须带病运行（降级 Warn + 进程不退出），
+# 见 ACCEPTANCE §10 降级路径。
 strict:
   db: true
 
+# demo 自身的业务参数（非地址类，但同样不写死在代码里）。
+# 只放「会随环境或演示意图调整」的项：令牌、窗口、索引名、集合名、TTL。
+demo:
+  auth_token: "demo-token"          # 演示用静态令牌，经缓存校验（middleware.auth 的外部依赖）
+  rate_limit_per_min: 300           # 单 IP 每窗口上限（宽松，压测不会误伤）
+  cache_ttl: 60s                    # 订单缓存有效期
+  order_index: "orders"             # ES 索引名
+  snapshot_collection: "order_snapshots"  # Mongo 集合名
+
 xmiddleware:
+
+  # ----- sqlx：私有库 order_db（账号 order_rw）-----
   sqlx:
     driver: gorm
     databases:
@@ -48,3 +69,47 @@ xmiddleware:
         conn_max_idle_time: 1m
         tracing:
           enabled: true
+
+  # ----- cachex：订单缓存 + 鉴权令牌 + 限流计数 -----
+  # 用途三合一，每种用途都会各产一个 span，Jaeger 上按 operationName 可区分。
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      demo-monolith:
+        addr: "127.0.0.1:6379"
+        db: 0
+        pool_size: 50
+
+  # ----- mqx：下单事件投递（topic order.completed.v1）-----
+  mqx:
+    driver: kafka
+    instances:
+      demo-monolith:
+        brokers:
+          - "127.0.0.1:9092"   # 本机 compose 现行端口（**不**用 srv-order 旧端口 19093）
+        enable_trace: true
+        producer:
+          topic: order.completed.v1
+          batch_size: 100
+          batch_timeout: 10ms
+          # acks=all：sarama RequiredAcks -1 = WaitForAll
+          required_acks: -1
+
+  # ----- searchx：订单检索（ES 索引见 demo.order_index）-----
+  searchx:
+    driver: elasticsearch
+    address:
+      - "http://127.0.0.1:9200"
+    enable_trace: true
+
+  # ----- mongodbx：订单快照（集合见 demo.snapshot_collection）-----
+  # 注意：mongodbx 没有实例级 enable_trace，Config 字段也没有 mapstructure tag，
+  # 故地址类键只能用 uri / database / driver（蛇形键会被静默丢弃）。
+  mongodbx:
+    instances:
+      demo-monolith:
+        driver: mongodb
+        uri: "mongodb://127.0.0.1:27018"
+        database: order_demo
+        max_pool_size: 50

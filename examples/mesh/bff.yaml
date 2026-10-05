@@ -1,0 +1,71 @@
+# 网格形态 · bff
+#
+# POD_IP 经 Downward API 注入，配置里以 ${POD_IP} 引用（configsrc 会做
+# os.ExpandEnv）—— 这是「自身注册地址配置化」（P3）的落地方式：
+# 没有它，注册进 consul 的地址只能是 127.0.0.1，gateway 发现到的实例不可达。
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-bff
+  namespace: launchx-mesh
+spec:
+  selector:
+    app: demo-bff
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-bff
+  namespace: launchx-mesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-bff
+  template:
+    metadata:
+      labels:
+        app: demo-bff
+    spec:
+      containers:
+        - name: app
+          image: launchx-demo:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/demo-bff"]
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: bff.yaml
+          livenessProbe:
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: demo-configs

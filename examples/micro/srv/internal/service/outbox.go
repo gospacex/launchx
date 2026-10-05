@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gospacex/dbx/orm"
 	"github.com/gospacex/logx"
 	"github.com/gospacex/mqx"
 
@@ -120,7 +121,11 @@ func (r *OutboxRunner) flushOnce() {
 // MarkOutboxSent 先推走，Abandon 的 status 守卫让误判看不出痕迹），也捞不到
 // 日志（logx 不暴露 writer 注入）。没有返回值就只能靠读 stdout 才能验证。
 func (r *OutboxRunner) flushOnceResult() []uint64 {
-	ctx := context.Background()
+	// 空转轮询用免追踪 ctx：轮询查询没有上游请求，若产 span 会每 3s 另起一根
+	// 孤儿单 span trace（db.query），Jaeger 列表被噪声淹没，真实请求的 trace
+	// 反而翻不到。只有真拉到待发事件时才换回可追踪 ctx，让本轮补发工作
+	// （投递 / 标记 / 重试）以一个批次根 trace 入链，保留可观测性。
+	ctx := orm.WithoutTracing(context.Background())
 	pending, err := r.repo.PendingOutbox(ctx, outboxBatchLimit)
 	if err != nil {
 		r.logger.ErrorContext(ctx, "outbox: list pending failed", logx.Err(err))
@@ -129,6 +134,7 @@ func (r *OutboxRunner) flushOnceResult() []uint64 {
 	if len(pending) == 0 {
 		return nil
 	}
+	ctx = context.Background()
 	sent, retried := []uint64{}, []uint64{}
 	var failed []repository.OutboxEvent
 	for i := range pending {

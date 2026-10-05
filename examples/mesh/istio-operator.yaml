@@ -1,0 +1,50 @@
+# =============================================================================
+# Istio 安装参数（`istioctl install -y -f istio-operator.yaml`）
+# -----------------------------------------------------------------------------
+# 为什么用 operator 文件而不是 `--set`：
+#   Istio 1.30 的 `meshConfig.defaultConfig.tracing` 是**数组**（EnvoyTracing），
+#   而 `--set meshConfig.defaultConfig.tracing.sampling=100` 是按 map 语义写路径，
+#   两者冲突会让 istioctl 在 values.Map.SetPath 里直接 panic（实测堆栈指向
+#   operator/pkg/values/map.go:365）。采样率改由 Telemetry API 下发（telemetry.yaml）。
+#
+# provider 必须是 opentelemetry：
+#   Envoy 的 OTel tracer 走 W3C `traceparent`，与 launchx 的
+#   Composite{TraceContext, Baggage} 同源；若选 zipkin provider，Envoy 默认发
+#   B3 头（x-b3-traceid），两边头名不互通 → sidecar span 与应用 span 必然分成
+#   两条 trace，T10 直接失败。
+#
+# service 指向 host-middleware.launchx-mesh.svc.cluster.local：
+#   Jaeger 跑在**宿主**的 compose 里（4317 OTLP gRPC），不在集群内。但 istiod
+#   **只接受集群内 Service 作为 tracing provider 目标** —— 直接写
+#   host.minikube.internal 会在 istiod 日志里报
+#     `could not find service host.minikube.internal in Istio service registry`
+#   并且静默不生成 Envoy 的 OTLP cluster，一条 sidecar span 都不会有。
+#   故先用无 selector 的 Service+Endpoints（host-middleware.yaml）把宿主
+#   「搬进」集群视图，再让 provider 指向它。
+# =============================================================================
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: launchx-mesh
+  namespace: istio-system
+spec:
+  # demo profile：含 istiod + ingressgateway + egressgateway，资源占用最小，
+  # 适配 2C4G 的 minikube。
+  profile: demo
+  meshConfig:
+    enableTracing: true
+    extensionProviders:
+      - name: jaeger
+        opentelemetry:
+          service: host-middleware.launchx-mesh.svc.cluster.local
+          port: 4317
+  values:
+    global:
+      proxy:
+        # 必须开：istio-proxy 的 iptables 规则在容器启动前就已生效，但 Envoy 还在
+        # 初始化；此时应用容器若抢先发出向请求（注册 consul、连 mysql），会被
+        # Envoy 直接拒绝，日志里是一句极具误导性的
+        #   `dial tcp <ClusterIP>:8500: connect: connection refused`
+        # —— 中间件明明活着，却像是「注册中心挂了」。
+        # 开了这个开关，应用容器会等 sidecar ready 之后再启动。
+        holdApplicationUntilProxyStarts: true
