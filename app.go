@@ -133,9 +133,56 @@ func (a *App) MQ() mqx.Producer {
 	return v
 }
 
-// Registry 返回服务注册句柄。
+// registryHandle 把「注册」与「发现」两个 coordx 句柄合成一个返回给业务。
+//
+// 为什么需要这层包装：coordx 把注册与发现拆成两个接口（Register / Discover），
+// 而 HTTP 网关拿到的是 App.Registry()，它需要按服务名解析上游实例 —— 注册句柄
+// 本身不含 Discovery。早先这里只返回注册句柄，网关的类型断言失败后静默落到
+// 配置里的静态兜底地址，于是「网关经注册中心发现上游」这条路**从未真正生效**：
+// micro 形态被 `service.upstream.<name>` 的 127.0.0.1 兜底掩盖了，网格形态把兜底
+// 留空（上游地址只留一个来源）才暴露成 502。
+// 注意：**不能**用内嵌 coordx.Register 来继承方法 —— 内嵌字段名恰好是
+// `Register`，与接口方法 `Register` 同名，Go 会判定 `h.Register` 是字段而非
+// 方法，方法提升被抑制，类型也就不再实现该接口。故这里逐方法显式转发。
+type registryHandle struct {
+	reg  coordx.Register
+	disc coordx.Discover
+}
+
+func (h registryHandle) Register(ctx context.Context, service string, inst *coordx.ServiceInstance) error {
+	return h.reg.Register(ctx, service, inst)
+}
+
+func (h registryHandle) Deregister(ctx context.Context, service string, inst *coordx.ServiceInstance) error {
+	return h.reg.Deregister(ctx, service, inst)
+}
+
+func (h registryHandle) HealthCheck() error { return h.reg.HealthCheck() }
+
+func (h registryHandle) Close() error { return h.reg.Close() }
+
+// Discovery 实现业务侧（网关反代）所需的发现能力。
+func (h registryHandle) Discovery(ctx context.Context, service string) ([]*coordx.ServiceInstance, error) {
+	if h.disc == nil {
+		return nil, errors.New("launchx: discovery is unavailable (registry component built without a discover handle)")
+	}
+	return h.disc.Discovery(ctx, service)
+}
+
+// Registry 返回服务注册句柄；注册中心可用时，返回值同时具备发现能力
+// （断言 Discovery(ctx, service) 即可，网关反代就是这么用的）。
 func (a *App) Registry() coordx.Register {
 	v, _ := a.compProduct(func(c *component.Env) any { return c.Registry }).(coordx.Register)
+	if v == nil {
+		return nil
+	}
+	disc, _ := a.compProduct(func(c *component.Env) any { return c.Discover }).(coordx.Discover)
+	return registryHandle{reg: v, disc: disc}
+}
+
+// Discover 返回服务发现句柄（注册中心未装配或发现器构造失败时为 nil）。
+func (a *App) Discover() coordx.Discover {
+	v, _ := a.compProduct(func(c *component.Env) any { return c.Discover }).(coordx.Discover)
 	return v
 }
 

@@ -15,14 +15,19 @@ type mongoSection struct {
 
 // buildMongo 构造文档数据库组件（yaml 段：xmiddleware.mongodbx）。
 //
-// mongodbx 的调用链开关是**全局**的（mongodbx/tracing.go），没有实例级
-// enable_trace；因此这里只用 presence + trace.on.mongodb 决定是否构造后的入链，
-// 不往 Config 上写不存在的字段。
+// moongodbx 的调用链开关是**全局**的（mongodbx/tracing.go，默认是关的，
+// 不显式打开连一个 span 都不会产）：实例级 enable_trace 不存在，必须经
+// SetTracingConfig 写入全局，由 trace.on.mongodb 裁决。
+//
+// 顺带接住 MapToStruct 填不进去的开关：Config 字段没有 mapstructure tag，
+// enable_trace 这种蛇形键会被静默丢弃（比字段名拼错更难发现）。
 func buildMongo(env *Env) error {
 	key := pickSection(env.Cfg, "xmiddleware.mongodbx", "mongodbx")
 	if key == "" {
 		return nil
 	}
+	wantTrace := traceOn(env, "mongodb")
+	mongodbx.SetTracingConfig(mongodbx.TracingConfig{Enabled: wantTrace})
 	var sec mongoSection
 	if err := env.Cfg.Unmarshal(key, &sec); err != nil {
 		return degrade(env, "mongodb", ConsequenceMongo, err)
@@ -40,6 +45,7 @@ func buildMongo(env *Env) error {
 		if inst.Database == "" {
 			inst.Database = env.ServiceName
 		}
+		inst.EnableTrace = wantTrace // 实例级与主开关保持一致，避免两处开关互相打架
 		cfgs = append(cfgs, &inst)
 	}
 	instances, err := mongodbx.New(cfgs)

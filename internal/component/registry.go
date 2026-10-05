@@ -38,10 +38,14 @@ type Env struct {
 
 	// DB 是 *gorm.DB。此处刻意用 any：launchx 库自身不直接依赖 gorm，
 	// 调用方按需断言（保持"业务经 launchx 取句柄、不直引驱动"的依赖面）。
-	DB       any
-	Cache    cachex.Instances
-	MQ       mqx.Producer
+	DB    any
+	Cache cachex.Instances
+	MQ    mqx.Producer
+	// Registry 注册句柄；Discover 发现句柄。coordx 把「注册」与「发现」拆成两个
+	// 接口，而 HTTP 网关（按服务名解析上游实例）和 RPC 客户端都要用发现侧，
+	// 故两个都留。降级或未配段时为零值。
 	Registry coordx.Register
+	Discover coordx.Discover
 	Search   searchx.SearchClient
 	Mongo    mongodbx.Instances
 

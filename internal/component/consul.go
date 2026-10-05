@@ -1,8 +1,11 @@
 package component
 
 import (
+	"context"
+
 	"github.com/gospacex/coordx"
 	_ "github.com/gospacex/coordx/consul" // 注册 consul 驱动（blank import）
+	"github.com/gospacex/logx"
 )
 
 func init() { Register("registry", buildRegistry) }
@@ -45,6 +48,22 @@ func buildRegistry(env *Env) error {
 	env.Registry = reg
 	env.AddStop("registry", func() error {
 		reg.Close()
+		return nil
+	})
+
+	// 发现句柄：与注册同源配置。**这一步不能省** —— 网关（HTTP 反代）要按
+	// 服务名解析上游实例，靠的就是它；没有它，业务只能退化成配置里写死地址。
+	// 建不出来只记录告警，不按 strict 裁决：注册能力仍在，发现侧退化为兜底地址。
+	disc, derr := coordx.NewDiscover(cfg)
+	if derr != nil {
+		env.Logger.WarnContext(context.Background(),
+			"launchx: discover init failed, upstream discovery falls back to static address",
+			logx.Err(derr))
+		return nil
+	}
+	env.Discover = disc
+	env.AddStop("registry.discover", func() error {
+		disc.Close()
 		return nil
 	})
 	return nil
