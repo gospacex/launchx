@@ -59,4 +59,5 @@
 - [ ] 4.8 代码断言：全仓无网格专属 trace 分支，`mode` 枚举无 `mesh` 取值；`examples/mesh` 与 `examples/micro` 三服务 main.go 差异仅在配置路径与地址副本（验收案例 T8）
 - [ ] 4.9 集成（网格）：minikube + Istio 就绪、sidecar 追踪 100% 采样并绑定 OTLP provider 后，触发 `gateway → bff → srv` 全链路，Jaeger 同一 trace 下同时存在应用 span（`gateway`/`bff`/`srv`）与 sidecar span（`<workload>.<ns>`），且应用 span 父子链仍为 gateway → bff → srv、srv 数据层 span 同 trace（验收案例 T10）
 - [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）
+- [ ] 4.12 调用链完整性（验收案例 T13）：(a) 分层完整——根 span 为路由入口、树深 ≥3、handler/service/repository 各层至少 1 span；(b) 中间件入链矩阵逐行核对，具备外部依赖的中间件全部有 span，豁免项写明理由，未列入矩阵视为缺失；(c) CRUD 与连表逐条入链——`db.query.text` 非空 span 数 == 实际执行 SQL 条数、JOIN 语句 text 含 join、INSERT/SELECT/UPDATE/DELETE 四类各至少一条；(d) 反向断言——关闭任一埋点（如 `trace.on.db=false`）后完整性检查 MUST 失败
 - [ ] 4.11 证据落盘（网格）：`examples/mesh/docs/verify.md` 记录 trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始响应片段 / `hubx.trace` OFF-ON 对比 / minikube-kubectl-istioctl-Istio 版本（验收案例 T12）

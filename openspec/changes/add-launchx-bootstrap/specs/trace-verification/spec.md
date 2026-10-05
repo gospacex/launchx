@@ -129,3 +129,21 @@ Span 导出 MUST 在退出序列中完成冲刷（反序退出链的 `tracing.Sh
 - **AND** span 树中无缺失的尾部节点（证明退出冲刷生效）
 
 网格形态复用同一观测端（Jaeger `16686`）与同一 API 断言方式，但服务名按 T10 同时含应用名与 sidecar 名，查询时 MUST 两者都查（应用侧查 `service=gateway`，sidecar 侧查 `service=gateway.<namespace>`）。
+
+### Requirement: 调用链完整性（分层与中间件全覆盖）
+
+一次请求的调用链 SHALL 覆盖其执行的**每一层**，不得出现「链路存在但中间某一层被跳过」的空洞：路由入口（HTTP 根 span）、业务分层（handler → service → repository 各层至少各一个 span）、数据访问（**每一条** SQL 一个 span）、以及所有**具备外部依赖的中间件**（缓存、限流、鉴权、RPC 客户端、消息投递）。
+
+仅含进程内控制流、无外部调用的中间件（如 CORS 响应头设置、recover 兜底）可豁免，但 MUST 在「中间件入链矩阵」中逐条列出并写明豁免理由；**未列入矩阵的中间件视为埋点缺失**，MUST NOT 以"默认不需要"为由静默略过。
+
+各中间件自身执行的 CRUD 操作 SHALL 入链：缓存的 get/set/del、消息的 produce/consume、检索与文档库的读写，每一操作对应一个 span 且带操作标识属性。
+
+连表（JOIN）与多表事务中的**每一条** SQL SHALL 各自成 span，MUST NOT 合并为一个 span 或省略其中任一条；`db.query.text` MUST 为完整可执行语句，MUST NOT 为空值或模板占位符。CRUD 四类（INSERT / SELECT / UPDATE / DELETE）SHALL 各自至少有一条 span。
+
+#### Scenario: 验收案例 T13 — 调用链完整性（三层判据）
+
+- **WHEN** 触发一次完整业务请求（单体走单表与连表查询；微服走 gateway → bff → srv → 数据层）
+- **THEN** 分层完整：根 span 为路由入口，调用树深度 ≥ 3，handler / service / repository 各层至少 1 个 span
+- **AND** 中间件全覆盖：中间件入链矩阵逐行核对，具备外部依赖的中间件全部有 span，豁免项均有理由
+- **AND** CRUD 与连表逐条入链：`db.query.text` 非空的 span 数 **等于** 该请求实际执行的 SQL 条数；JOIN 语句的 `db.query.text` 含 `join`；INSERT / SELECT / UPDATE / DELETE 四类各至少一条
+- **AND** 反向断言成立：将任一处埋点关闭（如 `trace.on.db=false`）后重跑，完整性检查 MUST 失败（否则该检查为空壳）

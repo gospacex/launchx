@@ -169,6 +169,72 @@ go test ./... -run 'TestInject|TestPropagator|TestNoTelemetry' -v               
 
 判定：两项都补齐且反向断言确实「提取失败」→ T1/T7 PASS。**反向断言若也能提取到，说明用例是空壳 → FAIL。** 当前只有 Fields 断言时，T1 记为「部分覆盖」，不得记 PASS。
 
+## 9b. T13 — 调用链完整性（分层 / 中间件矩阵 / CRUD 与连表逐条）
+
+**为什么单列一条**：前面 T2–T6 判的是「有没有链路」，T13 判的是「链路里有没有空洞」——链路能画通但某层被跳过（比如 repository 层没埋点、连表那条 SQL 没成 span）是当前最容易蒙混过关的形态。
+
+### 9b.1 分层完整性
+
+```bash
+TRACE=$(curl -s "http://127.0.0.1:16686/api/traces?service=monolith&limit=1" | jq -r '.data[0].traceID')
+curl -s "http://127.0.0.1:16686/api/traces/$TRACE" > /tmp/t.json
+
+# 根 span 必须唯一（路由入口），且总 span 数不低于预期下限
+jq '[.data[0].spans[] | select((.references // []) | length == 0)] | length' /tmp/t.json   # == 1
+jq '[.data[0].spans[]] | length' /tmp/t.json                                              # >= 预期下限
+```
+
+判据：根 span **恰好 1 个**且为 HTTP 入口（operationName 为 HTTP 方法/路径形态）；`handler / service / repository` 三层各至少 1 个 span；树深 ≥ 3。
+
+**预期 span 清单（golden）**：demo 实现后从真机 trace 提取并固化到本节下方表格；**未固化前本项记 SKIP**（不许凭想象填一串名字然后打勾）。
+
+### 9b.2 中间件入链矩阵（逐行核对，未列出即缺失）
+
+| 中间件 / 切面 | 位置 | 是否入链 | 依据或豁免理由 |
+|---|---|---|---|
+| otel（HTTP 入口） | `webx/middleware/otel.go` | ✅ 必须 | 根 span 来源，Extract 入站 traceparent |
+| DB 访问 | `dbx/orm` gorm 插件 | ✅ 必须 | `db.query.text` 携带完整 SQL |
+| 缓存 | `cachex` | ✅ 必须 | 有外部依赖，否则穿透不可见 |
+| 消息 | `mqx` | ✅ 必须 | produce / consume 各一 span |
+| 检索 | `searchx` | ✅ 必须 | 外部依赖 |
+| 文档库 | `mongodbx` | ✅ 必须 | 外部依赖 |
+| RPC 客户端 | `rpcx` ClientSpanMiddleware | ✅ 必须 | 跨进程续链，缺则断成两棵子树 |
+| 鉴权 | 业务 middleware | ✅ 必须 | 有外部依赖（缓存 / DB 查凭据） |
+| 限流 | 业务 middleware | ✅ 必须 | 依赖缓存计数 |
+| recover 兜底 | `webx` | ⚠️ 可豁免 | 纯控制流、无外部调用——**必须在理由列写明** |
+| CORS 响应头 | `webx` | ⚠️ 可豁免 | 仅设置响应头——**必须在理由列写明** |
+
+判定：矩阵中「必须」项全部有 span；「可豁免」项**必须写明理由**，空白理由视为缺失。矩阵覆盖不全（实际启用却未列入）→ FAIL。
+
+### 9b.3 CRUD 与连表逐条入链
+
+```bash
+SQLS='[.data[0].spans[].attributes[]? | select(.key=="db.query.text") | (.value|tostring)]'
+
+# 1) 带完整 SQL 的 span 数（应等于该请求实际执行的 SQL 条数）
+jq "$SQLS | length" /tmp/t.json
+# 2) 空值 / 占位符必须为 0
+jq "$SQLS | map(select(. == \"\" or (ascii_downcase|test(\"placeholder|\\\\?\\\\?\\\\?\")))) | length" /tmp/t.json   # == 0
+# 3) 连表语句必须含 join，且每条 JOIN 各自成 span（不得合并）
+jq "$SQLS | map(select(ascii_downcase|test(\"join\"))) | length" /tmp/t.json                                        # >= 1
+# 4) 四类 CRUD 各至少一条
+for op in insert select update delete; do
+  printf "%-7s %s\n" "$op" "$(jq "$SQLS | map(select(ascii_downcase|test(\"^\\\\s*$op\"))) | length" /tmp/t.json)"
+done
+```
+
+判定：`db.query.text` 非空 span 数 **==** 实际 SQL 条数（不是 ≥，多了说明重复埋点，少了说明漏埋）；JOIN 语句的 text 含 `join`；INSERT / SELECT / UPDATE / DELETE 四类各 ≥ 1；事务中的多条 SQL **各自成 span**，合并成一条即 FAIL。
+
+### 9b.4 反向断言（防空壳，必做）
+
+```bash
+# 关闭 db 埋点后重跑同一请求，完整性检查必须失败
+sed -i '' 's/trace.on.db: true/trace.on.db: false/' examples/monolith/config.yaml
+# ... 重跑并重新执行 9b.3 的判据 ...
+```
+
+判定：关闭后 `db.query.text` span 数必须为 0，即完整性检查**必须报错**。若关闭前后都"通过"，说明检查是空壳 → FAIL。测完必须还原配置。
+
 ## 10. 降级路径（tasks 3.9）
 
 | 场景 | 步骤 | 判定 |
@@ -787,6 +853,7 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 | T8 | 网格无专属分支 | §12 | | grep/diff 输出 |
 | T9 | 尾部 span 不缺 | §8 | | `/tmp/trace.json` |
 | T10/T11/T12 | 网格链路 | §11b / §13.3 | | `examples/mesh/docs/verify.md` |
+| T13 | 调用链完整性（分层/中间件矩阵/CRUD 连表） | §9b | | `/tmp/t.json` + jq 输出 |
 | 3.14 | 依赖面 | §2/§12 | | grep 输出 |
 | A | 单体案例（目录树/链路/可观测） | §13.1 | | `/tmp/monolith.log` + `/tmp/trace.json` |
 | B | 微服案例（三进程/三段链/ consul） | §13.2 | | consul 实例数 + `/tmp/trace.json` |
