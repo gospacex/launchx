@@ -15,12 +15,15 @@ type mongoSection struct {
 
 // buildMongo 构造文档数据库组件（yaml 段：xmiddleware.mongodbx）。
 //
-// moongodbx 的调用链开关是**全局**的（mongodbx/tracing.go，默认是关的，
-// 不显式打开连一个 span 都不会产）：实例级 enable_trace 不存在，必须经
-// SetTracingConfig 写入全局，由 trace.on.mongodb 裁决。
-//
-// 顺带接住 MapToStruct 填不进去的开关：Config 字段没有 mapstructure tag，
-// enable_trace 这种蛇形键会被静默丢弃（比字段名拼错更难发现）。
+// 开关口径（2026-10-05 复核，别再按旧注释理解）：
+//   - mongodbx **有**实例级 EnableTrace（interface.go 的 traceflag.Apply +
+//     mongodb.go 的 traceflag.NewTracer），span 判定读的是 cfg.EnableTrace，
+//     故下面第 48 行的赋值才是真正生效的那一下；
+//   - mongodbx/tracing.go 的 SetTracingConfig / IsTracingEnabled 目前**全库无调用者**
+//     （死开关），这里仍调一次只为对齐 cachex 的姿态，别指望它开埋点；
+//   - 顺带接住 MapToStruct 填不进去的开关：Config 字段没有 mapstructure tag，
+//     enable_trace 这种蛇形键会被静默丢弃（比字段名拼错更难发现），
+//     所以统一由 trace.on.mongodb 裁决后显式写回实例级。
 func buildMongo(env *Env) error {
 	key := pickSection(env.Cfg, "xmiddleware.mongodbx", "mongodbx")
 	if key == "" {

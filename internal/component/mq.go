@@ -14,6 +14,18 @@ func init() { Register("mq", buildMQ) }
 // 红线：trace.on.mq=false **不阻止** producer 的构造，只是不产 span。
 // 历史 bug 把该开关当构造开关，producer 变 nil，outbox 静默堆积到
 // retry_count=10 才放弃（"消息没发出去但没人报错"）。
+//
+// 已知偏差（2026-10-05 审计，修在 mqx 侧，别在 launchx 里绕）：
+// mqx 的驱动 span 是**无条件**产生的 —— kafka.go 的 Send 直接
+// `p.tracer.Start(ctx, "messaging.kafka.send")`，外面没有 EnableTrace 包裹，
+// callchain.go 里的 span 同理。也就是说：
+//   - trace.enabled=false（全局）→ provider 是 noop，span 自然不导出；
+//   - 但只把 trace.on.mq 置 false、全局仍开 → 开关只压住 EnableTrace /
+//     CallChainEnabled 两个字段（它们只管日志与内存调用链条目），
+//     span 照产照报。
+//
+// 这条违反「trace.on.* 只控入链」的红线，定性为 mqx 缺陷；launchx 侧
+// 无法拦截（span 在 SDK 内部产生），只能如实记录。
 func buildMQ(env *Env) error {
 	if pickSection(env.Cfg, "xmiddleware.mqx") == "" {
 		return nil
