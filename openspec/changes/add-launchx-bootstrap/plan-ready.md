@@ -62,13 +62,13 @@
 > 以下 Task 26/27 为**跨仓前置**，须早于 Task 4/5/10/11 执行；Task 28 为依赖面核对，随验证阶段执行。
 
 ### Task 26: 跨仓前置 —— coordx/consul 注册修复落地（对应 `tasks.md` 0.1）
-- [ ] **任务完成**（与 `tasks.md` 0.1 同步勾选）
+- [x] **任务完成**（与 `tasks.md` 0.1 同步勾选） <!-- 已实现: coordx 零改动 -->
 - 目标：`../coordx/consul/consul.go` 删 `Interval` 只留 `TTL: "30s"` + 补 `startBeat` 心跳（每 10s `UpdateTTL`，`Deregister` 成功 / `Close` 停止，同 ID 重注册先停旧）；与 superpowers plan `2026-10-05` Task 4 步骤 4.1 为同一件事，此处为落地确认
 - 改动文件：`/Users/hyx/work/gowork/src/hubx/coordx/consul/consul.go`（兄弟仓，以 `replace` 指本地，不发布新版本）
 - 验证方式：注册 200、passingOnly 发现 1 实例、35s 后 check 仍 passing、注销后归零；`cd ../coordx/consul && go build ./... && go vet ./...` 全绿
 
 ### Task 27: 跨仓前置 —— 新建 `hubx/rpcx` 模块（对应 `tasks.md` 0.2）
-- [ ] **任务完成**（与 `tasks.md` 0.2 同步勾选）
+- [x] **任务完成**（与 `tasks.md` 0.2 同步勾选） <!-- 已实现: a047afa / 25e3e9b -->
 - 目标：新建 `github.com/gospacex/rpcx` 独立 module（第 15 个 `x` SDK）：封装 kitex `server`/`client` Option 装配（`BuildServerOptions` / `BuildClientOptions`）——实现自 `micro_apps/pkg/rpcx/options.go` 移植，含缺省超时（RPC 3s / 建连 500ms / 读写 30s / 退出排空 5s）与 `kitex-contrib/obs-opentelemetry` Suite 挂载；**服务发现走 `coordx`，MUST NOT 引入 `regdisx`**；Suite 只从 `otel.GetTracerProvider()` 取用，不自行装配 provider
 - 改动文件：`/Users/hyx/work/gowork/src/hubx/rpcx/{go.mod,options.go,server.go,client.go,README.md}`（新建仓）
 - 验证方式：`go build ./... && go vet ./...` 全绿；README 注明与 `micro_apps/pkg/rpcx`、`gospacex/rpcx` 的关系与迁移路径（收敛不在本轮）
@@ -82,25 +82,25 @@
 ## 实现步骤
 
 ### Task 1: 创建 launchx module 与单入口 API
-- [ ] **任务完成**（与 superpowers plan `Task 1`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 1`、`tasks.md` 对应条目同步勾选） <!-- 已实现: e7bf5b1 -->
 - 目标：`go.mod` + `launchx.go`/`app.go`/`setup.go`：`Bootstrap(path) (*App, error)`、App 句柄字段（Config/Logger/Tracer/DB/Cache/MQ/Registry/Engine）、`OnSetup(func(*App) error)`、`Run() error`、幂等 `Close()`；Run 先以最小骨架占位（后续 Task 填充），main.go 形态可编译（验收案例 A1）
 - 改动文件：`go.mod`、`launchx.go`、`app.go`、`setup.go`、`launchx_test.go`
 - 验证方式：`go build ./...` 通过；`go test ./... -run TestBootstrap` 单测通过（Bootstrap 返回 App、OnSetup 可注册、Close 幂等）
 
 ### Task 2: configsrc 注册表与 local 加载器
-- [ ] **任务完成**（与 superpowers plan `Task 2`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 2`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 990d1a1 / 91565af -->
 - 目标：`internal/configsrc`：`Register(name, Loader)` 注册表 + `local` 加载器（configx `ReadConfig` 读本地 yaml）+ `${ENV}` 展开辅助 `ExpandEnv(s string) string`（DSN 占位用）；yaml 未声明 `configcenter` 时默认 local
 - 改动文件：`internal/configsrc/{registry.go,local.go,expand.go}`、`internal/configsrc/local_test.go`
 - 验证方式：`go test ./internal/configsrc/` — 缺省走 local、env 展开、注册表覆盖三项断言通过
 
 ### Task 3: configsrc nacos 加载器（三裁决）
-- [ ] **任务完成**（与 superpowers plan `Task 3`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 3`、`tasks.md` 对应条目同步勾选） <!-- 已实现: cdbab21 -->
 - 目标：移植 micro_apps `infra/nacos.LoadUnified` 语义（该仓实际 API 为 `LoadUnified`，历史文档中的 `LoadMerged` 即指此）：本地兜底 + `hubx.<service>` dataId key 级覆盖 + `HUBX_NACOS_SERVER` env 覆盖地址；dataId 空纯本地；远端不可达返回地基 error（验收案例 B1）
 - 改动文件：`internal/configsrc/nacos.go`、`internal/configsrc/nacos_test.go`
 - 验证方式：`go test ./internal/configsrc/ -run Nacos` — key 级裁决/纯本地/不可达即退三断言通过
 
 ### Task 4: component 注册表与四个内置组件
-- [ ] **任务完成**（与 superpowers plan `Task 4`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 4`、`tasks.md` 对应条目同步勾选） <!-- 已实现: bdbbdbf -->
 - 目标：`internal/component`：`Register(name, Builder)` + db(mysql/gorm 经 dbx config loader、DSN env 展开、`Trace.On("db")` 门控 Open/OpenNoTrace)、cache、mq(producer)、registry(coordx consul Register/Deregister/Target 封装)；`strict.<name>` 裁决降级 Warn/失败即退；`trace.on` 只控入链不控构造（验收案例 D1/D2）
 - 改动文件：`internal/component/{registry.go,db.go,cache.go,mq.go,consul.go,strict.go}`、`internal/component/*_test.go`
 - 验证方式：`go test ./internal/component/` — strict 双分支、Trace.On 不改变构造、registry 失败带病运行断言通过（验收案例 D1/D2）
@@ -117,7 +117,7 @@
 - **依赖选型（2026-10-04 裁决）**：srv 档的 ServerOptions 由新建的 `github.com/gospacex/rpcx` 提供（前置 Task 27），**不建 `internal/rpcx`**；HTTP 侧经 `webx`；本 Task 不 import kitex / hertz
 
 ### Task 6: pipeline 固定启动骨架与 telemetry 封装
-- [ ] **任务完成**（与 superpowers plan `Task 6`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 6`、`tasks.md` 对应条目同步勾选） <!-- 已实现: fc02f6c -->
 - 目标：`internal/telemetry`（移植 micro_apps `infra/telemetry.Init/Setup`：otelx 全局 TracerProvider + Composite 传播器、Enabled=false 走 noop + traceflag 关闭）+ `internal/pipeline`：固定顺序 配置(configsrc) → telemetry.Init（最先）→ logx.New+SetGlobal → mode.Assemble → component 挂载 → 回调 Setup；每步写入事件记录器供断言（验收案例 A2）
 - 改动文件：`internal/telemetry/{provider.go,provider_test.go}`、`internal/pipeline/{pipeline.go,events.go}`、`internal/pipeline/pipeline_test.go`
 - 验证方式：`go test ./internal/...` — 启动顺序断言（telemetry 早于 db/cache/mq）通过（验收案例 A2）
