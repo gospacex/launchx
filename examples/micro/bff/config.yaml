@@ -1,0 +1,62 @@
+# ============================================================
+# 微服 demo（bff 档）配置
+#
+# 端口 / 注册中心地址 / 下游目标一律来自本文件，业务 Go 代码不出现任何硬编码
+# 地址（同一份二进制与配置副本才能被网格直接复用，验收陷阱 14）。
+#
+# 本档注册进 consul 由 launchx 按 mode 自己做（地址取 service.self.addr →
+# service.addr），demo 侧不调 Register / Deregister。
+# ============================================================
+
+service:
+  name: demo-bff                # 服务名 = Jaeger 的 service，也是 consul 注册名
+  mode: bff                     # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:8081"        # HTTP 监听地址（ACCEPTANCE §13.2 端口定稿）
+  self:
+    # 注册进 consul 的自身地址。launchx 按 service.self.addr → service.addr
+    # 顺序取第一个非空值；值支持 ${ENV}（configsrc 对 GetString 施加
+    # os.ExpandEnv），网格形态设该 env 即可，未设置则自动回落到上面的 addr。
+    addr: "${DEMO_BFF_SELF_ADDR}"
+  upstream:
+    # 注册中心不可用时的直连兜底目标：launchx 读 service.upstream.<被调服务名>。
+    # 注册中心配了就走发现、本值不生效，故留空 —— 上游地址只留一个来源。
+    demo-srv: ""
+
+webx:
+  addr: "127.0.0.1:8081"
+  timeout: 5s
+  rate_limit_rps: 100
+  rate_limit_burst: 200
+  cors_origins: []
+  health_prefix: /healthz
+
+# 调用链：全局闸 + 组件级开关。trace.enabled=false 时各项组件级开关不再产出
+# 子 span（T13 反向断言的唯一开关）。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    registry: true
+
+logx:
+  level: info
+  otel:
+    enable_trace: true
+    exporter: otlp
+    endpoint: "127.0.0.1:4318"
+
+# 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决。
+# 本档刻意不设 strict：consul 不在时须带病运行（降级 Warn + 进程不退出），
+# 见 ACCEPTANCE §10 降级路径。
+
+xmiddleware:
+
+  # ----- coordx：注册中心 -----
+  # bff 的两个用途都落在这里：把自己注册进注册中心供 gateway 发现（由 launchx
+  # 按 mode 做），以及 App.RPCClientOptions 里的 coordx resolver（发现 demo-srv）。
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true
+
+  # bff 不建数据层：无 sqlx / cachex / mqx 段。订单数据的唯一入口是下游 demo-srv。
