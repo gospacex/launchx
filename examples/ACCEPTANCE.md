@@ -504,6 +504,54 @@ find examples/mesh -name '*.go'                     # 必须为空（出现即 F
 grep -rn "image:" examples/mesh/workloads/*.yaml    # 必须指向 launchx-examples/*，且 tag 与 micro 构建产物一致
 ```
 
+#### C-0b 复用边界：代码零差异，但有三个前提
+
+**结论：`examples/mesh` 直接复用 `examples/micro` 的三个二进制——不重写、不 fork、不重新构建。** 这不是省事，是 C4/T8 的硬约束：一旦网格出现自己的 `main.go`，"换形态不改业务代码"这条主张当场失效，T8 直接 FAIL。
+
+但「直接复用」成立有三个前提，缺一个就跑不起来，而这三个**恰好都是代码面的纪律**：
+
+| # | 前提 | 反面证据（`micro_apps` 现役代码就是反例） |
+|---|---|---|
+| **P1** | 监听地址来自配置，容器内须为 `0.0.0.0` | `apps/gateway/cmd/.../main.go` 写死 `const listenAddr = "127.0.0.1:8080"` —— `127.0.0.1` 在 Pod 内只有本容器可达，**sidecar 从 Pod 网络进不来** |
+| **P2** | 注册中心地址来自配置 | `const consulAgent = "127.0.0.1:8500"` 写死，Pod 内指向自己 |
+| **P3** | **注册进注册中心的「自身地址」来自配置** | 现役代码把 `listenAddr` 当自身地址注册；Pod 里会注册成 `127.0.0.1`，bff 拿到后连自己 → 断链 |
+
+P3 的解法 launchx 侧已具备：Downward API 把 `status.podIP` 注入 env，配置里写 `${POD_IP}`，由 `configsrc` 的 `envConfig` 做 `${ENV}` 展开落地 —— **零代码改动**。
+
+```yaml
+# mesh/workloads/srv.yaml 片段
+env:
+  - name: POD_IP
+    valueFrom: { fieldRef: { fieldPath: status.podIP } }
+# mesh/configs/srv.yaml 片段
+service:
+  self:
+    addr: ${POD_IP}      # ← 运行时展开为 Pod IP
+```
+
+```bash
+# 网格复用前必须先过这两条（在代码面执行）
+grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/   # 必须为空：地址一律来自配置
+grep -rln "POD_IP" examples/mesh/workloads/ examples/mesh/configs/  # 两侧都必须命中
+```
+
+#### C-0c 三个不能靠「复用」解决的部署面冲突（必须显式决策并落 `docs/verify.md`）
+
+**① 服务发现载体冲突（最硬的一个）**：consul 在宿主，Pod IP 在 minikube 容器网络（`172.17.x`），**宿主到 Pod IP 不可路由**，且 consul 的主动健康检查会全失败 → 实例全 critical，bff 发现不到任何 srv。三选一：
+
+- **A（推荐）consul 部署进集群**：`launchx-mesh` 内起 consul，配置副本只改 `coordx.addr → consul.launchx-mesh.svc:8500`。**代码零改动**，代价是多一个镜像与有状态负载。
+- **B `hostNetwork: true`**：Pod 复用宿主网络命名空间、IP 可达，但 hostNetwork 下 Istio 的 iptables 拦截需特殊配置且易端口冲突 —— **破坏网格语义，不推荐**。
+- **C 网格改走 k8s DNS 直连**（`srv.launchx-mesh.svc.cluster.local:9013`）：需 `rpcx.ClientOptions.Target` 支持直连地址（**待核实**）；且发现方式变更等于代码路径变更，**会削弱「与微服同构」的论证**，仅在 A 不可行时启用。
+
+**② 双套注册表并存**：consul 与 k8s Service 各持一份实例表，Istio 只认后者。判据：consul 中健康实例数 **必须等于** `kubectl get endpoints` 的就绪地址数，差一个即判漂移。
+
+**③ Istio 对 Kitex 段的 tracing 覆盖（待真机核实，不得预先断言）**：Istio 的 tracing 由 Envoy 的 HTTP connection manager 产生；纯 TCP（Kitex TTHeader over TCP）经 `tcp_proxy` 层，**预期不生成 sidecar span**。因此 T10 分两段断言：
+
+- **HTTP 段**（Ingress → gateway → bff）：预期**有** sidecar span；
+- **Kitex 段**（bff → srv）：预期**只有应用 span**，无 sidecar span。若真机发现该段出现 sidecar span，回来修正本条说明。
+
+**不得**以「bff→srv 缺 sidecar span」为由判 T10 FAIL —— 那是协议特性，不是断链。
+
 #### C-1 目录树（部署面，**禁 Go 代码**）
 
 ```
@@ -651,6 +699,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | A | 单体案例（目录树/链路/可观测） | §13.1 | | `/tmp/monolith.log` + `/tmp/trace.json` |
 | B | 微服案例（三进程/三段链/ consul） | §13.2 | | consul 实例数 + `/tmp/trace.json` |
 | C | 网格案例（清单/镜像/挂载/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 + `kubectl exec cat /app/config.yaml` |
+| C-复用 | 网格直接复用微服二进制（P1/P2/P3 + 决策 A/B/C） | §13.3 C-0b/C-0c | | `grep` 硬编码为空 + `docs/verify.md` 决策记录 |
 | OBS | 可观测基线与缺口登记 | §13.4 | | 缺口项记 SKIP，不得记 PASS |
 
 ## 15. 「看起来过了其实没过」陷阱清单
@@ -661,10 +710,12 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 4. **降级被当成通过**：consul 挂了照样起来 → 这是设计内行为（A3），但**必须**有 Warn 日志；`strict=true` 时必须反过来变成启动失败。只测一种不算过。
 5. **网格 sidecar 假完整**：sidecar 之间靠 Envoy 自身透传，链路看着严丝合缝，但 app span 全脱落（trace 数 ≥ 4）。必须同时查应用服务名与 sidecar 服务名。
 6. **dry-run 静默通过**：`bring-up.sh check` 对 PATH / minikube / istioctl / kubectl / 集群 Running / istio-system 就绪 / 镜像已 load 每一项都要逐条输出，缺失即非零退出；任一项缺失却返回 0 → FAIL。注意本机 `minikube`/`istioctl` 在 `/usr/local/bin` 而**不在默认 PATH**，`which` 找不到不等于没装——脚本里漏了 `export PATH=/usr/local/bin:$PATH` 会造成「工具齐全却被判缺失」和「真缺失却判通过」两种反向误判。
-12. **镜像构建上下文错**：在 `launchx/` 下 `docker build` 会因 `go.mod` replace 指向 `../webx` 等兄弟目录而失败（`../` 越出仓库根）。构建必须在 `hubx/` 根执行并 `-f launchx/examples/docker/Dockerfile`。看到 `../webx: no such file` 就是这个错。
-13. **配置副本没挂进容器**：`configs/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl exec ... -- cat /app/config.yaml` 必须与 `examples/mesh/configs/<svc>.yaml` 一致，且含 `host.minikube.internal`。
 7. **把缺口记成通过**：metrics / pprof / 日志 trace_id 关联这三类本轮**不存在**（§13.4）。`/metrics` 返回 404 是预期，记 SKIP；若为使表格好看而写 PASS，或临时加个返回空 JSON 的假端点凑数 → 一律 FAIL。
 8. **只跑一个进程就宣称微服链路通**：gateway 起来了、bff/srv 没起，`/api/ping` 也可能被 fallback 逻辑返回 200。判据必须同时看 consul 实例数（bff + srv 各 ≥1）与 Jaeger 中三个服务名同 trace，缺一不算过。
 9. **bff 端口漂移**：计划 Task 10 曾写 `8091`，本文档定稿为 `8081`。实现与文档必须单一口径；出现两个端口说明有人各写各的，配置与验收已脱节。
 10. **网格里混进 Go 代码**：`examples/mesh` 出现 `.go` 文件 = 网格走了独立代码路径，直接违反 T8。哪怕编译通过、链路也通，仍判 FAIL（因为"通"的是另一份代码，不能证明同构）。
 11. **单体出现 deregister 日志**：单体不注册，退出序列里若打出 deregister，说明 `mode` 装配串档了（monolith 走了 bff/srv 分支），链路看似正常但装配矩阵已错。
+12. **镜像构建上下文错**：在 `launchx/` 下 `docker build` 会因 `go.mod` replace 指向 `../webx` 等兄弟目录而失败（`../` 越出仓库根）。构建必须在 `hubx/` 根执行并 `-f launchx/examples/docker/Dockerfile`。看到 `../webx: no such file` 就是这个错。
+13. **配置副本没挂进容器**：`configs/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl exec ... -- cat /app/config.yaml` 必须与 `examples/mesh/configs/<svc>.yaml` 一致，且含 `host.minikube.internal`。
+14. **地址硬编码导致网格被迫 fork 代码**：`examples/micro` 的 Go 源码里出现 `127.0.0.1` / `localhost` / 写死的端口常量 → 网格无法复用同一份二进制，只能复制一份改常量，T8 当场失效。判据：`grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/` 必须为空。**这是本轮最容易复发的一条**：现役 `micro_apps` 三个服务全是这个写法（`const listenAddr = "127.0.0.1:8080"`），照抄即中招。
+15. **把 Kitex 段没有 sidecar span 当成断链**：Istio tracing 由 Envoy HTTP connection manager 产生，纯 TCP（Kitex TTHeader）经 `tcp_proxy` 预期**不生成** sidecar span（§C-0c ③）。判 T10 只看 HTTP 段的 sidecar span 与应用链的完整性；反过来，若 bff→srv 竟然出现 sidecar span，要回来修正该条预期说明。
