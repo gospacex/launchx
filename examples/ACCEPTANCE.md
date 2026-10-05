@@ -157,21 +157,51 @@ jq -r '.spans[] | "\(.spanID) \(.operationName) \(.references[0].spanID // "-")"
 
 ```bash
 curl -s 'http://127.0.0.1:8500/v1/health/service/demo-srv?passing=1' | jq 'length'   # ≥ 1，consul 发现生效
-curl -sf http://127.0.0.1:8080/api/ping      | grep -q '"service":"bff"'              # gateway → bff
-curl -sf http://127.0.0.1:8080/api/order/1001 | grep -q 'order_id'                     # → bff → srv → mysql
+curl -sf http://127.0.0.1:8080/api/ping       | grep -q '"service":"bff"'             # gateway → bff
+curl -sf http://127.0.0.1:8080/api/order/1                                            # → bff → srv → mysql
+curl -s 'http://127.0.0.1:8500/v1/catalog/services' | jq -r 'keys[]'                  # 含 demo-bff/demo-srv，**不含** demo-gateway
 ```
+
+> ⚠️ **本机端口坑（实测）**：`127.0.0.1:8081` 被 Docker Desktop 的 `com.docke` 以 `*:8081`
+> （IPv6 通配，etcdkeeper 容器转发）占用，而 bff 只绑 IPv4 `127.0.0.1:8081`。两个监听并存，
+> `curl localhost:8081` 会解析到 `::1` 从而打到 **etcdkeeper 返回 404**，
+> 必须显式写 **`http://127.0.0.1:8081`**。同理 gateway 转发用的上游地址也必须写 `127.0.0.1` 而非 `localhost`。
+> 另：本机 shell 常有 `http_proxy`，验收 curl 一律加 `--noproxy '*'`。
 
 链路断言：
 
 ```bash
-curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway&limit=20" | jq -r '.data[0].traceID'
-# 同一 trace 下的服务名集合必须含三个
-jq -r '.processes | to_entries[] | .value.serviceName' /tmp/trace.json | sort -u
-# 父子链：gateway 是 bff 的父，bff 是 srv 的父（不是三个并列根）
-jq '[.spans[] | select((.references|length)==0)] | length' /tmp/trace.json            # = 1
+curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway&limit=20" > /tmp/gw.json
+# 同一 trace 下的服务名集合必须含三个（服务名在 .processes 映射里，不在 span.process 上）
+jq -r '.data[0].processes | to_entries[] | .value.serviceName' /tmp/gw.json | sort -u
+# 父子链（按 spanID 排序后再看，避免 .spans[] 迭代顺序造成的错配）
+jq -r '.data[0] as $t | [.data[0].spans[] | {id:.spanID, svc:$t.processes[.processID].serviceName, op:.operationName, p:((.references//[])[0].spanID // "-")}] | sort_by(.id)[] | "\(.svc)\t\(.op)\tparent=\(.p)"' /tmp/gw.json
+# 根 span 必须唯一
+jq '[.data[0].spans[] | select((.references//[])|length==0)] | length' /tmp/gw.json   # = 1
 ```
 
+> ⚠️ **Jaeger 字段口径（实测，同 §9b.3）**：服务名在 **`.data[].processes[<processID>].serviceName`**，
+> span 上只有 `.processID`。直接取 `.spans[].process.serviceName` 得到 `null`，
+> 于是"服务名集合"判据恒为空 → 空壳。
+
 判定：服务名集合含 `demo-gateway`/`demo-bff`/`demo-srv`；根 span = 1；父子链方向正确；srv 侧 db span 在同一 trace。**三段各成一根（trace 数 ≥ 3）→ FAIL**（典型症状：传播器没注册，见 §9）。
+
+**golden 链（2026-10-05 真机提取，`/api/order/1`，单 trace 9 span）**：
+
+```
+demo-gateway   GET /api/order/1            parent=-            ← 根，webx otel 中间件
+demo-gateway   gateway.proxy.api           parent=GET /api/...  ← 转发前 launchx.Inject
+demo-bff       GET /order/1                parent=gateway.proxy.api   ← bff 入站 span 挂在网关下 = 续链成功
+demo-bff       handler.GetOrder            parent=GET /order/1
+demo-bff       downstream.Order.GetOrder   parent=handler.GetOrder
+demo-bff       client.demo-srv.GetOrder    parent=downstream...  ← rpcx ClientSpanMiddleware
+demo-bff       order.Order/GetOrder        parent=downstream...  ← kitex 客户端侧
+demo-srv       order.Order/GetOrder        parent=client.demo-srv.GetOrder  ← 跨进程
+demo-srv       service.order.GetOrder      parent=order.Order/GetOrder
+```
+
+关键观察：**bff 的入站 span 直接挂在 `gateway.proxy.api` 之下**，这是 `launchx.Inject` 生效的直接证据；
+若注入缺失，bff 会另起一根 trace，此处会变成 `parent=-`。
 
 ## 7. E3 — srv 迁移回归（tasks 2.4 / 3.7）
 
@@ -910,14 +940,14 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 | 编号 | 案例 | 命令锚点 | 状态 | 证据 |
 |---|---|---|---|---|
 | E1 | 单体跑通 | §3 | ✅ PASS (2026-10-05) | 六接口全通；orders 3→删除后 2；SIGTERM 退出 1s；无 deregister 日志 |
-| E2 | 微服调用链 | §6 | | curl 输出 + consul 实例数 |
+| E2 | 微服调用链 | §6 | ✅ PASS (2026-10-05) | `/api/ping`→bff、`/api/order/1`→srv 返回业务错误（跨进程到达）；consul 仅有 demo-bff/demo-srv，**gateway 未注册**符合装配矩阵 |
 | E3 | srv 迁移回归 | §7 | | e2e 输出 + `wc -l` + kafka 消息 |
 | E4 | 网格同 trace | §11b | | `examples/mesh/docs/verify.md` |
 | E5 | trace OFF/ON | §11b | | 同上 |
 | T1/T7 | 传播器 | §9 | ✅ PASS (2026-10-05) | 5 个用例全绿，含 `TestDefaultPropagatorIsNoop` 反向断言（commit `18a331d`） |
 | T2/T3/T4 | 数据层入链 | §4 | ✅ PASS（T4 部分 SKIP） | SQL span 9 条、空值 0、JOIN 1、CRUD 四类齐全；T4 的 cache/mq/ES/mongo 四类同 trace 待微服 demo 起后补 |
 | T5 | 单体调用树 | §5 | ✅ PASS (2026-10-05) | 6 条 trace 根 span 均恰好 1 个且为 HTTP 入口；树深 5（POST 链） |
-| T6 | 三段同 trace | §6 | | `/tmp/trace.json` |
+| T6 | 三段同 trace | §6 | ✅ PASS (2026-10-05) | 单 trace 9 span、三进程、根唯一；bff 入站 span 挂在 `gateway.proxy.api` 下（Inject 生效） |
 | T8 | 网格无专属分支 | §12 | | grep/diff 输出 |
 | T9 | 尾部 span 不缺 | §8 | ✅ PASS (2026-10-05) | 最后一条 DELETE trace 7 span 完整（含 `db.delete` × 2），退出冲刷生效 |
 | T10/T11/T12 | 网格链路 | §11b / §13.3 | | `examples/mesh/docs/verify.md` |
@@ -951,3 +981,4 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 16. **把 Kitex 段没有 sidecar span 当成断链**：Istio tracing 由 Envoy HTTP connection manager 产生，纯 TCP（Kitex TTHeader）经 `tcp_proxy` 预期**不生成** sidecar span（§C-0c ③）。判 T10 只看 HTTP 段的 sidecar span 与应用链的完整性；反过来，若 bff→srv 竟然出现 sidecar span，要回来修正该条预期说明。
 17. **用 `.attributes[]` 取 Jaeger span 属性**（2026-10-05 实测踩到）：Jaeger REST API（`/api/traces`）返回的 span 属性在 **`.tags[]`**，结构是 `{"key","type","value"}`；`.attributes[]` **不存在**，取之恒为空数组。后果极隐蔽——`db.query.text | length == 0`、"空值数为 0"、`JOIN 数为 0` 全都"通过"，整套 T13 判据变成空壳。判据一律写 `.spans[].tags[]?`（见 §9b.3 顶部警示）。**自检方式**：先跑 `jq '[.data[].spans[].tags[]? | select(.key=="db.query.text")] | length'`，若得到 0 而 Jaeger UI 上明明有 SQL，就是命中本条。
 18. **Jaeger 查询早于 batch flush**：OTLP BatchSpanProcessor 默认约 5s 批量导出，请求刚发完立刻查 `/api/traces` 会拿到**上一条** trace（本次还没入库），于是"关闭 db 埋点后 SQL 仍为 2 条"这种假失败就出现了。判据必须**按 traceID 精确定位**新请求的那条（不能只看 `limit=1`），并在请求后等待 ≥10s 再查。
+19. **用 `.spans[].process.serviceName` 取服务名**（2026-10-05 实测）：Jaeger 的 span 上只有 `.processID`，服务名在 **`.data[].processes[<pid>].serviceName`。直接取前者得 `null`，"三服务名集合"判据恒为空 → 空壳（与第 17 条同源）。另：`.spans[]` 的迭代顺序不保证与 spanID 一致，核对父子链时须 `sort_by(.id)` 后再看，否则会把 span 名与父指针错配，看起来像"链断了"。
