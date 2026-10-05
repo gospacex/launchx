@@ -133,3 +133,63 @@ func TestOnSetupRegistered(t *testing.T) {
 		t.Fatalf("setups = %d, want 1", len(app.setups))
 	}
 }
+
+// TestExitOrderReverseChain 断言反序退出链的显式顺序（A3）：
+// 业务回调 → server.stop → component.stop → registry.deregister
+// → tracing.shutdown（冲刷）→ logger.close。
+// 关键点：tracing.shutdown 必须晚于所有组件停止（否则最后的 span 丢失），
+// logger.close 必须最后（前面的失败还需要它打日志）。
+func TestExitOrderReverseChain(t *testing.T) {
+	app, err := Bootstrap("testdata/monolith.yaml")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	app.OnStop(func() error { return nil })
+	if err := app.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	want := []string{
+		"setup.stop",
+		pipeline.StepServerStop,
+		pipeline.StepComponentStop,
+		pipeline.StepRegistryDeregister,
+		pipeline.StepTracingShutdown,
+		pipeline.StepLoggerClose,
+	}
+	prev := -1
+	for _, name := range want {
+		i := app.Events().IndexOf(name)
+		if i < 0 {
+			t.Fatalf("missing exit event %q in %v", name, app.Events().Order())
+		}
+		if i <= prev {
+			t.Fatalf("exit order broken at %q: %v", name, app.Events().Order())
+		}
+		prev = i
+	}
+}
+
+// TestBootstrapStrictComponentFailsFast 断言 strict.<name>=true 时组件失败
+// 会冒泡为 Bootstrap 错误（错误带 "init db" 上下文），而非静默降级。
+func TestBootstrapStrictComponentFailsFast(t *testing.T) {
+	_, err := Bootstrap("testdata/strict-db.yaml")
+	if err == nil {
+		t.Fatal("strict.db=true with a bad DSN must fail bootstrap")
+	}
+	if !strings.Contains(err.Error(), "init db") {
+		t.Fatalf("error must carry 'init db' context, got: %v", err)
+	}
+}
+
+// TestBootstrapDegradeKeepsRunning 断言默认（strict 缺省 false）时组件失败只降级：
+// Bootstrap 成功、句柄为空、进程可继续。
+func TestBootstrapDegradeKeepsRunning(t *testing.T) {
+	app, err := Bootstrap("testdata/degrade-db.yaml")
+	if err != nil {
+		t.Fatalf("default must degrade, not fail: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+	if app.DB() != nil {
+		t.Fatal("db must be nil in degraded state")
+	}
+}

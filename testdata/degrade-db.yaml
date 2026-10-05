@@ -1,0 +1,14 @@
+# 默认 strict（缺省 false）+ 坏 DSN：组件失败只降级，启动继续
+service:
+  name: degrade-svc
+  mode: srv
+
+trace:
+  enabled: false
+
+xmiddleware:
+  sqlx:
+    driver: gorm
+    databases:
+      degrade-svc:
+        dsn: "bad@tcp(127.0.0.1:1)/nodb"

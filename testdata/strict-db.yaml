@@ -1,0 +1,17 @@
+# strict.db=true + 坏 DSN：组件失败必须即退（不降级）
+service:
+  name: strict-svc
+  mode: srv
+
+trace:
+  enabled: false
+
+strict:
+  db: true
+
+xmiddleware:
+  sqlx:
+    driver: gorm
+    databases:
+      strict-svc:
+        dsn: "bad@tcp(127.0.0.1:1)/nodb"
