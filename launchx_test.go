@@ -1,6 +1,7 @@
 package launchx
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -188,6 +189,39 @@ func TestBootstrapModeAssembly(t *testing.T) {
 	}
 	if _, err := app.RPCClientOptions("downstream"); err == nil {
 		t.Fatal("monolith has no rpc client factory")
+	}
+}
+
+// TestRunSetupFailureRunsExitChain 断言 Setup 失败走完整反序退出链
+// （spec: bootstrap-pipeline → "Setup 失败走完整退出"；tasks.md 1.7）：
+// Run 返回该 error **之前**必须先把已初始化的资源按退出链收掉——否则
+// tracer 不冲刷（丢最后一批 span）、logger 不关（丢缓冲日志），
+// 而调用方拿到 error 时完全看不出资源还悬着。
+func TestRunSetupFailureRunsExitChain(t *testing.T) {
+	app, err := Bootstrap("testdata/monolith.yaml")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	boom := errors.New("setup boom")
+	app.OnSetup(func(a *App) error { return boom })
+
+	err = app.Run()
+	if err == nil {
+		t.Fatal("Run must return the setup error")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run must return the setup error, got: %v", err)
+	}
+	for _, name := range []string{
+		pipeline.StepServerStop,
+		pipeline.StepComponentStop,
+		pipeline.StepRegistryDeregister,
+		pipeline.StepTracingShutdown,
+		pipeline.StepLoggerClose,
+	} {
+		if app.Events().IndexOf(name) < 0 {
+			t.Fatalf("exit step %q not recorded, order = %v", name, app.Events().Order())
+		}
 	}
 }
 

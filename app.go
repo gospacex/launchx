@@ -192,7 +192,8 @@ func (a *App) Logger() logx.Logger { return a.logger }
 // Tracer 返回 telemetry provider（退出链负责 Shutdown 冲刷）。
 func (a *App) Tracer() otelx.Provider { return a.tracer }
 
-// OnSetup 注册装配回调，Bootstrap 后、Run 前调用。
+// OnSetup 注册装配回调：在 Run 的 setup 步骤按注册顺序执行
+// （基础设施就绪后、服务端监听前），业务在此装配自己的分层并挂路由/RPC。
 func (a *App) OnSetup(fn func(*App) error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -396,7 +397,14 @@ func (a *App) Run() error {
 	// Setup 必须早于监听：路由与处理器注册只能在起服前完成。
 	for _, fn := range a.setupSnapshot() {
 		if err := fn(a); err != nil {
-			return fmt.Errorf("launchx: setup: %w", err)
+			// Setup 失败与运行期错误走同一条退出链（spec "Setup 失败走完整退出"）：
+			// 先收干净已初始化的资源（tracer 冲刷 / logger 关闭）再返回。
+			// 退出链自己的错误不吞，附在 setup 错误之后（首错仍是 setup error）。
+			setupErr := fmt.Errorf("launchx: setup: %w", err)
+			if exitErr := a.Close(); exitErr != nil {
+				return errors.Join(setupErr, exitErr)
+			}
+			return setupErr
 		}
 	}
 	a.mu.Lock()
@@ -412,6 +420,12 @@ func (a *App) Run() error {
 			return fmt.Errorf("launchx: server %T does not implement Run() error", srv)
 		}
 		return r.Run()
+	}
+	// 一个服务端都没有（后台型服务，或 srv 档业务忘了回存 RPC server）：
+	// 返回 nil 是刻意的，但必须说出来——否则"Run 立刻返回"会被当成"起来了"。
+	if a.logger != nil {
+		a.logger.Warn("launchx: no webx engine and no rpc server, Run returns immediately",
+			logx.String("mode", string(a.mode)))
 	}
 	return nil
 }

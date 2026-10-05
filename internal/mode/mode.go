@@ -78,9 +78,6 @@ type AppHolders struct {
 	Tracer otelx.Provider
 	// ServiceName 服务名，用于注册名与 tracer 名。
 	ServiceName string
-	// PreRun 可选的 webx 路由预注册回调（在 New 内、监听前执行）。
-	// 业务通常在 Setup 里经 App.Engine() 挂路由，这里留给装配期即已知的场景。
-	PreRun []func(any)
 
 	// Out 装配产物，Assemble 成功后可读。
 	Out Out

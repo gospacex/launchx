@@ -73,9 +73,6 @@ func newWebx(h *AppHolders) (any, error) {
 	if h.Tracer != nil {
 		opts = append(opts, webx.WithTracer(h.Tracer.TracerProvider().Tracer(tracerName(h))))
 	}
-	for _, fn := range h.PreRun {
-		opts = append(opts, webx.WithPreRun(func(a *webx.App) { fn(a) }))
-	}
 	app, err := webx.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("launchx: webx new: %w", err)
