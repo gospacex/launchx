@@ -867,7 +867,7 @@ git add examples/monolith && git commit -m "feat: examples/monolith 单体 demo�
 **文件：**
 - 创建：`examples/micro/gateway/{config.yaml,cmd/main.go,app/setup.go,internal/routing/routes.go,internal/proxy/proxy.go}`
 
-- [ ] **步骤 9.1：config.yaml（mode gateway + gateway.routes /api→bff）**
+- [x] **步骤 9.1：config.yaml（mode gateway + gateway.routes /api→bff）**
 
 ```yaml
 service:
@@ -885,12 +885,12 @@ coordx:
 ```
 （yaml 段名以 Task 4/5 实现中实际读取的键为准，Step 9.1 先探查 `internal/component/consul.go` 与 `internal/mode` 读取的 config 段名，再定稿本文件——**不得**凭本步骤文本盲写）
 
-- [ ] **步骤 9.2：转发实现（Registry.Target + hertz Any 反向代理 + 状态码映射）**
+- [x] **步骤 9.2：转发实现（Registry.Target + hertz Any 反向代理 + 状态码映射）**
 
 `internal/proxy/proxy.go`：经 `app.Registry.Target(agentAddr, "bff")` 取上游地址串（consul 不可达或空表 → 响应 502；参考 micro_apps gateway 行为但精简：路由匹配 + 上游 404/429/502 原样透传映射）；`internal/routing/routes.go`：`a.Any("/*p", handler)` 挂转发。`app/setup.go` 经 `WithPreRun` 注入。
 `cmd/main.go` 同 Task 8 形态（≤50 行）。
 
-- [ ] **步骤 9.3：构建 + 单进程可启动断言（E2 前半前置，完整链路在 Task 19）**
+- [x] **步骤 9.3：构建 + 单进程可启动断言（E2 前半前置，完整链路在 Task 19）**
 
 运行：
 ```bash
@@ -901,7 +901,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx/examples/micro/gateway && go build ./
 git add examples/micro/gateway && git commit -m "feat: examples/micro/gateway 网关 demo（2.2，E2 前半）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.2 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.2 同步） <!-- 已实现: 0541e17 -->
 
 ---
 

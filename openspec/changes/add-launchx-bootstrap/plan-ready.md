@@ -137,10 +137,11 @@
 - 验证方式：`go build ./... && go run ./examples/monolith/cmd` 启动；`curl localhost:8080/orders` 返回 JSON（验收案例 E1 起）
 
 ### Task 9: examples/micro/gateway 网关 demo
-- [ ] **任务完成**（与 superpowers plan `Task 9`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 9`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 0541e17 -->
 - 目标：新建 `examples/micro/gateway/`：mode gateway，`config.yaml` 含 `gateway.routes`（/api→bff）；Setup 内实现极简转发（`app.Registry.Target` 解析上游 + hertz Any("/*p") 反向代理，参考 micro_apps gateway 行为但精简为转发+状态码映射 404/429/502 中路由与 502 部分）
 - 改动文件：`examples/micro/gateway/{config.yaml,cmd/main.go,app/setup.go,internal/routing/*.go,internal/proxy/*.go}`
 - 验证方式：`go build ./...`；起 consul 后 `curl localhost:8080/api/ping` 经转发命中 bff（验收案例 E2 前半）
+- **API 事实与落地偏差（2026-10-05 实测）**：`coordx.Register` **没有 `Target` 方法**（只有 `Register/Deregister/HealthCheck/Close`，`coordx/interface.go:23`），`App.Registry()`（`app.go:137`）返回的是它；consul 驱动把注册与发现分在两个句柄上（`coordx/consul/consul.go`：`registerImpl` 无 `Discovery`，`discoverImpl` 才有）。故上游解析改为「`a.Registry()` 断言 `coordx.Discover` 同形子集 → 失败则读 `service.upstream.<被调服务名>`（`internal/mode/webx.go:111` 的同一个兜底键）→ 都空则 502」，**未**自建 `consul.NewClient`/`coordx.NewDiscover`；当前实际生效的是配置直连兜底 `demo-bff: 127.0.0.1:8081`。另：launchx 根包未导出 `Inject`，转发前直接用 `otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))`（全局传播器由 `internal/telemetry/telemetry.go:56` 设定），代码与 README 已留 TODO——Task 23 落地 `launchx.Inject` 后替换
 
 ### Task 10: examples/micro/bff 服务 demo
 - [x] **任务完成**（与 superpowers plan `Task 10`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 3c5021c -->
