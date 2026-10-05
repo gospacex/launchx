@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # launchx 端到端调用链验收底座（tasks 0.3）
 #
-# 用途：拉起 / 校验 / 停止 Jaeger、MySQL、Kafka、Elasticsearch 四个容器，
+# 用途：拉起 / 校验 / 停止 Jaeger、MySQL、Kafka、Elasticsearch 四个中间件，
 #       供 trace-verification（T1–T9）与既有 E1–E3 验收复用。
 #
 # 环境前提（已实测）：
 #   - Docker Desktop 的 CLI 不在 PATH，位于
 #     /Applications/Docker.app/Contents/Resources/bin/docker
-#   - 容器统一接入 dockers_devnet 网络（与 hubx/dockers/docker-compose.yml 一致）
+#   - 四个中间件**全部**由 hubx/dockers/docker-compose.yml 提供（含 elasticsearch，
+#     2026-10-05 已从临时 docker run 容器收编进 compose）。本脚本只做启停与校验，
+#     缺容器时提示走 compose，不再自行 docker run —— 避免又冒出一份环境。
 #
 # 用法：
 #   ./bring-up-trace.sh start    启动/新建缺失容器，并等待就绪
@@ -20,7 +22,8 @@ set -euo pipefail
 DOCKER="${DOCKER_BIN:-/Applications/Docker.app/Contents/Resources/bin/docker}"
 NET="${DOCKER_NET:-dockers_devnet}"
 
-ES_IMAGE="${ES_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/elasticsearch:7.6.2}"
+# compose 是唯一供给源：容器缺失时按它重建，不另起炉灶
+COMPOSE_FILE="${COMPOSE_FILE:-/Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml}"
 
 # 已由其它项目复用的在跑底座，此处只做就绪提示，不负责启停
 readonly REUSED="consul:8500 mongo1:27018 keydb:6380 memcached:11211"
@@ -57,16 +60,13 @@ ensure_running() { # <container>
   fi
 }
 
+# elasticsearch 已收编进 compose；容器缺失时交给 compose 建，脚本不自己 run。
 ensure_es() {
   if "$DOCKER" inspect elasticsearch >/dev/null 2>&1; then
     ensure_running elasticsearch; return
   fi
-  echo "  + 新建 elasticsearch（本机原无此容器）"
-  "$DOCKER" run -d --name elasticsearch --network "$NET" \
-    -p 9200:9200 -p 9300:9300 \
-    -e "discovery.type=single-node" \
-    -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
-    "$ES_IMAGE" >/dev/null
+  echo "  + elasticsearch 容器缺失，交 compose 创建（唯一供给源）"
+  "$DOCKER" compose -f "$COMPOSE_FILE" up -d elasticsearch >/dev/null
 }
 
 cmd_start() {

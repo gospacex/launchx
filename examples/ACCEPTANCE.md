@@ -19,7 +19,7 @@
 | kafka | `127.0.0.1:9092`（KRaft，auto-create topic，PLAINTEXT） | compose（**不**用 srv-order 旧端口 19093） |
 | redis | `127.0.0.1:6379` | compose |
 | jaeger | UI `127.0.0.1:16686`，OTLP/HTTP `127.0.0.1:4318` | compose |
-| elasticsearch | `127.0.0.1:9200` | **不在 compose 内**，当前由独立容器 `elasticsearch:7.6.2` 提供，重建环境须自补 |
+| elasticsearch | `127.0.0.1:9200`（单节点，无鉴权） | compose（原为临时 `docker run` 的独立容器，已收编进 compose，数据目录 `/Users/hyx/work/dockerwork/data/elasticsearch/data`） |
 | mongodb | `127.0.0.1:27018/27019/27020` | compose，需先 `docker compose --profile once up -d mongo-init` 初始化 rs0 |
 | 网格 | 本机 minikube + Istio | 用户给定。**已装**：minikube `v1.36.0`、istioctl `1.30.1`（均在 `/usr/local/bin`）；**kubectl 未单独安装**，走 `minikube kubectl --`。集群**未启动**（无 `minikube` 容器），须先 `minikube start` |
 | ⚠️ PATH | `/usr/local/bin` | WorkBuddy 的 shell PATH 不含 `/usr/local/bin`，`which minikube` 会**误报未安装**。所有脚本与手工命令必须先 `export PATH=/usr/local/bin:$PATH` |
