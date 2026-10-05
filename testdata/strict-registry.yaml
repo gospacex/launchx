@@ -1,0 +1,11 @@
+# strict.registry=true + 注册失败：必须即退，不允许降级成「起了但不被发现」
+service:
+  name: strict-registry-svc
+  mode: bff
+  addr: 127.0.0.1:8081
+
+trace:
+  enabled: false
+
+strict:
+  registry: true

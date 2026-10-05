@@ -2,7 +2,7 @@
 //
 // 骨架顺序是框架契约，业务只能挂 Setup 回调，不能插队：
 //
-//	config.load → telemetry.init → logger.init → mode.assemble → component.mount → setup
+//	config.load → telemetry.init → logger.init → mode.assemble → component.mount → registry.register → setup
 //
 // 顺序不是风格问题：telemetry 必须最早，否则 webx/组件会拿到 noop tracer
 // （详见 internal/telemetry 包注释）。
@@ -18,12 +18,13 @@ import (
 
 // 启动骨架步骤名（顺序断言与日志都用这里的常量，避免散落字符串字面量）。
 const (
-	StepConfigLoad     = "config.load"
-	StepTelemetryInit  = "telemetry.init"
-	StepLoggerInit     = "logger.init"
-	StepModeAssemble   = "mode.assemble"
-	StepComponentMount = "component.mount"
-	StepSetup          = "setup"
+	StepConfigLoad       = "config.load"
+	StepTelemetryInit    = "telemetry.init"
+	StepLoggerInit       = "logger.init"
+	StepModeAssemble     = "mode.assemble"
+	StepComponentMount   = "component.mount"
+	StepRegistryRegister = "registry.register"
+	StepSetup            = "setup"
 )
 
 // 反序退出链步骤名（显式序列，不依赖 defer）。

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +32,22 @@ var componentOrder = []string{"db", "cache", "mq", "registry", "search", "mongod
 
 // serverShutdownTimeout 优雅停机排空 in-flight 请求的上限。
 const serverShutdownTimeout = 5 * time.Second
+
+// registryOpTimeout 单次注册/注销的上限。
+//
+// 注册中心不可达时不能让启动或退出无限挂住（退出挂住 = 后面的 tracing 冲刷
+// 与 logger 关闭都执行不到，丢最后一批 span）。超时取消**不会影响已注册实例
+// 的续期**：coordx 的 TTL 心跳由内部 ticker 维持，不继承这里的 ctx
+// （实测 coordx/consul/consul.go:100）。
+const registryOpTimeout = 5 * time.Second
+
+// selfAddrKeys 自身注册地址的取值顺序（P3 纪律：地址一律来自配置，不硬编码）。
+//
+// 顺序按仓库现状实测：service.addr 是四档共用的监听地址键（webx 段未配 addr 时
+// 回落到它，srv 档 kitex 的监听地址也取它）；webx.addr 是「只配了 webx 段」的
+// 兜底；service.self.addr 排在最前，用于容器内外地址不一致时显式声明
+// 「注册地址 ≠ 监听地址」。三次读取都经 configsrc 的 envConfig，${ENV} 生效。
+var selfAddrKeys = []string{"service.self.addr", "service.addr", "webx.addr"}
 
 // Mode 服务形态。四档之间只差「服务端 + 服务发现」的装配方式，
 // 业务代码完全一致（C4：换形态不改业务）。
@@ -87,9 +105,14 @@ type App struct {
 	engine           any
 	rpcServer        any
 	rpcClientOptions func(service string) (any, error)
-	// serverStop 停止服务端的钩子，退出链在 server.stop 之后调用
-	//（退出链编排本身在任务 7，这里只留钩子）。
+	// serverStop 停止服务端的钩子，退出链在 server.stop 之后调用。
+	// 只在 Run 真正起服时接上：从未起服（后台型服务）时保持 nil。
 	serverStop func() error
+
+	// registry / registered 记录「本进程注册进注册中心的那个实例」，
+	// 退出链第 4 步按它注销（未注册态两者皆为零值，注销彻底静默）。
+	registry   coordx.Register
+	registered *coordx.ServiceInstance
 }
 
 // 组件句柄访问器。业务经此处取中间件，不直接构造驱动
@@ -155,14 +178,14 @@ func (a *App) RPCServerOptions() any {
 // RPCServer 返回业务回存的 RPC 服务端句柄（kitex server），未回存为 nil。
 func (a *App) RPCServer() any { return a.rpcServer }
 
-// SetRPCServer 回存业务构造的 RPC 服务端句柄，并把它接进退出链。
+// SetRPCServer 回存业务构造的 RPC 服务端句柄（kitex server）。
+//
+// 停机钩子不在此处接：它只在 Run 真正起服时接上（见 stopHook），
+// 这样「回存了但从没起服」的进程退出链里不会有一个多余的停机动作。
 func (a *App) SetRPCServer(srv any) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.rpcServer = srv
-	if s, ok := srv.(interface{ Stop() error }); ok {
-		a.serverStop = s.Stop
-	}
 }
 
 // RPCClientOptions 按被调服务名产出下游 RPC 客户端选项（[]client.Option）。
@@ -223,6 +246,7 @@ func (a *App) steps() []pipeline.Step {
 		{Name: pipeline.StepLoggerInit, Fn: a.stepLogger},
 		{Name: pipeline.StepModeAssemble, Fn: a.stepMode},
 		{Name: pipeline.StepComponentMount, Fn: a.stepComponents},
+		{Name: pipeline.StepRegistryRegister, Fn: a.stepRegister},
 	}
 }
 
@@ -319,13 +343,13 @@ func (a *App) stepMode(e *pipeline.Env) error {
 	a.mode = Mode(out.Mode)
 	a.engine = out.Webx
 	a.rpcClientOptions = out.RPCClientOptions
-	if a.engine != nil {
-		a.serverStop = webxStop(a.engine)
-	}
 	return nil
 }
 
-// webxStop 产出 webx 引擎的停止闭包。
+// webxStop 产出 webx 引擎的停止闭包（接口断言，库源码不 import hertz）。
+//
+// 实测：webx/webx.go:235 Run() error、:240 Shutdown(ctx) error；
+// IsRunning 来自内嵌的 *server.Hertz。
 //
 // 未启动的引擎直接跳过：hertz 对未运行的服务 Shutdown 会返回
 // errStatusNotRunning，而「从没起来过」不是错误，不该冒进退出链的错误聚合。
@@ -343,8 +367,42 @@ func webxStop(engine any) func() error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 		defer cancel()
-		return w.Shutdown(ctx)
+		if err := w.Shutdown(ctx); err != nil {
+			return fmt.Errorf("webx shutdown: %w", err)
+		}
+		return nil
 	}
+}
+
+// rpcStop 产出 kitex 服务端的停止闭包（接口断言，库源码不 import kitex）。
+//
+// 实测：kitex@v0.16.3/server/server.go:52-58，Server 接口为
+// Run() error / Stop() error。
+//
+// 不另加超时：kitex 的 Stop 自带优雅退出等待（rpcx.BuildServerOptions 的
+// WithExitWaitTime，缺省 5s），再套一层只会把同一个上限写两遍。
+func rpcStop(srv any) func() error {
+	s, ok := srv.(interface{ Stop() error })
+	if !ok {
+		return nil
+	}
+	return func() error {
+		if err := s.Stop(); err != nil {
+			return fmt.Errorf("rpc server stop: %w", err)
+		}
+		return nil
+	}
+}
+
+// stopHook 按服务端类型取停机钩子；两者都不匹配返回 nil（由调用方 Warn）。
+//
+// 断言失败**不 panic**：未知服务端类型只是没有停机钩子，起服照旧，
+// 代价是退出时排空不了 in-flight 请求——必须说出来，但不能因此炸掉进程。
+func stopHook(srv any) func() error {
+	if stop := webxStop(srv); stop != nil {
+		return stop
+	}
+	return rpcStop(srv)
 }
 
 // stepComponents 按固定顺序挂载六类内置组件。
@@ -364,6 +422,102 @@ func (a *App) stepComponents(e *pipeline.Env) error {
 	}
 	a.comp = cenv
 	return nil
+}
+
+// stepRegister 按形态把自身实例注册进注册中心，并记下实例供退出链注销。
+//
+// 只有 bff / srv 注册（monolith 没有下游、gateway 是流量入口，注册它们只会让
+// 注册中心多一批无人调用的条目）；未注册态必须**彻底静默**——验收陷阱第 11 条
+// 就是把「单体退出时打出 deregister」当作 mode 装配串档的判据。
+//
+// 注册中心未装配（presence-based：没配 xmiddleware.coordx 段）同样不注册：
+// 无注册中心是合法部署形态，不是故障。
+func (a *App) stepRegister(e *pipeline.Env) error {
+	if a.holders == nil || !a.holders.Out.Registered {
+		return nil
+	}
+	reg := a.Registry()
+	if reg == nil {
+		return nil
+	}
+	host, port, err := selfAddr(a.cfg)
+	if err != nil {
+		return a.registerFail(err)
+	}
+	inst := &coordx.ServiceInstance{
+		// ID 与 rpcx 的实例标识同构（service-host-port）：注册与注销必须落在
+		// 同一个 ID 上，否则注销作用在另一个实例，注册中心会残留脏条目。
+		ID:        fmt.Sprintf("%s-%s-%d", a.serviceName, host, port),
+		ServiceID: fmt.Sprintf("%s-%s-%d", a.serviceName, host, port),
+		Addr:      host,
+		Port:      port,
+		Metadata:  map[string]string{"mode": string(a.mode)},
+		Healthy:   true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), registryOpTimeout)
+	defer cancel()
+	if err := reg.Register(ctx, a.serviceName, inst); err != nil {
+		return a.registerFail(err)
+	}
+	a.registry = reg
+	a.registered = inst
+	if a.logger != nil {
+		a.logger.Info("launchx: service registered",
+			logx.String("service", a.serviceName), logx.String("instance", inst.ID))
+	}
+	return nil
+}
+
+// registerFail 按 strict.registry 裁决注册失败：
+// true 即退（起了但不被发现比启动失败更难排查）；缺省降级——打一条带后果的
+// Warn 并**不记实例**，退出链因此也不会去注销一个没注册成功的实例。
+func (a *App) registerFail(err error) error {
+	if a.strictOf("registry") {
+		return fmt.Errorf("launchx: register %s: %w", a.serviceName, err)
+	}
+	if a.logger != nil {
+		a.logger.Warn("launchx: register failed, running unregistered",
+			logx.String("service", a.serviceName),
+			logx.Err(err),
+			logx.String("consequence", component.ConsequenceRegistry),
+			logx.String("hint", "set strict.registry: true to fail fast"),
+		)
+	}
+	return nil
+}
+
+// strictOf 读取 strict.<name> 裁决（组件环境未挂载时按缺省 false = 降级）。
+func (a *App) strictOf(name string) bool {
+	if a.comp == nil {
+		return false
+	}
+	return a.comp.StrictOf(name)
+}
+
+// selfAddr 从配置解析自身注册地址，拆成 host + port。
+//
+// 配置缺失或不是 host:port 形式都返回 error：注册地址错了比不注册更糟——
+// 上游按注册的地址连过来，连的是个不存在的实例。
+func selfAddr(cfg configx.Config) (string, int, error) {
+	raw := ""
+	for _, key := range selfAddrKeys {
+		if v := strings.TrimSpace(cfg.GetString(key)); v != "" {
+			raw = v
+			break
+		}
+	}
+	if raw == "" {
+		return "", 0, fmt.Errorf("no self address configured (tried %s)", strings.Join(selfAddrKeys, " / "))
+	}
+	host, portStr, err := net.SplitHostPort(raw)
+	if err != nil {
+		return "", 0, fmt.Errorf("self address %q is not host:port: %w", raw, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("self address %q has a non-numeric port %q: %w", raw, portStr, err)
+	}
+	return host, port, nil
 }
 
 // boolMap 读取 `key.<name>: true|false` 形态的开关表（缺省空表）。
@@ -419,6 +573,16 @@ func (a *App) Run() error {
 		if !ok {
 			return fmt.Errorf("launchx: server %T does not implement Run() error", srv)
 		}
+		// 停机钩子只在**确定要起服**时接上：从未起服的进程退出链里
+		// 不该出现对一个没监听过的句柄的停机动作。
+		stop := stopHook(srv)
+		a.mu.Lock()
+		a.serverStop = stop
+		a.mu.Unlock()
+		if stop == nil && a.logger != nil {
+			a.logger.Warn("launchx: server has no stop hook, in-flight requests will not be drained",
+				logx.String("server", fmt.Sprintf("%T", srv)))
+		}
 		return r.Run()
 	}
 	// 一个服务端都没有（后台型服务，或 srv 档业务忘了回存 RPC server）：
@@ -470,8 +634,8 @@ func (a *App) Close() error {
 		}
 	}
 
-	// 2. 服务端停止：钩子由形态装配（webx）或业务回存（RPC server）提供。
-	//    未启动过则为 no-op，不往错误聚合里塞噪声。
+	// 2. 服务端停止：钩子由 Run 起服时按服务端类型接上（webx Shutdown /
+	//    kitex Stop）。从未起服则为 nil（no-op），不往错误聚合里塞噪声。
 	rec(pipeline.StepServerStop)
 	if a.serverStop != nil {
 		if err := a.serverStop(); err != nil {
@@ -490,8 +654,19 @@ func (a *App) Close() error {
 		}
 	}
 
-	// 4. 注册中心注销（任务 9 记录注册实例后在此 Deregister）
+	// 4. 注册中心注销：只注销本进程**注册成功**的那个实例（未注册态彻底静默，
+	//    见 stepRegister）。必须早于 tracing.shutdown：注销本身会标 span，
+	//    冲刷之后再注销等于把最后一批 span 丢在缓冲里。
 	rec(pipeline.StepRegistryDeregister)
+	if inst := a.registered; inst != nil && a.registry != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), registryOpTimeout)
+		err := a.registry.Deregister(ctx, a.serviceName, inst)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("registry deregister: %w", err))
+		}
+		a.registered = nil
+	}
 
 	// 5. 调用链冲刷：必须在所有组件停止之后、logger 关闭之前。
 	//    15s 上限：批量导出器缓冲未冲刷会静默丢最后一批 span。

@@ -1,0 +1,8 @@
+# srv 档：仅 RPC 服务端（不建 webx），注册自身供上游发现（Task 7 注册实例跟踪）
+service:
+  name: srv-demo
+  mode: srv
+  addr: 127.0.0.1:9013
+
+trace:
+  enabled: false

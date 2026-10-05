@@ -1,0 +1,8 @@
+# BFF 档：HTTP 入口 + 下游 RPC 客户端，注册自身供网关发现（Task 7 注册实例跟踪）
+service:
+  name: bff-demo
+  mode: bff
+  addr: 127.0.0.1:8081
+
+trace:
+  enabled: false

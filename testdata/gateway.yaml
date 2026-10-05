@@ -1,0 +1,8 @@
+# 网关档：HTTP 入口 + 上游服务发现，自身不注册（Task 7：只有 bff/srv 注册）
+service:
+  name: gw-demo
+  mode: gateway
+  addr: 127.0.0.1:8080
+
+trace:
+  enabled: false

@@ -71,6 +71,7 @@ func TestBootstrapStartupOrder(t *testing.T) {
 		pipeline.StepLoggerInit,
 		pipeline.StepModeAssemble,
 		pipeline.StepComponentMount,
+		pipeline.StepRegistryRegister,
 	}
 	for _, w := range want {
 		if app.Events().IndexOf(w) < 0 {

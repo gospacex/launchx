@@ -1,0 +1,10 @@
+# 自身注册地址显式声明 + ${ENV} 展开（P3：地址一律来自配置，不得硬编码）
+service:
+  name: selfaddr-svc
+  mode: bff
+  addr: 127.0.0.1:8081
+  self:
+    addr: ${LX_TEST_SELF_ADDR}
+
+trace:
+  enabled: false
