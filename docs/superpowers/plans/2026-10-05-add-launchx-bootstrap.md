@@ -1365,7 +1365,7 @@ cd /Users/hyx/work/gowork/src/hubx/coordx && git status --short # 期望：clean
 
 **背景（实测）：** `webx/middleware/otel.go` **只有 Extract 没有 Inject**，全 hubx 无出向注入 helper。gateway 转发 HTTP 到 bff 时若不在出向 Header 注入 `traceparent`，下游 Extract 拿不到上游 context，链路断开。已验证写法：`micro_apps/apps/gateway/internal/proxy/proxy.go:134` 的 `otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(outReq.Header))`。
 
-- [ ] **步骤 23.1：写失败测试（T1 注入 + T7 反向断言）**
+- [x] **步骤 23.1：写失败测试（T1 注入 + T7 反向断言）**
 
 ```go
 // trace_test.go
@@ -1374,23 +1374,23 @@ func TestDefaultPropagatorIsNoop(t *testing.T)      // 不注册传播器时提�
 ```
 注意：用例必须成对使用 `t.Cleanup` 还原全局 provider / propagator，避免污染其它用例。
 
-- [ ] **步骤 23.2：运行确认失败** — `go test ./... -run 'Inject|DefaultPropagator'`
+- [x] **步骤 23.2：运行确认失败** — `go test ./... -run 'Inject|DefaultPropagator'`
 
-- [ ] **步骤 23.3：实现 `trace.Inject(ctx, carrier)`**
+- [x] **步骤 23.3：实现 `trace.Inject(ctx, carrier)`**
 
 `trace.go` 只做一件事：`otel.GetTextMapPropagator().Inject(ctx, carrier)`，**不含任何转发逻辑**；carrier 入参类型对齐 `propagation.HeaderCarrier`。链路正确性依赖 Task 6 已注册的 Composite{TraceContext, Baggage}（见「内容基线」红线 4）。
 
-- [ ] **步骤 23.4：`examples/micro/gateway` 调用注入完成 gateway → bff 续链**
+- [x] **步骤 23.4：`examples/micro/gateway` 调用注入完成 gateway → bff 续链**
 
 转发前 MUST 调用 `trace.Inject(ctx, propagation.HeaderCarrier(outReq.Header))`；缺此步则 T6 的三段同 trace 断言无法通过。
 
-- [ ] **步骤 23.5：Commit**
+- [x] **步骤 23.5：Commit**
 
 ```bash
 git add trace.go trace_test.go examples/micro/gateway && git commit -m "feat(launchx): 出向注入工具 trace.Inject（T1/T7，1.9）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 1.9 同步；plan-ready.md 无对应 Task）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 1.9 同步；plan-ready.md 无对应 Task） <!-- 已实现: 18a331d -->
 
 ---
 

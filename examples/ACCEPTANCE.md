@@ -201,17 +201,23 @@ jq -r '.spans[] | select(.operationName|startswith("db.")) | .operationName' /tm
 
 ```bash
 export PATH=/Users/hyx/sdk/go1.24.3/bin:$PATH
-go test ./internal/telemetry/ -run TestInitDisabledStillRegistersPropagator -v   # 已存在：Fields 含三项
-go test ./... -run 'TestInject|TestPropagator|TestNoTelemetry' -v                # Task 23 补齐后应命中
+go test ./internal/telemetry/ -run TestInitDisabledStillRegistersPropagator -v   # Fields 含三项
+go test . -run 'Inject|Propagator|Extract' -v                                    # Task 23 已落地
 ```
 
-已覆盖：`TestInitDisabledStillRegistersPropagator`（`internal/telemetry/telemetry_test.go`）断言 `PropagatorFields()` == `baggage/traceparent/tracestate`，且 trace 关闭时仍注册。
+已覆盖（Task 23，`trace.go` / `trace_test.go`，commit `18a331d`）：
 
-**待补（Task 23，tasks 4.1）**：
-- 向空 carrier 注入有 span 的 ctx，carrier 中存在格式合法的 `traceparent`（`00-<32hex>-<16hex>-01`）；
-- 反向断言 T7：不跑 telemetry 步骤时提取不到上游 span context。
+| 用例 | 断言 |
+|---|---|
+| `TestInjectWritesTraceParent` | 注入后 carrier 有 `traceparent`，且含上游 trace id（T1） |
+| `TestInjectAndExtractRoundTrip` | 注入→提取闭环，下游取回同一个 trace id |
+| `TestDefaultPropagatorIsNoop` | **反向断言**：noop 传播器下既写不出 traceparent、Extract 也取不到有效 context，Fields 为空（T7） |
+| `TestPropagatorFieldsContainsW3C` | Fields 覆盖 `traceparent`/`tracestate`/`baggage` |
+| `TestInjectNilCarrierSafe` | nil carrier 不 panic（转发场景易传空） |
 
-判定：两项都补齐且反向断言确实「提取失败」→ T1/T7 PASS。**反向断言若也能提取到，说明用例是空壳 → FAIL。** 当前只有 Fields 断言时，T1 记为「部分覆盖」，不得记 PASS。
+另有 `internal/telemetry` 的 `TestInitDisabledStillRegistersPropagator`：trace 关闭时传播器仍注册（关闭 trace 不等于断链基础设施）。
+
+判定：全部通过 → T1/T7 PASS。**`TestDefaultPropagatorIsNoop` 若也"通过地提取到了"，说明全局状态被其它用例污染 → FAIL。**
 
 ## 9b. T13 — 调用链完整性（分层 / 中间件矩阵 / CRUD 与连表逐条）
 
@@ -364,7 +370,7 @@ done
 | Go 代码 | 有 | 有 | **禁止有**（镜像由 micro 侧 Dockerfile 构建；mesh 只有部署面，见 §13.3 C-0） |
 | 根 span 数 | 1 | 1 | 1（应用侧）；sidecar 侧另成并行链 |
 | Jaeger 服务名 | `demo-monolith` | `demo-gateway` / `demo-bff` / `demo-srv` | 应用名 + `<workload>.<ns>` 两套 |
-| 健康入口 | `GET /healthz`（webx 默认） | gateway/bff `/healthz`；srv 靠 consul TTL | k8s `tcpSocket` 探针 + consul |
+| 健康入口 | `GET /healthz/live`、`/healthz/ready`（webx 实际注册的两个子路径，**裸 `/healthz` 返回 404**） | gateway/bff 两个子路径；srv 靠 consul TTL | k8s `tcpSocket` 探针 + consul |
 
 ---
 
@@ -448,7 +454,7 @@ jq -r '.spans[] | select(.operationName|startswith("db.")) | .tags[] | select(.k
 |---|---|---|
 | 链路 | Jaeger `service=demo-monolith` | 见 A-4 |
 | 日志 | 进程 stdout / `/tmp/monolith.log` | 启动序列与退出序列完整（见 A-6） |
-| 健康 | `curl -sf http://127.0.0.1:8080/healthz` | 200（webx `Config.HealthPrefix` 默认 `/healthz`，`webx/config.go:31`；`ReadyCheck` 未配时恒 200） |
+| 健康 | `curl -sf http://127.0.0.1:8080/healthz/live` | 200（webx `Config.HealthPrefix` 默认 `/healthz`（`webx/config.go:51`），但**实际注册的是 `/healthz/live` 与 `/healthz/ready` 两条**（`webx/webx.go:130`），裸 `/healthz` 为 404；`ReadyCheck` 未配时 `/healthz/ready` 恒 200） |
 | 数据 | `mysql order_db` 行数 | 落真库，非内存 |
 | metrics | **无** | 见 13.4，`/metrics` 404 是预期，不判 FAIL |
 
@@ -459,7 +465,7 @@ jq -r '.spans[] | select(.operationName|startswith("db.")) | .tags[] | select(.k
 cd examples/monolith && export HUBX_DB_PW=hubx123
 go build ./... && (go run ./cmd &>/tmp/monolith.log & echo $! >/tmp/monolith.pid)
 sleep 3
-curl -sf http://127.0.0.1:8080/healthz                                  # 200
+curl -sf http://127.0.0.1:8080/healthz/live                             # 200（裸 /healthz 是 404）
 curl -sf http://127.0.0.1:8080/orders                                   # 200 + JSON 数组
 curl -sf -X POST http://127.0.0.1:8080/orders -H 'Content-Type: application/json' -d '{"item":"e2e","qty":1}'
 mysql -h127.0.0.1 -uorder_rw -phubx123 order_db -e "SELECT COUNT(*) FROM orders WHERE item='e2e';"   # ≥1
@@ -567,16 +573,16 @@ jq -r '.spans[] | "\(.processID) \(.operationName)"' /tmp/trace.json            
 | 链路 | Jaeger 三个服务名 | 见 B-3 |
 | 消息 | kafka `127.0.0.1:9092`，outbox topic | 下单后有消息（E3） |
 | 日志 | 三份进程日志 | 各自含启动/退出序列 |
-| 健康 | gateway `8080/healthz`、bff `8081/healthz` | 200；srv 无 HTTP 端点，靠 consul TTL 心跳 |
+| 健康 | gateway `8080/healthz/live`、bff `8081/healthz/live` | 200；srv 无 HTTP 端点，靠 consul TTL 心跳 |
 | 限流/鉴权 | gateway `internal/ratelimit`、`auth`（若实现） | 404/429/502 原样透传（不改写为 200） |
 
 #### B-5 判定清单
 
 ```bash
-# 启动顺序：srv → bff → gateway，每步等 /healthz 或 consul 就绪
+# 启动顺序：srv → bff → gateway，每步等 /healthz/live 或 consul 就绪
 curl -s 'http://127.0.0.1:8500/v1/health/service/demo-srv?passing=1' | jq 'length'      # ≥1
-curl -sf http://127.0.0.1:8081/healthz
-curl -sf http://127.0.0.1:8080/healthz
+curl -sf http://127.0.0.1:8081/healthz/live
+curl -sf http://127.0.0.1:8080/healthz/live
 curl -sf http://127.0.0.1:8080/api/ping        | grep -q '"service":"bff"'              # gateway→bff
 curl -sf http://127.0.0.1:8080/api/order/1001  | grep -q 'order_id'                     # →bff→srv→mysql
 # 上游不可达时 gateway 必须 502，不得 200 静默
@@ -781,7 +787,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | 分布式链路 | ✅ | ✅ | ✅ | otelx + OTLP 4318 → Jaeger |
 | 结构化日志 | ✅ | ✅ | ✅ | logx |
 | 日志 ↔ 链路关联（trace_id 落日志字段） | ⚠️ 待核 | ⚠️ 待核 | ⚠️ 待核 | logx 侧未检索到 trace_id 注入逻辑，需真机确认后再定；未确认前**不得**记 PASS |
-| HTTP 健康端点 | ✅ `/healthz` | gateway/bff ✅；srv ❌ | 由 k8s 探针替代 | `webx/config.go:31`（`HealthPrefix` 默认 `/healthz`） |
+| HTTP 健康端点 | ✅ `/healthz/live` + `/healthz/ready` | gateway/bff ✅；srv ❌ | 由 k8s 探针替代 | `webx/webx.go:130`（`HealthPrefix` 默认 `/healthz`，`webx/config.go:51`；**裸前缀路径无 handler**） |
 | 注册与健康检查 | 不注册 | consul TTL + 心跳 | consul + k8s 双层 | coordx |
 | metrics / Prometheus | ❌ | ❌ | ❌ | **实测缺口**：`webx.Config.MetricsEnabled`（`webx/config.go:35`）在全仓零引用；otelx 未导出 MeterProvider → `/metrics` 不存在是**预期**，判 SKIP 而非 FAIL，更不得伪造端点记 PASS |
 | pprof | ❌ | ❌ | ❌ | 本轮不做 |

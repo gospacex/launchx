@@ -16,7 +16,7 @@
 - [x] 1.6 实现 `internal/pipeline` 固定启动骨架与 `internal/telemetry`（otelx 封装）：配置 → telemetry.Init（全局 TracerProvider + Composite 传播器，最先）→ logx.SetGlobal → mode 装配 → 组件挂载 → 回调 Setup；顺序用事件记录器可断言（对应验收案例 A2） <!-- 已实现: fc02f6c -->
 - [x] 1.7 实现反序退出编排（`App.Run` 收尾段）：server → 组件 Stop → deregister → tracing.Shutdown(15s flush) → logger.Close，显式序列不依赖 defer；Setup 失败与运行期错误走同一退出链（对应验收案例 A3） <!-- 已实现: 21c2fb0 -->
 - [ ] 1.8 实现 `debug` 伪组件（observability capability）：`debug.enabled`（yaml 或 `APP_DEBUG=1`）时临时起仅监听 `127.0.0.1:6060` 的 debug server（标准 `net/http/pprof` handlers），生产默认关；端口冲突 Warn 带病运行；退出序列插入点先于 logger.Close（对应验收案例 O1/O2）
-- [ ] 1.9 导出极小出向注入工具（如 `trace.Inject(ctx, carrier)`，仅做 `otel.GetTextMapPropagator().Inject`，不含转发逻辑）：因 `webx/middleware/otel.go` 只有 Extract 无 Inject、全 hubx 无出向注入 helper；写法对齐已验证的 `micro_apps/apps/gateway/internal/proxy/proxy.go:134`；`examples/micro/gateway` MUST 调用它完成 gateway → bff 的 HTTP 续链（对应验收案例 T6）
+- [x] 1.9 导出极小出向注入工具（如 `trace.Inject(ctx, carrier)`，仅做 `otel.GetTextMapPropagator().Inject`，不含转发逻辑）：因 `webx/middleware/otel.go` 只有 Extract 无 Inject、全 hubx 无出向注入 helper；写法对齐已验证的 `micro_apps/apps/gateway/internal/proxy/proxy.go:134`；`examples/micro/gateway` MUST 调用它完成 gateway → bff 的 HTTP 续链（对应验收案例 T6） <!-- 已实现: 18a331d -->
 
 ## 2. Examples Demos
 
