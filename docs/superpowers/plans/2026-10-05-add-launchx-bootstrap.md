@@ -913,17 +913,17 @@ git add examples/micro/gateway && git commit -m "feat: examples/micro/gateway �
 **文件：**
 - 创建：`examples/micro/bff/{config.yaml,cmd/main.go,app/setup.go,internal/handler/order.go,internal/downstream/client.go}`
 
-- [ ] **步骤 10.1：依赖前置检查（bff 调 srv 需要 Task 11 迁入的 kitex_gen 与下游 client 类型）**
+- [x] **步骤 10.1：依赖前置检查（bff 调 srv 需要 Task 11 迁入的 kitex_gen 与下游 client 类型）** <!-- 已实现: 3c5021c -->
 
 本 Task 的 `internal/downstream` 依赖 `examples/micro/srv/pkg/kitex_gen`（同 module import）与 srv 已注册 consul → **执行顺序：先 Task 11 的复制部分（步骤 11.1–11.2），再本 Task；11.3（main.go 改写）与 11.4 可回移**。若 kitex_gen 尚未迁入，先跑 Task 11 的 11.1/11.2。
 
-- [ ] **步骤 10.2：config.yaml + main.go + 下游调用**
+- [x] **步骤 10.2：config.yaml + main.go + 下游调用** <!-- 已实现: 3c5021c -->
 
 `config.yaml`：`service.mode: bff`、`webx.addr: "127.0.0.1:8081"`（`examples/ACCEPTANCE.md` §13.2 端口定稿；原写的 `8091` 为笔误，已统一为 8081）、`coordx` 段同 gateway、`rpcx` 下游段（`downstream.srv.target` 缺省经 `Registry.Target` 解析）。
 `internal/downstream/client.go`：经 `app.RPCClientOptions("srv")` 工厂（Task 5 产出）构造 kitex 客户端（import `examples/micro/srv/pkg/kitex_gen` 的订单服务类型），封装 `GetOrder(ctx, id)`；**不**为 srv 新增 HTTP 适配层（plan-ready 2026-10-04 翻译层修正）。
 `internal/handler/order.go`：`GET /ping`（自响应 `{"service":"bff"}`）、`GET /order/:id`（调下游 GetOrder）。
 
-- [ ] **步骤 10.3：构建 + 单进程可启动 + Commit**
+- [x] **步骤 10.3：构建 + 单进程可启动 + Commit** <!-- 已实现: 3c5021c -->
 
 运行：
 ```bash
@@ -934,7 +934,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx/examples/micro/bff && go build ./...
 git add examples/micro/bff && git commit -m "feat: examples/micro/bff demo（rpcx 下游客户端，2.3，E2 中段）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.3 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.3 同步） <!-- 已实现: 3c5021c -->
 
 ---
 

@@ -143,7 +143,7 @@
 - 验证方式：`go build ./...`；起 consul 后 `curl localhost:8080/api/ping` 经转发命中 bff（验收案例 E2 前半）
 
 ### Task 10: examples/micro/bff 服务 demo
-- [ ] **任务完成**（与 superpowers plan `Task 10`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 10`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 3c5021c -->
 - 目标：新建 `examples/micro/bff/`：mode bff，webx 入口 + consul 注册；`GET /ping`（自响应）与 `GET /order/:id`（经 `app.RPCClientOptions("srv")` 工厂取 rpcx 客户端选项——Target 来自 `app.Registry.Target("srv")`、挂 obs-opentelemetry suite——构造 kitex 客户端调 srv `GetOrder`；客户端类型复用已迁入的 `examples/micro/srv/pkg/kitex_gen`，demo 内同 module 直接 import，**不**新增 srv HTTP 适配层。与 proposal/mode-assembly spec/tasks.md 2.3 的「rpcx 下游客户端」一致）
 - 改动文件：`examples/micro/bff/{config.yaml,cmd/main.go,app/setup.go,internal/handler/*.go,internal/downstream/*.go}`
 - 验证方式：`go build ./...`；起 consul+srv 后 `curl localhost:8091/order/1001` 返回 srv 数据（验收案例 E2 中段）
