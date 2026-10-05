@@ -108,9 +108,11 @@
 - **API 事实纠偏（2026-10-05 采集）**：`Target/Resolve` 不在 coordx（coordx 侧等价能力为 `Discover.Discovery(ctx, service) ([]*ServiceInstance, error)`）；`Target(agentAddr, serviceID)` 是 `micro_apps/infra/consul/registry.go:148` 的应用层助手 → registry 组件的 Target/Resolve 逻辑**移植自该文件**进 `internal/component/consul.go`，coordx 仅承担 Register/Deregister/Discovery 原语。另：`infra/` 目录不存在于 srv-order 仓（各 app 复制的是 `micro_apps/infra/{consul,nacos,telemetry,drivers}`），Task 11 迁移时删除的是对 `micro_apps/infra` 的 import，改为 launchx 等价物
 
 ### Task 5: mode 四档装配分支
-- [ ] **任务完成**（与 superpowers plan `Task 5`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 5`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 0cb00c8 -->
 - 目标：`internal/mode`：`Assemble(app) error` 按 `service.mode` 分支——monolith/bff/gateway 构造 `webx.App`（Addr 来自 yaml、Tracer/Logger 注入、PreRun 挂路由）并按档决定 consul 注册与下游客户端工厂；srv 不建 webx、提供 rpcx ServerOptions 与注册；非法/缺失 mode 返回含 `monolith|bff|srv|gateway` 合法取值的 error（验收案例 C1/C2/C3）
-- 改动文件：`internal/mode/{mode.go,webx.go,srv.go,registry.go}`、`internal/mode/mode_test.go`
+- 改动文件：`internal/mode/{mode.go,webx.go,srv.go}`、`internal/mode/mode_test.go`；`app.go` 接通 `mode.Assemble` + `Run` + `serverStop` 钩子（未建 `registry.go`：注册/发现一律经 rpcx 的 coordx 适配）
+- **API 事实纠偏（2026-10-05 实测）**：`coordx.Register` 只有 `Register/Deregister/HealthCheck/Close`（`coordx/interface.go:23`），**没有** `Target(agentAddr, service)`；故「上游发现」不走 Registry.Target，改为经 `rpcx.BuildClientOptions(ClientOptions{RegistryAddr})` 内部的 coordx resolver（`rpcx/client.go:31`）
+- **启动/停机 API 实测**：`webx.App.Run() error` / `Shutdown(ctx) error`（`webx/webx.go:235/240`，未运行时 Shutdown 返回 errStatusNotRunning，故停机钩子先判 `IsRunning()`）；kitex `server.Server` 为 `Run() error` / `Stop() error`（`kitex@v0.16.3/server/server.go:54`）
 - 验证方式：`go test ./internal/mode/` — 四档装配断言 + 非法 mode 报错断言通过（验收案例 C1/C2/C3）
 - **依赖选型（2026-10-04 裁决）**：srv 档的 ServerOptions 由新建的 `github.com/gospacex/rpcx` 提供（前置 Task 27），**不建 `internal/rpcx`**；HTTP 侧经 `webx`；本 Task 不 import kitex / hertz
 

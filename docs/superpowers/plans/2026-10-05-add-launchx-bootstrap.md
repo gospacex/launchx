@@ -606,7 +606,7 @@ git add internal/component ../coordx 2>/dev/null; git add internal/component && 
 **文件：**
 - 创建：`internal/mode/{mode.go,webx.go,srv.go}`、`internal/mode/mode_test.go`
 
-- [ ] **步骤 5.1：写失败测试（C1/C2/C3 + 非法/缺失 mode 报错 + 拒绝 mesh 取值）**
+- [x] **步骤 5.1：写失败测试（C1/C2/C3 + 非法/缺失 mode 报错 + 拒绝 mesh 取值）** <!-- 已实现: 0cb00c8 -->
 
 创建 `internal/mode/mode_test.go`：
 ```go
@@ -648,7 +648,7 @@ func TestModeAssemblyMatrix(t *testing.T) {
 }
 ```
 
-- [ ] **步骤 5.2：实现四档分支**
+- [x] **步骤 5.2：实现四档分支** <!-- 已实现: 0cb00c8 -->
 
 `internal/mode/mode.go`：
 ```go
@@ -671,7 +671,7 @@ func Assemble(h *AppHolders) error {
 `webx.go`：`webx.New(webx.WithConfig(webx.ReadConfigFromConfigx(cfg)), webx.WithLogger(h.Logger), webx.WithTracer(h.Tracer))`，PreRun 挂路由由 Setup 回调完成（Task 8 的 `app/routes.go` 经 `WithPreRun` 注入）；bff 档额外产出 `RPCClientOptions(service string)` 工厂（Target = `Registry.Target(agentAddr, service)`，挂 obs suite）；`srv.go`：`ServerOptions`（rpcx.NewServer 的 options 组装，kitex server 由业务 Setup 构建，句柄存 `App.RPCServer`）。
 error 文案：`errMissingMode/errIllegalMode/errMeshRejected` 均含 `合法取值：monolith|bff|srv|gateway`，mesh 追加「mesh 非独立档，与微服同代码，请使用 srv/gateway/bff 并以部署清单体现网格」。
 
-- [ ] **步骤 5.3：运行确认通过 + Commit**
+- [x] **步骤 5.3：运行确认通过 + Commit** <!-- 已实现: 0cb00c8 -->
 
 运行：`go test ./internal/mode/ -v`
 预期：PASS（C1/C2/C3 + 非法/缺失/mesh 拒绝）。
@@ -679,7 +679,7 @@ error 文案：`errMissingMode/errIllegalMode/errMeshRejected` 均含 `合法取
 git add internal/mode && git commit -m "feat: mode 四档装配分支（C1-C3/C4 纯代码断言，1.5）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.5 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.5 同步） <!-- 已实现: 0cb00c8 -->
 
 ---
 
