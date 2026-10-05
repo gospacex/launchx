@@ -216,7 +216,355 @@ done
 
 ---
 
-## 13. 判定汇总表（跑一次填一次）
+## 13. 三类框架案例的验收细节（目录树 / 调用链 / 可观测）
+
+三类案例指**三种部署与框架形态**，业务恒为「订单」——同一份业务在三类下走不同装配路径，用来证明 launchx 的「换形态不改业务代码」（验收案例 C4 / T8）。
+
+### 13.0 总览对照
+
+| 维度 | A 单体 `examples/monolith` | B 微服 `examples/micro` | C 网格 `examples/mesh` |
+|---|---|---|---|
+| `service.mode` | `monolith` | `gateway` / `bff` / `srv`（三个进程各一档） | 与 B **完全相同**（无 `mesh` 档） |
+| 进程数 | 1 | 3 | 3（复用 B 的镜像） |
+| 入口协议 | HTTP（webx/hertz） | HTTP → HTTP → Kitex RPC | 同 B，流量经 sidecar 接管 |
+| 服务间调用 | 进程内函数调用 | RPC + consul 发现 | 同 B（+ k8s Service 一层） |
+| 注册发现 | **不注册** | gateway 只发现不注册；bff/srv 注册 | 同 B |
+| Go 代码 | 有 | 有 | **禁止有**（只放清单与配置副本） |
+| 根 span 数 | 1 | 1 | 1（应用侧）；sidecar 侧另成并行链 |
+| Jaeger 服务名 | `demo-monolith` | `demo-gateway` / `demo-bff` / `demo-srv` | 应用名 + `<workload>.<ns>` 两套 |
+| 健康入口 | `GET /healthz`（webx 默认） | gateway/bff `/healthz`；srv 靠 consul TTL | k8s `tcpSocket` 探针 + consul |
+
+---
+
+### 13.1 案例 A — 单体（`examples/monolith`）
+
+#### A-1 目录树（约定即断言）
+
+```
+examples/monolith/
+├── config.yaml                  # mode: monolith
+├── cmd/main.go                  # ≤50 行，Bootstrap + OnSetup + Run
+├── app/
+│   ├── setup.go                 # func Setup(*launchx.App) error：装配 repo→service→logic→handler
+│   └── routes.go                # func RegisterRoutes(...)：经 WithPreRun 挂入
+└── internal/
+    ├── handler/order.go         # 仅做参数绑定与响应封装
+    ├── logic/order.go           # 校验 / 错误映射
+    ├── service/order.go         # 业务编排（自开 span）
+    ├── repository/order.go      # 经 App.DB（*gorm.DB）读写
+    └── model/order.go           # GORM model
+```
+
+判定（结构不得漂移）：
+
+```bash
+cd examples/monolith
+test -f config.yaml && test -f cmd/main.go && test -f app/setup.go && test -f app/routes.go
+for d in handler logic service repository model; do test -d internal/$d || echo "MISSING internal/$d"; done
+# 反向断言：业务分层不得出现 mode 分支（C4）
+grep -rn "monolith\|bff\|gateway\|srv" internal/ | grep -v "_test.go"    # 必须为空
+```
+
+#### A-2 `main.go` 契约
+
+```bash
+wc -l cmd/main.go                                    # ≤ 50
+grep -c "launchx.Bootstrap" cmd/main.go              # = 1
+grep -nE "gorm\.Open|sql\.Open|consul|otel\." cmd/main.go   # 必须为空（裸装配全部下沉到 launchx）
+```
+
+形态必须是 `Bootstrap(path) → OnSetup(Setup) → Run()` 三段，且 `Setup` 只做业务装配。
+
+#### A-3 `config.yaml` 契约（关键段）
+
+| 键 | 值 | 说明 |
+|---|---|---|
+| `service.name` | `demo-monolith` | Jaeger 服务名，也是 dbx 实例名 |
+| `service.mode` | `monolith` | 缺失/非法即退（C2） |
+| `webx.addr` | `127.0.0.1:8080` | 与 gateway 同端口但不同时运行 |
+| `xmiddleware.sqlx.driver` | `gorm` | |
+| `xmiddleware.sqlx.databases.demo-monolith.dsn` | `order_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/order_db?...` | 运行前 `export HUBX_DB_PW=hubx123` |
+| `logx.level` | `info` | |
+| `logx.otel.enable_trace` / `exporter` / `endpoint` | `true` / `otlp` / `127.0.0.1:4318` | |
+
+**不得出现**：`coordx` 段（单体不注册）、`gateway.routes`、`rpcx` 监听段。出现即为装配越界。
+
+#### A-4 调用链拓扑（期望形态）
+
+```
+GET /orders  (demo-monolith, SERVER)                 ← 唯一根 span
+└── service.ListOrders  (INTERNAL)                   ← 业务自开，非 launchx 代开
+    ├── repository.Query  (INTERNAL)
+    │   └── db.query  (CLIENT)  db.query.text="SELECT * FROM orders WHERE ..."
+    └── cache.GET order:list  (CLIENT)               ← 若命中缓存路径
+```
+
+span 清单与判据（`/tmp/trace.json` 取自 `service=demo-monolith`）：
+
+```bash
+jq -r '.spans[] | "\(.spanID)  \(.operationName)  parent=\(.references[0].spanID // "-")"' /tmp/trace.json
+jq '[.spans[] | select((.references|length)==0)] | length'                       # = 1
+jq '[.spans[] | select(.operationName|startswith("db."))] | length'               # ≥ 1
+jq -r '.spans[] | select(.operationName|startswith("db.")) | .tags[] | select(.key=="db.query.text").value'  # 完整 SQL
+```
+
+判定：根 span = 1；树深 ≥ 3；db span 的 `db.query.text` 为完整 SQL（非空、无 `?` 残留）；业务 span 由业务代码自开（若分层未自开 span 导致树深 = 2，属业务漏埋点 → 记 FAIL 并注明）。
+
+#### A-5 可观测面
+
+| 面 | 入口 | 判定 |
+|---|---|---|
+| 链路 | Jaeger `service=demo-monolith` | 见 A-4 |
+| 日志 | 进程 stdout / `/tmp/monolith.log` | 启动序列与退出序列完整（见 A-6） |
+| 健康 | `curl -sf http://127.0.0.1:8080/healthz` | 200（webx `Config.HealthPrefix` 默认 `/healthz`，`webx/config.go:31`；`ReadyCheck` 未配时恒 200） |
+| 数据 | `mysql order_db` 行数 | 落真库，非内存 |
+| metrics | **无** | 见 13.4，`/metrics` 404 是预期，不判 FAIL |
+
+#### A-6 判定清单
+
+```bash
+# 启动与业务
+cd examples/monolith && export HUBX_DB_PW=hubx123
+go build ./... && (go run ./cmd &>/tmp/monolith.log & echo $! >/tmp/monolith.pid)
+sleep 3
+curl -sf http://127.0.0.1:8080/healthz                                  # 200
+curl -sf http://127.0.0.1:8080/orders                                   # 200 + JSON 数组
+curl -sf -X POST http://127.0.0.1:8080/orders -H 'Content-Type: application/json' -d '{"item":"e2e","qty":1}'
+mysql -h127.0.0.1 -uorder_rw -phubx123 order_db -e "SELECT COUNT(*) FROM orders WHERE item='e2e';"   # ≥1
+
+# 退出序列（反序，缺一即 FAIL）
+kill -TERM $(cat /tmp/monolith.pid)
+grep -E "server|component|deregister|tracing|logger|shutdown" /tmp/monolith.log
+```
+
+| 判据 | 通过条件 |
+|---|---|
+| 三个请求 + mysql 行数 | 全过 → PASS |
+| SIGTERM 后 20s 内退出码 0 | 是 → PASS |
+| 退出序列顺序 | `server.stop → component.stop → (无 deregister) → tracing.shutdown → logger.close`；单体不注册，故**不应**出现 deregister |
+| 日志中无 `panic` / `span context missing` | 是 → PASS |
+
+---
+
+### 13.2 案例 B — 微服（`examples/micro`）
+
+#### B-1 目录树
+
+```
+examples/micro/
+├── gateway/
+│   ├── config.yaml              # mode: gateway
+│   ├── cmd/main.go              # ≤50 行
+│   ├── app/setup.go
+│   ├── internal/routing/routes.go
+│   └── internal/proxy/proxy.go  # 反向代理 + 状态码映射
+├── bff/
+│   ├── config.yaml              # mode: bff
+│   ├── cmd/main.go              # ≤50 行
+│   ├── app/setup.go
+│   ├── internal/handler/order.go
+│   └── internal/downstream/client.go   # 经 App.RPCClientOptions("srv") 构造 kitex 客户端
+└── srv/
+    ├── config.yaml              # mode: srv
+    ├── cmd/main.go              # ≤50 行（E3 硬断言）
+    ├── app/setup.go
+    ├── internal/{service,repository,rpc,middleware}/**   # 自 srv-order 迁移，业务零改动
+    └── pkg/kitex_gen/**         # bff 通过同 module import 复用，不复制第二份
+```
+
+判定：
+
+```bash
+for s in gateway bff srv; do
+  test -f examples/micro/$s/config.yaml && test -f examples/micro/$s/cmd/main.go || echo "MISSING $s"
+  wc -l examples/micro/$s/cmd/main.go                       # 每个 ≤50
+  grep -c "launchx.Bootstrap" examples/micro/$s/cmd/main.go # 每个 =1
+done
+grep -rn "micro_apps/infra" examples/micro/                 # 必须为空（E3）
+find examples/micro -name kitex_gen -type d                 # 只能 1 个（在 srv 下）
+```
+
+#### B-2 三个 `config.yaml` 的差异（差异即装配矩阵）
+
+| 键 | gateway | bff | srv |
+|---|---|---|---|
+| `service.name` | `demo-gateway` | `demo-bff` | `demo-srv` |
+| `service.mode` | `gateway` | `bff` | `srv` |
+| `webx.addr` | `127.0.0.1:8080` | `127.0.0.1:8081` | **不配**（srv 不建 HTTP 引擎） |
+| `coordx.driver/addr` | `consul` / `http://127.0.0.1:8500` | 同左 | 同左 |
+| 注册 | **否**（只发现） | 是 | 是 |
+| `gateway.routes` | `/api → bff` | 不配 | 不配 |
+| RPC 监听 | 不配 | 不配（只有出向客户端） | `127.0.0.1:9013` |
+| `xmiddleware.sqlx` | 不配 | 不配 | 配（order_db） |
+| `xmiddleware.mqx`（kafka） | 不配 | 不配 | 配（`127.0.0.1:9092`，**不**用 19093） |
+
+**端口定稿**：monolith `8080`、gateway `8080`、bff `8081`、srv RPC `127.0.0.1:9013`（沿用原 srv-order 监听地址）。
+⚠️ 计划 Task 10 步骤 10.2 写的 bff `8091` 是笔误——实现按 **8081** 落，并回改计划与本文档保持单一口径。
+
+#### B-3 调用链拓扑（跨进程，三段同 trace）
+
+```
+gateway  GET /api/order/1001  (SERVER)                       ← 唯一根 span
+└── HTTP client → bff         (CLIENT)  traceparent 出向注入
+    bff  GET /order/1001      (SERVER, 远端父 = gateway client span)
+    └── RPC GetOrder → srv    (CLIENT)  traceparent 经 kitex 元数据注入
+        srv  GetOrder         (SERVER, 远端父 = bff client span)
+        └── db.query          (CLIENT)  db.query.text="SELECT ... FROM orders WHERE id=?"
+```
+
+出向注入（T1/T7 红线）：`webx/middleware/otel.go` **只有 Extract 没有 Inject**，因此 gateway 的反向代理在转发前**必须**显式调 `launchx.Inject(ctx, header)`；bff→srv 由 rpcx 的 `ClientSpanMiddleware` 注入。两处缺任一都断链。
+
+判据：
+
+```bash
+curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway&limit=20" | jq -r '.data[0].traceID' | head -1
+curl -s "http://127.0.0.1:16686/api/traces/$T" | jq '.data[0]' > /tmp/trace.json
+
+jq -r '.processes | to_entries[] | .value.serviceName' /tmp/trace.json | sort -u   # 三个服务名齐
+jq '[.spans[] | select((.references|length)==0)] | length'                          # = 1
+jq -r '.spans[] | "\(.processID) \(.operationName)"' /tmp/trace.json                # 父子方向
+```
+
+判定：服务名集合 = {gateway, bff, srv}；根 span = 1；gateway span 是 bff span 的祖先、bff 是 srv 的祖先；srv 侧 db span 同 trace。三段各成一根（trace 数 ≥ 3）→ FAIL。
+
+#### B-4 可观测面
+
+| 面 | 入口 | 判定 |
+|---|---|---|
+| 服务发现 | `curl -s 'http://127.0.0.1:8500/v1/health/service/demo-srv?passing=1' \| jq length` | ≥ 1（bff 同理；**gateway 不应出现在注册表中**） |
+| 链路 | Jaeger 三个服务名 | 见 B-3 |
+| 消息 | kafka `127.0.0.1:9092`，outbox topic | 下单后有消息（E3） |
+| 日志 | 三份进程日志 | 各自含启动/退出序列 |
+| 健康 | gateway `8080/healthz`、bff `8081/healthz` | 200；srv 无 HTTP 端点，靠 consul TTL 心跳 |
+| 限流/鉴权 | gateway `internal/ratelimit`、`auth`（若实现） | 404/429/502 原样透传（不改写为 200） |
+
+#### B-5 判定清单
+
+```bash
+# 启动顺序：srv → bff → gateway，每步等 /healthz 或 consul 就绪
+curl -s 'http://127.0.0.1:8500/v1/health/service/demo-srv?passing=1' | jq 'length'      # ≥1
+curl -sf http://127.0.0.1:8081/healthz
+curl -sf http://127.0.0.1:8080/healthz
+curl -sf http://127.0.0.1:8080/api/ping        | grep -q '"service":"bff"'              # gateway→bff
+curl -sf http://127.0.0.1:8080/api/order/1001  | grep -q 'order_id'                     # →bff→srv→mysql
+# 上游不可达时 gateway 必须 502，不得 200 静默
+```
+
+| 判据 | 通过条件 |
+|---|---|
+| consul 实例数 | `demo-srv` ≥ 1、`demo-bff` ≥ 1、`demo-gateway` = 0 |
+| 三个服务名同 trace | 是 |
+| 根 span = 1 | 是 |
+| 上游停掉后 gateway 返回 | 502（原样透传），非 200 |
+| srv `main.go` ≤ 50 行、无 `micro_apps/infra` | 是（E3） |
+
+---
+
+### 13.3 案例 C — 网格（`examples/mesh`）
+
+#### C-1 目录树（**禁 Go 代码**）
+
+```
+examples/mesh/
+├── namespace.yaml                     # launchx-mesh
+├── workloads/
+│   ├── gateway.yaml                   # Deployment + Service（gateway）
+│   ├── bff.yaml
+│   └── srv.yaml
+├── telemetry.yaml                     # Istio Telemetry + extensionProvider(opentelemetry)
+├── configs/
+│   ├── gateway.yaml                   # 微服配置的地址副本
+│   ├── bff.yaml
+│   └── srv.yaml
+├── scripts/bring-up.sh                # start / check / down
+└── docs/verify.md                     # T12 证据落盘
+```
+
+```bash
+find examples/mesh -name '*.go'                     # 必须为空（出现即 FAIL：网格走了独立代码路径）
+kubectl apply --dry-run=client -f examples/mesh/ -R # 全过
+bash examples/mesh/scripts/bring-up.sh check        # 缺失底座必须非零退出（静默 0 = FAIL）
+```
+
+#### C-2 与微服的同构断言（T8）
+
+```bash
+# 配置副本差异只在地址段
+for s in gateway bff srv; do
+  diff <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/micro/$s/config.yaml) \
+       <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/mesh/configs/$s.yaml)
+done
+# 清单侧：镜像指向 launchx-examples/*，探针 tcpSocket 且端口与业务一致（3.13/O3）
+grep -n "tcpSocket" -A2 examples/mesh/workloads/*.yaml
+```
+
+#### C-3 调用链拓扑（双链并存）
+
+```
+同一 trace 内：
+  app:      demo-gateway ──► demo-bff ──► demo-srv ──► db.query
+  sidecar:  gateway.<ns> ──► bff.<ns> ──► srv.<ns>       （Envoy 自产，与应用 span 并行插入）
+
+反例（T11，应用侧未注册传播器）：
+  trace#1  sidecar 完整链（看着严丝合缝）
+  trace#2  demo-gateway 孤儿
+  trace#3  demo-bff 孤儿
+  trace#4  demo-srv 孤儿        → trace 数 ≥ 4
+```
+
+判据（**两侧都要查**）：
+
+```bash
+curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway&limit=20"          | jq '.data | length'
+curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&limit=20" | jq '.data | length'
+# T10：同一 traceID 下两类 span 并存，且应用 span 父子链仍为 gateway→bff→srv
+# T11：trace 数 ≥ 4 即判定为断链（不是"sidecar 链完整"就算过）
+```
+
+#### C-4 可观测面
+
+| 面 | 入口 | 判定 |
+|---|---|---|
+| 注入 | `kubectl get pods -n launchx-mesh` | 每个 Pod READY `2/2`（业务 + sidecar） |
+| 控制面 | `istioctl proxy-status` | 全部 `SYNCED` |
+| 传播头 | 实测：bff 打印收到的 `traceparent`；或 `istioctl proxy-config log` 打开 `trace` 级 | 头名必须是 `traceparent`（W3C），出现 `x-b3-*` 即断链 |
+| 链路 | Jaeger 两套服务名 | 见 C-3 |
+| 探针 | `kubectl describe pod` 的 `tcpSocket` | 端口与业务一致；**不用 httpGet**（sidecar 未就绪时 httpGet 会误判） |
+| OFF/ON | `hubx.trace` 各跑一次 | OFF 无业务 span，ON 有完整链路，可复现（E5） |
+
+**待核（不凭记忆定稿）**：Istio 的 extensionProvider 选 `opentelemetry` 时 Envoy 走 W3C `traceparent`，与 launchx 的 `Composite{TraceContext, Baggage}` 对齐；选 `zipkin`/`jaeger` provider 会走 B3（`x-b3-*`）直接断链。真机以实测头名确认，结论写回 `docs/verify.md` 与 §11b。
+
+#### C-5 判定清单
+
+| 判据 | 通过条件 |
+|---|---|
+| `find examples/mesh -name '*.go'` | 空 |
+| `kubectl apply --dry-run=client -R` | 全过 |
+| `bring-up.sh check` | 底座齐全时 0；缺失时**非零**并显式报缺失 |
+| Pod READY | 全部 `2/2` |
+| T10 双链并存 | 同一 trace 有 app + sidecar span，app 父子链方向不变 |
+| T11 反例 | 关掉应用传播器后 trace 数 ≥ 4（证明该断言非空壳） |
+| E5 OFF/ON | 可复现，两侧各一次 |
+| T12 证据 | `docs/verify.md` 含 trace-id / span 总数 / app span 数 vs sidecar 数 / 原始响应 / 版本清单 |
+
+---
+
+### 13.4 三类共用的可观测基线与已知缺口（**不得伪装**）
+
+| 能力 | 单体 | 微服 | 网格 | 依据 |
+|---|---|---|---|---|
+| 分布式链路 | ✅ | ✅ | ✅ | otelx + OTLP 4318 → Jaeger |
+| 结构化日志 | ✅ | ✅ | ✅ | logx |
+| 日志 ↔ 链路关联（trace_id 落日志字段） | ⚠️ 待核 | ⚠️ 待核 | ⚠️ 待核 | logx 侧未检索到 trace_id 注入逻辑，需真机确认后再定；未确认前**不得**记 PASS |
+| HTTP 健康端点 | ✅ `/healthz` | gateway/bff ✅；srv ❌ | 由 k8s 探针替代 | `webx/config.go:31`（`HealthPrefix` 默认 `/healthz`） |
+| 注册与健康检查 | 不注册 | consul TTL + 心跳 | consul + k8s 双层 | coordx |
+| metrics / Prometheus | ❌ | ❌ | ❌ | **实测缺口**：`webx.Config.MetricsEnabled`（`webx/config.go:35`）在全仓零引用；otelx 未导出 MeterProvider → `/metrics` 不存在是**预期**，判 SKIP 而非 FAIL，更不得伪造端点记 PASS |
+| pprof | ❌ | ❌ | ❌ | 本轮不做 |
+| 告警 / 看板 | ❌ | ❌ | ❌ | 本轮不做 |
+
+> 上表是「有没有」的事实登记，不是验收项。缺口项统一记 **SKIP**，任何把 SKIP 写成 PASS 的行为按 §15 第 7 条处理。
+
+## 14. 判定汇总表（跑一次填一次）
 
 | 编号 | 案例 | 命令锚点 | 状态 | 证据 |
 |---|---|---|---|---|
@@ -231,10 +579,14 @@ done
 | T6 | 三段同 trace | §6 | | `/tmp/trace.json` |
 | T8 | 网格无专属分支 | §12 | | grep/diff 输出 |
 | T9 | 尾部 span 不缺 | §8 | | `/tmp/trace.json` |
-| T10/T11/T12 | 网格链路 | §11b | | `examples/mesh/docs/verify.md` |
+| T10/T11/T12 | 网格链路 | §11b / §13.3 | | `examples/mesh/docs/verify.md` |
 | 3.14 | 依赖面 | §2/§12 | | grep 输出 |
+| A | 单体案例（目录树/链路/可观测） | §13.1 | | `/tmp/monolith.log` + `/tmp/trace.json` |
+| B | 微服案例（三进程/三段链/ consul） | §13.2 | | consul 实例数 + `/tmp/trace.json` |
+| C | 网格案例（清单/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 |
+| OBS | 可观测基线与缺口登记 | §13.4 | | 缺口项记 SKIP，不得记 PASS |
 
-## 14. 「看起来过了其实没过」陷阱清单
+## 15. 「看起来过了其实没过」陷阱清单
 
 1. **孤儿 trace**：三个服务各一根 trace，每条点开都有 span → 传播器没注册（空 Composite）。判据只有一条：根 span 数 = 1 / trace 数不暴增。
 2. **db span 在但没有 SQL**：`db.query.text` 空或只剩占位符 → 埋点没取到语句。必须逐 span 查属性值，不能只看 span 名。
@@ -242,3 +594,8 @@ done
 4. **降级被当成通过**：consul 挂了照样起来 → 这是设计内行为（A3），但**必须**有 Warn 日志；`strict=true` 时必须反过来变成启动失败。只测一种不算过。
 5. **网格 sidecar 假完整**：sidecar 之间靠 Envoy 自身透传，链路看着严丝合缝，但 app span 全脱落（trace 数 ≥ 4）。必须同时查应用服务名与 sidecar 服务名。
 6. **dry-run 静默通过**：minikube/kubectl 没装时 `check` 返回 0 → 视为 FAIL，必须显式报缺失并退非零。
+7. **把缺口记成通过**：metrics / pprof / 日志 trace_id 关联这三类本轮**不存在**（§13.4）。`/metrics` 返回 404 是预期，记 SKIP；若为使表格好看而写 PASS，或临时加个返回空 JSON 的假端点凑数 → 一律 FAIL。
+8. **只跑一个进程就宣称微服链路通**：gateway 起来了、bff/srv 没起，`/api/ping` 也可能被 fallback 逻辑返回 200。判据必须同时看 consul 实例数（bff + srv 各 ≥1）与 Jaeger 中三个服务名同 trace，缺一不算过。
+9. **bff 端口漂移**：计划 Task 10 曾写 `8091`，本文档定稿为 `8081`。实现与文档必须单一口径；出现两个端口说明有人各写各的，配置与验收已脱节。
+10. **网格里混进 Go 代码**：`examples/mesh` 出现 `.go` 文件 = 网格走了独立代码路径，直接违反 T8。哪怕编译通过、链路也通，仍判 FAIL（因为"通"的是另一份代码，不能证明同构）。
+11. **单体出现 deregister 日志**：单体不注册，退出序列里若打出 deregister，说明 `mode` 装配串档了（monolith 走了 bff/srv 分支），链路看似正常但装配矩阵已错。

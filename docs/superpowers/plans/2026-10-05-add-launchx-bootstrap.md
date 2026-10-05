@@ -919,7 +919,7 @@ git add examples/micro/gateway && git commit -m "feat: examples/micro/gateway �
 
 - [ ] **步骤 10.2：config.yaml + main.go + 下游调用**
 
-`config.yaml`：`service.mode: bff`、`webx.addr: "127.0.0.1:8091"`、`coordx` 段同 gateway、`rpcx` 下游段（`downstream.srv.target` 缺省经 `Registry.Target` 解析）。
+`config.yaml`：`service.mode: bff`、`webx.addr: "127.0.0.1:8081"`（`examples/ACCEPTANCE.md` §13.2 端口定稿；原写的 `8091` 为笔误，已统一为 8081）、`coordx` 段同 gateway、`rpcx` 下游段（`downstream.srv.target` 缺省经 `Registry.Target` 解析）。
 `internal/downstream/client.go`：经 `app.RPCClientOptions("srv")` 工厂（Task 5 产出）构造 kitex 客户端（import `examples/micro/srv/pkg/kitex_gen` 的订单服务类型），封装 `GetOrder(ctx, id)`；**不**为 srv 新增 HTTP 适配层（plan-ready 2026-10-04 翻译层修正）。
 `internal/handler/order.go`：`GET /ping`（自响应 `{"service":"bff"}`）、`GET /order/:id`（调下游 GetOrder）。
 
@@ -1165,7 +1165,7 @@ cd "$(dirname "$0")/.."
 # 1. srv：rpc 端口就绪 + consul passingOnly 查到 1 实例
 (cd srv && go build -o /tmp/srv ./cmd) && /tmp/srv & SRV_PID=$!
 #    轮询 consul KV/health API（curl http://127.0.0.1:8500/v1/health/service/demo-srv?passing 直到非空，超时 30s）
-# 2. bff：/tmp/bff（8091）启动，同上轮询注册
+# 2. bff：/tmp/bff（8081）启动，同上轮询注册
 # 3. gateway：/tmp/gateway（8080）启动
 # 4. 断言：
 #    curl -sf http://127.0.0.1:8080/api/ping | grep -q '"service":"bff"'
