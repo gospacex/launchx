@@ -150,7 +150,7 @@
 - **依赖选型（2026-10-04 裁决）**：下游客户端选项经 `github.com/gospacex/rpcx` 的 `BuildClientOptions`（前置 Task 27），bff 不 import kitex
 
 ### Task 11: examples/micro/srv 迁移 srv-order
-- [ ] **任务完成**（与 superpowers plan `Task 11`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 11`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 3a22f89 -->
 - 目标：从 `hubx/micro_apps/apps/srv-order` 复制业务代码（`internal/{repository,service,rpc,middleware}`、`pkg/kitex_gen`、`config.yaml`）到 `examples/micro/srv/`，删除其 `infra/` 与 336 行 main.go，改为 `Bootstrap+OnSetup+Run`：Setup 内装配 repo/outbox/service、用 launchx 提供的 rpcx ServerOptions 构建 kitex server 并 `go svr.Run()`、`OnStop` 注册反序关闭（main.go ≤50 行，验收案例 E3）
 - 改动文件：`examples/micro/srv/{config.yaml,cmd/main.go,app/setup.go,internal/**,pkg/kitex_gen/**}`（新增），不改 `hubx/micro_apps` 原仓
 - 验证方式：`go build ./... && wc -l examples/micro/srv/cmd/main.go`（≤50 行）；起 mysql/consul 后可接收 RPC（验收案例 E3 前置）

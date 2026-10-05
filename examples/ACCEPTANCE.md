@@ -60,8 +60,22 @@ grep -c "=>" go.mod              # ≥ 26（禁止 go mod tidy）
 grep -rn "cloudwego" --include=*.go . | grep -v "^./examples/"    # 必须为空
 grep -rn "go-redis\|segmentio/kafka-go\|hashicorp/consul/api\|gorm.io/gorm" \
      --include=*.go . | grep -v "^./examples/"                    # 必须为空
-grep -n "cloudwego/kitex" go.mod                                  # 必须是 // indirect
+grep -n "cloudwego/kitex" go.mod                                  # Task 11 起已转 direct（见 ③）
 ```
+
+**③ go.mod 直接依赖的既有偏差（已登记，不回购）**：demo 与库同属一个 module，
+故 `github.com/cloudwego/hertz` 在 `go.mod` 中是**直接** require（唯一来源：
+`examples/monolith/app/routes.go` 与 `internal/handler/` 要用 hertz 的
+`route.Engine` / `app.RequestContext` 类型才能挂路由）。这是"demo 消费 webx 句柄"
+的必然结果，不是库侧耦合——判据仍是 ① 的"库侧零 import"。
+
+**【Task 11 触发，已达成】** `github.com/cloudwego/kitex`（及其生成桩依赖
+`github.com/cloudwego/prutal`）现已同样变为**直接** require —— 唯一来源是
+`examples/micro/srv/pkg/kitex_gen/**`（代码生成产物 import kitex 的
+`server` / `client` 包）与 `examples/micro/srv/app/setup.go` 里对
+`[]server.Option` 的类型断言。至此 ③ 预设的触发条件达成：**必须评估把
+`examples/` 拆成独立 module**（让库侧 go.mod 回到零 cloudwego direct），
+本轮不拆、不改判据，留作后续项并同步进 `plan-ready.md`。
 
 **② demo 侧允许的特例（不算违规，但必须在下表内）**：demo 要在 go 层面消费 webx/rpcx 交出的句柄，
 必然触及 hertz / gorm / kitex 的**类型**，这不是"业务直引驱动"。允许面仅限：
@@ -72,11 +86,22 @@ grep -n "cloudwego/kitex" go.mod                                  # 必须是 //
 | `examples/monolith/app/setup.go`、`internal/repository/` | `gorm.io/gorm` **仅作类型断言与查询构造** | 句柄来自 `a.DB()`；**MUST NOT** 出现 `gorm.Open` |
 | `examples/micro/{srv,bff}` 的 kitex_gen 构造处 | `kitex` | 代码生成产物 |
 
-红线（越界即 FAIL）：demo 代码里出现 **`gorm.Open` / `redis.NewClient` / `kafka.NewWriter` / `consul.NewClient`**
+红线（越界即 FAIL）：demo **运行期**代码里出现 **`gorm.Open` / `redis.NewClient` / `kafka.NewWriter` / `consul.NewClient`**
 任一自建客户端调用——那才是"绕过 launchx 直引驱动"。判定：
 
 ```bash
 grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" --include=*.go .   # 必须为空
+```
+
+**Task 11 追加的豁免（不算越界，限定范围）**：随 srv-order 迁进来的单测
+（`examples/micro/srv/internal/{repository,service}/*_test.go`）用
+`gorm.Open(sqlite.Open(":memory:"))` 建**内存**库做查询语义断言——它不经
+launchx、也不连任何中间件，是纯测试夹具，不属于"业务绕过 launchx 取句柄"。
+故上式对该目录需排除 `_test.go`：
+
+```bash
+grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" \
+     --include=*.go --exclude='*_test.go' .                                          # 必须为空
 ```
 
 ---

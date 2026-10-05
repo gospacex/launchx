@@ -946,7 +946,7 @@ git add examples/micro/bff && git commit -m "feat: examples/micro/bff demo（rpc
 **文件：**
 - 创建：`examples/micro/srv/{config.yaml,cmd/main.go,app/setup.go,internal/**,pkg/kitex_gen/**}`（自 `hubx/micro_apps/apps/srv-order` 复制业务分层，**不**复制 `cmd/srv-order/main.go` 原 300+ 行装配与 `micro_apps/infra` import；原仓零改动）
 
-- [ ] **步骤 11.1：复制业务代码（分层 + kitex_gen + 测试，排除旧装配）**
+- [x] **步骤 11.1：复制业务代码（分层 + kitex_gen + 测试，排除旧装配）** <!-- 已实现: 3a22f89 -->
 
 运行：
 ```bash
@@ -954,17 +954,17 @@ cd /Users/hyx/work/gowork/src/hubx && mkdir -p launchx/examples/micro/srv/{cmd,a
 ```
 随后把 srv-order 的 `pkg/kitex_gen` 与 `pkg/events`（如存在）复制进 `launchx/examples/micro/srv/pkg/`；**剔除**所有 `micro_apps/infra/*` 与 `micro_apps/pkg/*` import（替换为 launchx 句柄：infra/consul→`App.Registry`、infra/telemetry→`App.Tracer`+telemetry 内建、infra/drivers→`App.DB/Cache/MQ`、infra/nacos→`configsrc`）。
 
-- [ ] **步骤 11.2：config.yaml（修正端口/DSN 占位，API 事实基线 6）**
+- [x] **步骤 11.2：config.yaml（修正端口/DSN 占位，API 事实基线 6）** <!-- 已实现: 3a22f89 -->
 
 以 srv-order 原 config.yaml 为底（已读：`xmiddleware.sqlx/cachex/mqx` 三段 + `enable_trace` 契约），改写：kafka `127.0.0.1:19093` → `127.0.0.1:9092`（本机 dockers 现行端口，**不**沿用 19093）；DSN 保留 `${HUBX_DB_PW}` 占位；追加 `service.name: demo-srv`、`service.mode: srv`、`coordx` 段、`rpcx` 监听段（端口与 micro_apps 原 srv-order 一致，供 bff Target 解析；探查原仓 rpc 段端口后定稿）。
 
-- [ ] **步骤 11.3：main.go + app/setup.go（Bootstrap 一行形态，main.go ≤50 行）**
+- [x] **步骤 11.3：main.go + app/setup.go（Bootstrap 一行形态，main.go ≤50 行）** <!-- 已实现: 3a22f89 -->
 
 `cmd/main.go`：同 Task 8 形态（`Bootstrap("config.yaml") + OnSetup + Run`）。
 `app/setup.go`：`Setup(*launchx.App)` 内装配 repo/outbox（经 `App.DB`）/service/rpc handler（经 `App.MQ` 的 outbox 补发 producer）、以 `App.RPCServerOptions` 构建 kitex rpcx server、`go server.Run()`、`OnStop` 注册反序关闭（rpc server Stop → outbox flush）。
 运行：`wc -l examples/micro/srv/cmd/main.go` → **必须 ≤50 行**（E3 断言，Task 20 复核）。
 
-- [ ] **步骤 11.4：构建 + 可接收 RPC 前置断言 + Commit**
+- [x] **步骤 11.4：构建 + 可接收 RPC 前置断言 + Commit** <!-- 已实现: 3a22f89 -->
 
 运行：
 ```bash
@@ -975,7 +975,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx/examples/micro/srv && export HUBX_DB_
 git add examples/micro/srv && git commit -m "feat: srv-order 迁移为 examples/micro/srv（Bootstrap 形态，E3 前置，2.4）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.4 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.4 同步） <!-- 已实现: 3a22f89 -->
 
 ---
 
