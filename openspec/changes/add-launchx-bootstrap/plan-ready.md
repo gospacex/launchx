@@ -123,10 +123,12 @@
 - 验证方式：`go test ./internal/...` — 启动顺序断言（telemetry 早于 db/cache/mq）通过（验收案例 A2）
 
 ### Task 7: 反序退出编排
-- [ ] **任务完成**（与 superpowers plan `Task 7`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 7`、`tasks.md` 对应条目同步勾选） <!-- 已实现: 21c2fb0 -->
 - 目标：`App.Run` 收尾段：SIGINT/SIGTERM 等待 → 项目 `OnStop` 钩子逆序 → 内置组件 Stop → registry Deregister → tracing.Shutdown(15s) → logger.Close；显式序列不依赖 defer；Setup 失败/运行期错误走同一退出链并返回首错；`Close()` 幂等复用该链（验收案例 A3）
-- 改动文件：`app.go`（Run/Close/OnStop）、`internal/pipeline/shutdown.go`、`internal/pipeline/shutdown_test.go`
-- 验证方式：`go test ./... -run Shutdown` — 退出顺序断言（deregister 早于 flush、flush 最后）、Setup 失败走完整退出、Close 幂等通过（验收案例 A3）
+- 改动文件：`app.go`（Run/Close/OnStop/stepRegister）、`internal/pipeline/pipeline.go`（新增步骤名 `registry.register`）、`app_test.go`、`launchx_test.go`、`testdata/{bff,srv,gateway,strict-registry,selfaddr}.yaml`
+- **落地偏差（未新建 `internal/pipeline/shutdown.go`）**：退出链已在 Task 5/6 落地于 `App.Close()`（显式序列、不依赖 defer），再抽一层 `Shutdown(a *AppHolders)` 会与 `App` 成环（pipeline 包不得回指根包），故本轮只在 `app.go` 内收口：补 serverStop 接线与注册实例跟踪 + 真注销，测试放 `app_test.go`（需 in-package 注入替身）
+- **API 事实（2026-10-05 实测）**：webx `*App.Run() error`（`webx/webx.go:235`）/ `Shutdown(ctx) error`（`:240`，`IsRunning()` 来自内嵌 `*server.Hertz`）；kitex `server.Server` 为 `Run() error` / `Stop() error`（`kitex@v0.16.3/server/server.go:52-58`）；`coordx.Register` 只有 `Register/Deregister/HealthCheck/Close`；自身注册地址键定为 `service.self.addr` → `service.addr` → `webx.addr`（三次读取均经 `configsrc.envConfig`，`${ENV}` 生效）
+- 验证方式：`go test ./... -count=1` 全绿 — 退出顺序断言（server.stop 早于 component.stop 与 tracing.shutdown、deregister 早于 flush）、bff/srv 注册一次且注销同一实例、monolith/gateway 零注册零注销日志、`strict.registry=true` 即退、缺省降级带后果 Warn（验收案例 A3）
 
 ### Task 8: examples/monolith 单体 demo
 - [ ] **任务完成**（与 superpowers plan `Task 8`、`tasks.md` 对应条目同步勾选）

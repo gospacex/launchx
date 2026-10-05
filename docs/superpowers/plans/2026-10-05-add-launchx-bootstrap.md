@@ -43,7 +43,7 @@
 - **Task 3**：nacos 加载器三裁决（本地兜底 + `hubx.<service>` dataId key 级裁决 + `HUBX_NACOS_SERVER` env 覆盖，dataId 空纯本地、远端不可达即退）→ `cdbab21`。
 - **Task 4**：组件注册表与组件构建器、strict/trace 双裁决、presence-based 装配 → `bdbbdbf`（**实际落地六类，偏差见下**）。
 - **Task 6**：pipeline 固定启动骨架 + telemetry 全局注册（含显式传播器 Composite{TraceContext, Baggage}）+ 事件记录器 → `fc02f6c`。
-- **组件挂载 + 反序退出链骨架**（对应本文件 Task 7）→ `37e5065`；**仅骨架**：缺 server 停止与注册实例跟踪，故 Task 7 在本文件中仍保持未勾选。
+- **组件挂载 + 反序退出链骨架**（对应本文件 Task 7）→ `37e5065`；**仅骨架**：缺 server 停止与注册实例跟踪，故 Task 7 曾保持未勾选——**已由 `21c2fb0` 收口**（serverStop 接线 + 注册实例跟踪与真注销），见本文件 Task 7。
 - **跨仓前置**：0.1 coordx/consul 复核 → 零改动通过（`../coordx`，复验非修复）；0.2 新建 `hubx/rpcx` 模块 → `a047afa` / `25e3e9b`。
 
 ### 最小偏差记录（必须写清）
@@ -742,7 +742,7 @@ git add internal/telemetry internal/pipeline launchx.go && git commit -m "feat: 
 **文件：**
 - 创建：`internal/pipeline/shutdown.go`；修改：`app.go`（Run/Close 接线）、`setup.go`（OnStop 逆序）
 
-- [ ] **步骤 7.1：写失败测试（A3：退出顺序 + Setup 失败走完整退出链 + Close 幂等）**
+- [x] **步骤 7.1：写失败测试（A3：退出顺序 + Setup 失败走完整退出链 + Close 幂等）** <!-- 已实现: 21c2fb0 -->
 
 追加至 `internal/pipeline/pipeline_test.go`（与 Task 6 的 `TestShutdownOrder` 合并断言，不重复）：
 ```go
@@ -756,7 +756,7 @@ func TestCloseIdempotent(t *testing.T) {
 }
 ```
 
-- [ ] **步骤 7.2：实现 shutdown.go**
+- [x] **步骤 7.2：实现 shutdown.go** <!-- 已实现: 21c2fb0 -->
 
 ```go
 // Shutdown 显式序列（MUST NOT 依赖 defer；A3 红线代码化）：
@@ -770,7 +770,7 @@ func Shutdown(a *AppHolders) error
 ```
 `app.go` 的 `Run()` 接线：`等待 SIGINT/SIGTERM → Shutdown(a)`；`Close()` 复用 `Shutdown` 且幂等（Task 1 已占位，此处落实）。
 
-- [ ] **步骤 7.3：运行确认通过 + Commit**
+- [x] **步骤 7.3：运行确认通过 + Commit** <!-- 已实现: 21c2fb0 -->
 
 运行：`go test ./... -v`
 预期：A3 全组 PASS（退出顺序断言、Setup 失败全链、Close 幂等）。
@@ -778,7 +778,7 @@ func Shutdown(a *AppHolders) error
 git add internal/pipeline app.go setup.go && git commit -m "feat: 反序退出编排（A3，1.7）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.7 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.7 同步） <!-- 已实现: 21c2fb0 -->
 
 ---
 
