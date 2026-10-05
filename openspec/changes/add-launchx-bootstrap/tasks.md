@@ -42,6 +42,7 @@
 - [ ] 3.11 单测：`debug` 组件门控——`debug.enabled=false` 不起 server；`true` 时 `127.0.0.1:6060` 仅回环可达；退出序列中 debug server 先于 logger.Close 关闭（验收案例 O1）
 - [ ] 3.12 集成：`APP_DEBUG=1` 启动 srv 档，`curl 127.0.0.1:6060/debug/pprof/` 返回 pprof 索引页；yaml `debug.enabled` 置位等效（验收案例 O2）
 - [ ] 3.13 清单：mesh 三 Deployment 探针字段为 `tcpSocket`（端口与业务一致），`kubectl apply --dry-run=client -f examples/mesh/ -R` + `bring-up.sh check` 全绿（验收案例 O3）
+- [ ] 3.15 治理下沉边界核对（`specs/example-demos`「治理下沉边界」）：网格只接管 mTLS / L4 授权 / 连接级可观测 /（可选）注册发现平台化；配置中心不下沉；注册发现下沉须以替换 `Registry` 实现达成而非删除业务侧调用；Kitex 私有 TCP 下重试 / 超时 / 熔断 / L7 限流 / JWT 鉴权 / 灰度留在应用侧且两侧不得重复开启（尤指重试）；`examples/mesh/docs/verify.md` 中每项「已下沉」结论须能指出应用侧已撤除或已换实现的位置
 - [ ] 3.14 依赖面核对（mode-assembly「RPC 依赖面收敛」）：launchx 库源码（含 `internal/*`）零 `cloudwego/*` import，go.mod 中 kitex 仅 `// indirect`；`examples/` 中仅 `micro/srv` 与 `micro/bff` 的 kitex 构造处出现 kitex import（`kitex_gen` 所需），且全仓无 `cloudwego/hertz`、`redis/go-redis`、`segmentio/kafka-go`、`hashicorp/consul/api`、`gorm.io/gorm` 的直接引用
 
 ## 4. Trace Verification（Jaeger 端到端调用链，T1–T12）

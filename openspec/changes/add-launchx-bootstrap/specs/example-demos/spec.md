@@ -44,6 +44,17 @@
 - **WHEN** 分别以 `hubx.trace` 开关 OFF / ON 各发起一次调用（网格或微服环境均可）
 - **THEN** OFF 不产生业务 span、ON 产生完整链路 span，对比可复现（人工验证项，证据入 `examples/mesh/docs/verify.md`）
 
+### Requirement: 治理下沉边界（网格接管范围与反虚假陈述）
+
+网格形态 SHALL 只接管与业务语义无关、且在当前传输协议下真正可用的治理能力：mTLS、基于服务身份的 L4 授权、连接级可观测，以及（可选）注册发现的平台化。配置中心 MUST NOT 下沉：Envoy 不参与配置分发，且 ConfigMap 不具备 Nacos 的长轮询热更新能力，替代即能力降级。注册发现若下沉，MUST 以**替换 `Registry` 实现**的方式达成（业务侧仍调用 `Register/Deregister`，实现退化为 k8s no-op），MUST NOT 通过删除业务侧注册调用来达成——后者会使微服与网格运行两份代码，直接违反「换形态不改业务代码」。
+
+在 Kitex 私有 TCP 协议下（未声明 `appProtocol` 的端口由 Istio 按 TCP 处理），请求级重试 / 超时 / 熔断、L7 限流、JWT 用户态鉴权、按 path 或 header 的灰度切分 SHALL 继续由应用侧承担，网格侧 MUST NOT 重复开启（重试双侧开启会造成重试放大）。任何写入 `examples/mesh/docs/verify.md` 的「治理已由网格接管」结论 MUST 同时指出应用侧已撤除或已替换实现的具体位置；指不出 MUST NOT 作此表述。
+
+#### Scenario: 治理下沉可追溯
+
+- **WHEN** 核对网格形态的治理分工
+- **THEN** 每一项声称已下沉的能力均可指出应用侧对应处已撤除或已换实现；未指出的能力仍留在应用侧且两侧未重复开启（尤指重试）
+
 ### Requirement: 验收案例标注对齐
 
 每条验收案例 MUST 在 `specs/*/spec.md` 的 `#### Scenario:` 名称（A1–E5 编号）与 `tasks.md` 对应验证项之间一一标注对应，供 close 阶段核对。
