@@ -1,0 +1,50 @@
+# 单体 demo 配置（service.mode=monolith）
+#
+# 端口/DSN/监听地址一律来自本文件，业务 Go 代码不出现任何硬编码地址
+# （同一份二进制与配置副本才能被网格直接复用）。
+#
+# 本 demo 不注册、不用 MQ：刻意**不出现** coordx / consul / mq 段。
+# 运行前导出库密码：export HUBX_DB_PW=hubx123
+
+service:
+  name: demo-monolith   # 服务名 = Jaeger 的 service，也是 dbx 实例名
+  mode: monolith        # 四档之一：monolith / bff / srv / gateway
+
+webx:
+  addr: "127.0.0.1:8080"
+  timeout: 5s
+  rate_limit_rps: 100
+  rate_limit_burst: 200
+  cors_origins: []
+  health_prefix: /healthz
+
+# 调用链：全局闸 + 组件级开关。trace.on.db 是 T13 反向断言的唯一开关。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    db: true
+
+logx:
+  level: info
+  otel:
+    enable_trace: true
+    exporter: otlp
+    endpoint: "127.0.0.1:4318"
+
+# 地基失败即退：db 连不上就启动失败，而不是降级成"起来但落不了库"。
+strict:
+  db: true
+
+xmiddleware:
+  sqlx:
+    driver: gorm
+    databases:
+      demo-monolith:            # 实例名须与 service.name 一致（dbx loader 按名字取段）
+        dsn: "order_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        conn_max_lifetime: 5m
+        conn_max_idle_time: 1m
+        tracing:
+          enabled: true

@@ -53,11 +53,30 @@ go test ./...                    # 6 个包全 ok
 grep -c "=>" go.mod              # ≥ 26（禁止 go mod tidy）
 ```
 
-依赖面（3.14）：
+依赖面（3.14）——**判定边界以本段为准**：
 
 ```bash
-grep -rn "cloudwego" --include=*.go .         # 库侧必须为空（仅 examples/micro/{srv,bff} 的 kitex_gen 构造处允许）
-grep -n "cloudwego/kitex" go.mod              # 必须是 // indirect
+# ① 库侧（根包 *.go + internal/**）：零 cloudwego / 零驱动直引
+grep -rn "cloudwego" --include=*.go . | grep -v "^./examples/"    # 必须为空
+grep -rn "go-redis\|segmentio/kafka-go\|hashicorp/consul/api\|gorm.io/gorm" \
+     --include=*.go . | grep -v "^./examples/"                    # 必须为空
+grep -n "cloudwego/kitex" go.mod                                  # 必须是 // indirect
+```
+
+**② demo 侧允许的特例（不算违规，但必须在下表内）**：demo 要在 go 层面消费 webx/rpcx 交出的句柄，
+必然触及 hertz / gorm / kitex 的**类型**，这不是"业务直引驱动"。允许面仅限：
+
+| 位置 | 允许引入 | 理由 |
+|---|---|---|
+| `examples/monolith/app/routes.go`、`internal/handler/` | `hertz/pkg/{app,route}` 类型 | `engine.GET` 与 handler 签名就是 hertz 的；业务分层内不出现 |
+| `examples/monolith/app/setup.go`、`internal/repository/` | `gorm.io/gorm` **仅作类型断言与查询构造** | 句柄来自 `a.DB()`；**MUST NOT** 出现 `gorm.Open` |
+| `examples/micro/{srv,bff}` 的 kitex_gen 构造处 | `kitex` | 代码生成产物 |
+
+红线（越界即 FAIL）：demo 代码里出现 **`gorm.Open` / `redis.NewClient` / `kafka.NewWriter` / `consul.NewClient`**
+任一自建客户端调用——那才是"绕过 launchx 直引驱动"。判定：
+
+```bash
+grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" --include=*.go .   # 必须为空
 ```
 
 ---
