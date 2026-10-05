@@ -679,6 +679,46 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 
 > 上表是「有没有」的事实登记，不是验收项。缺口项统一记 **SKIP**，任何把 SKIP 写成 PASS 的行为按 §15 第 7 条处理。
 
+## 13.5 服务治理分工：哪些交给网格，哪些必须留在应用侧
+
+**结论（带前提）**：在 Kitex 私有协议下，网格能接管的治理**非常有限**。问题不是「应不应该交」，而是**大部分根本交不出去**。
+
+**协议事实（决定了上面这句）**：
+
+- `rpcx` 的 `options.go` / `client.go` 中**没有任何** `ConnType` / `Protocol` / HTTP 传输选项 → Kitex 走默认的 **TTHeader over TCP 私有二进制协议**。
+- Istio 对未声明为 HTTP 的端口按 **TCP** 处理（端口名须 `http-` / `grpc-` 前缀，或 `appProtocol` 显式声明）。TCP 模式下 Envoy 走 `tcp_proxy`，**只看得见连接，看不见请求**。
+- 后果：L7 治理（按请求重试、按 header/path 路由、速率限制、按错误率熔断）**全部不可用**，可用的只剩连接级能力。这与 §C-0c ③「Kitex 段无 sidecar span」是同一根因。
+
+**分工表（本轮定稿）**：
+
+| 治理能力 | 网格能接管？ | 处置 |
+|---|---|---|
+| mTLS / 服务身份认证 | ✅ TCP 层亦可 | **交给网格**，应用侧不再自造传输加密假设 |
+| 连接级可观测（metrics / 访问日志） | ✅ 部分（span 见 §C-0c ③） | 网格补充，**不替代**应用侧 span |
+| 异常实例剔除（outlier detection） | ✅ 主机 / 连接级 | 可交网格，但阈值须与应用侧重试对齐 |
+| 负载均衡 | ⚠️ 仅 L4 连接级；Kitex 自带实例选择 | **留在应用侧**（双侧决策会互相打架） |
+| 请求级重试 / 超时 | ❌ TCP 层看不见请求 | **留在应用侧**，且严禁双侧同开 |
+| 熔断（按错误率） | ❌ Envoy 读不到业务错误码 | **留在应用侧** |
+| 限流（本地 / 全局速率） | ❌ L7 限流不可用 | **留在应用侧**（gateway 的 `ratelimit` 必须保留） |
+| 鉴权（JWT / 用户态） | ❌ 网格只做服务身份，不做用户身份 | **留在应用侧**（`auth` 保留） |
+| 灰度 / 流量切分 | ❌ 无 HTTP 属性无法按 path / header 切 | 留在应用侧，或先改协议（见下） |
+| 幂等 / 业务降级 / outbox | ❌ 与业务语义强耦合 | **永远在应用侧** |
+
+**三条硬规则（防双重治理，写死）**：
+
+1. **重试不双侧开**：应用侧配了重试，网格侧就不得再开（重试放大在故障期会雪崩）。判据：`VirtualService` 的 `retries` 为空 **或** 应用侧重试次数为 0，二者只能居其一。
+2. **超时逐层收敛**：gateway 超时 > bff 超时 > srv 超时（越内层越短）。反之外层先断，内层 span 会成孤儿。
+3. **限流只在入口做一次**：限流只在 gateway（应用侧），sidecar 不再叠加。
+
+**若要真正吃到网格红利**：把 Kitex 传输改为 gRPC / HTTP2（Kitex 支持 gRPC 与 TTHeader over HTTP2），端口声明 `appProtocol: grpc` / `http2`，L7 治理才可用。这是**后续演进项，本轮不做**；不做就必须接受「网格本轮只提供 mTLS + 连接级可观测」这一现实，并在 `docs/verify.md` 写明——**不得宣称「治理已下沉网格」**。
+
+```bash
+# Kitex 段不得把端口误声明为 http（会让 Istio 误判协议并静默失败）
+grep -rn "appProtocol\|name: http\|name: grpc" examples/mesh/workloads/*.yaml
+# 双重重试检查：网格侧 retries 与 micro 配置里的 retry 次数只能居其一
+grep -rn "retries" examples/mesh/ ; grep -rn "retry" examples/micro/*/config.yaml
+```
+
 ## 14. 判定汇总表（跑一次填一次）
 
 | 编号 | 案例 | 命令锚点 | 状态 | 证据 |
@@ -701,6 +741,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | C | 网格案例（清单/镜像/挂载/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 + `kubectl exec cat /app/config.yaml` |
 | C-复用 | 网格直接复用微服二进制（P1/P2/P3 + 决策 A/B/C） | §13.3 C-0b/C-0c | | `grep` 硬编码为空 + `docs/verify.md` 决策记录 |
 | OBS | 可观测基线与缺口登记 | §13.4 | | 缺口项记 SKIP，不得记 PASS |
+| GOV | 治理分工（应用侧 vs 网格侧） | §13.5 | | 无双重重试 / 无 L7 虚假陈述 |
 
 ## 15. 「看起来过了其实没过」陷阱清单
 
@@ -718,4 +759,5 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 12. **镜像构建上下文错**：在 `launchx/` 下 `docker build` 会因 `go.mod` replace 指向 `../webx` 等兄弟目录而失败（`../` 越出仓库根）。构建必须在 `hubx/` 根执行并 `-f launchx/examples/docker/Dockerfile`。看到 `../webx: no such file` 就是这个错。
 13. **配置副本没挂进容器**：`configs/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl exec ... -- cat /app/config.yaml` 必须与 `examples/mesh/configs/<svc>.yaml` 一致，且含 `host.minikube.internal`。
 14. **地址硬编码导致网格被迫 fork 代码**：`examples/micro` 的 Go 源码里出现 `127.0.0.1` / `localhost` / 写死的端口常量 → 网格无法复用同一份二进制，只能复制一份改常量，T8 当场失效。判据：`grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/` 必须为空。**这是本轮最容易复发的一条**：现役 `micro_apps` 三个服务全是这个写法（`const listenAddr = "127.0.0.1:8080"`），照抄即中招。
-15. **把 Kitex 段没有 sidecar span 当成断链**：Istio tracing 由 Envoy HTTP connection manager 产生，纯 TCP（Kitex TTHeader）经 `tcp_proxy` 预期**不生成** sidecar span（§C-0c ③）。判 T10 只看 HTTP 段的 sidecar span 与应用链的完整性；反过来，若 bff→srv 竟然出现 sidecar span，要回来修正该条预期说明。
+15. **把「网格装上了」当成「治理已下沉」**：Kitex 是 TTHeader over TCP 私有协议，Istio 按 TCP 处理，`tcp_proxy` 层**没有 L7 治理**（§13.5）。重试、熔断、限流、灰度、鉴权一项都交不出去。若验收报告写「治理已由网格接管」而应用侧配置并未撤除，等于双重治理 + 虚假陈述 → FAIL。正确表述是「本轮网格提供 mTLS 与连接级可观测，L7 治理仍在应用侧」。
+16. **把 Kitex 段没有 sidecar span 当成断链**：Istio tracing 由 Envoy HTTP connection manager 产生，纯 TCP（Kitex TTHeader）经 `tcp_proxy` 预期**不生成** sidecar span（§C-0c ③）。判 T10 只看 HTTP 段的 sidecar span 与应用链的完整性；反过来，若 bff→srv 竟然出现 sidecar span，要回来修正该条预期说明。
