@@ -1,0 +1,4 @@
+# 非法形态：mesh 不是 mode 档（网格与微服共用代码路径），必须被拒绝
+service:
+  name: m
+  mode: mesh

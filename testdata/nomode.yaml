@@ -1,0 +1,3 @@
+# 缺 service.mode：四档装配无从选择，必须即退（不允许默认成 monolith 蒙混）
+service:
+  name: nomode-svc

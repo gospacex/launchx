@@ -1,0 +1,8 @@
+# 单体 demo 用最小配置（任务 7 骨架联通验证；任务 11 会新建 examples/monolith/config.yaml）
+service:
+  name: mono
+  mode: monolith
+  addr: 127.0.0.1:8080
+
+trace:
+  enabled: false
