@@ -236,7 +236,20 @@ jq '[.data[0].spans[]] | length' /tmp/t.json                                    
 
 判据：根 span **恰好 1 个**且为 HTTP 入口（operationName 为 HTTP 方法/路径形态）；`handler / service / repository` 三层各至少 1 个 span；树深 ≥ 3。
 
-**预期 span 清单（golden）**：demo 实现后从真机 trace 提取并固化到本节下方表格；**未固化前本项记 SKIP**（不许凭想象填一串名字然后打勾）。
+**预期 span 清单（golden，2026-10-05 真机提取并固化）**——`service=demo-monolith`：
+
+| 请求 | 根 span | 三层 span | 数据层 span | 总 span 数 |
+|---|---|---|---|---|
+| `POST /orders` | `POST /orders` | `handler.CreateOrder` → `service.CreateOrder` → `repository.CreateWithItems` | `db.create` × 2（orders + order_items，**同父兄弟**） | 6 |
+| `GET /orders` | `GET /orders` | `handler.ListOrders` → `service.ListOrders` → `repository.List` | `db.query` × 1 | 5 |
+| `GET /orders/:no` | 同名根 | `handler.GetOrder` → `service.GetOrder` → `repository.Get` | `db.query` × 1 | 5 |
+| `GET /orders/:no/join` | 同名根 | `handler.GetOrderWithUser` → `service.GetOrderWithUser` → `repository.GetWithUser` | `db.query` × 1（含 `JOIN users`） | 5 |
+| `PUT /orders/:no` | 同名根 | `handler.UpdateOrder` → `service.UpdateOrder` → `repository.UpdateStatus`、`repository.Get` | `db.update` × 1 + `db.query` × 1 | 7 |
+| `DELETE /orders/:no` | 同名根 | `handler.DeleteOrder` → `service.DeleteOrder` → `repository.DeleteItems`、`repository.Delete` | `db.delete` × 2 | 7 |
+
+实测 SQL 文本（8 条去重后）：`INSERT INTO orders/order_items`、`SELECT * FROM orders [ORDER BY id DESC LIMIT ?|WHERE order_no = ? LIMIT ?]`、
+`SELECT o.id ... FROM orders o JOIN users u ON o.user_id = u.id WHERE o.order_no = ?`、`UPDATE orders SET status=?,updated_at=? WHERE order_no = ?`、
+`DELETE FROM orders|order_items WHERE order_no = ?`。参数以 `?` 占位（gorm 预编译），**语句文本完整即可，不要求参数已代入**。
 
 ### 9b.2 中间件入链矩阵（逐行核对，未列出即缺失）
 
@@ -258,8 +271,13 @@ jq '[.data[0].spans[]] | length' /tmp/t.json                                    
 
 ### 9b.3 CRUD 与连表逐条入链
 
+> ⚠️ **Jaeger REST API 的字段口径（实测，2026-10-05）**：span 属性在 `.tags[]`，
+> 结构是 `{"key","type","value"}`，**不是** `.attributes[]`。用 `.attributes[]`
+> 取永远得到 0——判据会静默"通过"（0 条 SQL 也判定为空值数为 0），是典型空壳。
+> 下面所有 jq 一律走 `.tags[]`。
+
 ```bash
-SQLS='[.data[0].spans[].attributes[]? | select(.key=="db.query.text") | (.value|tostring)]'
+SQLS='[.data[].spans[].tags[]? | select(.key=="db.query.text") | (.value|tostring)]'
 
 # 1) 带完整 SQL 的 span 数（应等于该请求实际执行的 SQL 条数）
 jq "$SQLS | length" /tmp/t.json
@@ -786,7 +804,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 |---|---|---|---|---|
 | 分布式链路 | ✅ | ✅ | ✅ | otelx + OTLP 4318 → Jaeger |
 | 结构化日志 | ✅ | ✅ | ✅ | logx |
-| 日志 ↔ 链路关联（trace_id 落日志字段） | ⚠️ 待核 | ⚠️ 待核 | ⚠️ 待核 | logx 侧未检索到 trace_id 注入逻辑，需真机确认后再定；未确认前**不得**记 PASS |
+| 日志 ↔ 链路关联（trace_id 落日志字段） | ✅ | ✅ | ✅ | **2026-10-05 真机确认**：webx 访问日志自带 `trace_id` / `span_id` / `request_id`（`webx/middleware/logging.go:34`），实测 `{"trace_id":"993a319f…","span_id":"f464c7d2…","method":"POST","path":"/orders","status":201}`，与 Jaeger 中该请求的 traceID 一致 |
 | HTTP 健康端点 | ✅ `/healthz/live` + `/healthz/ready` | gateway/bff ✅；srv ❌ | 由 k8s 探针替代 | `webx/webx.go:130`（`HealthPrefix` 默认 `/healthz`，`webx/config.go:51`；**裸前缀路径无 handler**） |
 | 注册与健康检查 | 不注册 | consul TTL + 心跳 | consul + k8s 双层 | coordx |
 | metrics / Prometheus | ❌ | ❌ | ❌ | **实测缺口**：`webx.Config.MetricsEnabled`（`webx/config.go:35`）在全仓零引用；otelx 未导出 MeterProvider → `/metrics` 不存在是**预期**，判 SKIP 而非 FAIL，更不得伪造端点记 PASS |
@@ -891,25 +909,25 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 
 | 编号 | 案例 | 命令锚点 | 状态 | 证据 |
 |---|---|---|---|---|
-| E1 | 单体跑通 | §3 | | `/tmp/monolith.log` + mysql 行数 |
+| E1 | 单体跑通 | §3 | ✅ PASS (2026-10-05) | 六接口全通；orders 3→删除后 2；SIGTERM 退出 1s；无 deregister 日志 |
 | E2 | 微服调用链 | §6 | | curl 输出 + consul 实例数 |
 | E3 | srv 迁移回归 | §7 | | e2e 输出 + `wc -l` + kafka 消息 |
 | E4 | 网格同 trace | §11b | | `examples/mesh/docs/verify.md` |
 | E5 | trace OFF/ON | §11b | | 同上 |
-| T1/T7 | 传播器 | §9 | | 单测输出 |
-| T2/T3/T4 | 数据层入链 | §4 | | `/tmp/trace.json` |
-| T5 | 单体调用树 | §5 | | `/tmp/trace.json` |
+| T1/T7 | 传播器 | §9 | ✅ PASS (2026-10-05) | 5 个用例全绿，含 `TestDefaultPropagatorIsNoop` 反向断言（commit `18a331d`） |
+| T2/T3/T4 | 数据层入链 | §4 | ✅ PASS（T4 部分 SKIP） | SQL span 9 条、空值 0、JOIN 1、CRUD 四类齐全；T4 的 cache/mq/ES/mongo 四类同 trace 待微服 demo 起后补 |
+| T5 | 单体调用树 | §5 | ✅ PASS (2026-10-05) | 6 条 trace 根 span 均恰好 1 个且为 HTTP 入口；树深 5（POST 链） |
 | T6 | 三段同 trace | §6 | | `/tmp/trace.json` |
 | T8 | 网格无专属分支 | §12 | | grep/diff 输出 |
-| T9 | 尾部 span 不缺 | §8 | | `/tmp/trace.json` |
+| T9 | 尾部 span 不缺 | §8 | ✅ PASS (2026-10-05) | 最后一条 DELETE trace 7 span 完整（含 `db.delete` × 2），退出冲刷生效 |
 | T10/T11/T12 | 网格链路 | §11b / §13.3 | | `examples/mesh/docs/verify.md` |
-| T13 | 调用链完整性（分层/中间件矩阵/CRUD 连表） | §9b | | `/tmp/t.json` + jq 输出 |
-| 3.14 | 依赖面 | §2/§12 | | grep 输出 |
+| T13 | 调用链完整性（分层/中间件矩阵/CRUD 连表） | §9b | ✅ PASS (2026-10-05) | 正向：SQL 9/空 0/JOIN 1/CRUD 2-4-1-2，事务两 INSERT 同父；**反向**：`trace.on.db=false` 后 SQL span 归 0（判据非空壳） |
+| 3.14 | 依赖面 | §2/§12 | ✅ PASS（含登记偏差） | 库侧 cloudwego/gorm 零 import；kitex 因 demo 转 direct，已登记「examples 拆 module」后续项 |
 | A | 单体案例（目录树/链路/可观测） | §13.1 | | `/tmp/monolith.log` + `/tmp/trace.json` |
 | B | 微服案例（三进程/三段链/ consul） | §13.2 | | consul 实例数 + `/tmp/trace.json` |
 | C | 网格案例（清单/镜像/挂载/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 + `kubectl exec cat /app/config.yaml` |
 | C-复用 | 网格直接复用微服二进制（P1/P2/P3 + 决策 A/B/C） | §13.3 C-0b/C-0c | | `grep` 硬编码为空 + `docs/verify.md` 决策记录 |
-| OBS | 可观测基线与缺口登记 | §13.4 | | 缺口项记 SKIP，不得记 PASS |
+| OBS | 可观测基线与缺口登记 | §13.4 | ✅（metrics/pprof 记 SKIP） | 日志-链路关联已由真机确认（webx 访问日志带 trace_id）；metrics 仍为实测缺口，记 SKIP |
 | GOV | 治理分工（应用侧 vs 网格侧） | §13.5 | | 无双重重试 / 无 L7 虚假陈述 |
 | GOV2 | 下沉决策（注册中心 / 配置中心 / 其他） | §13.6 | | 下沉项须指出「应用侧已撤除或已换实现」 |
 
@@ -931,3 +949,5 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 14. **地址硬编码导致网格被迫 fork 代码**：`examples/micro` 的 Go 源码里出现 `127.0.0.1` / `localhost` / 写死的端口常量 → 网格无法复用同一份二进制，只能复制一份改常量，T8 当场失效。判据：`grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/` 必须为空。**这是本轮最容易复发的一条**：现役 `micro_apps` 三个服务全是这个写法（`const listenAddr = "127.0.0.1:8080"`），照抄即中招。
 15. **把「网格装上了」当成「治理已下沉」**：Kitex 是 TTHeader over TCP 私有协议，Istio 按 TCP 处理，`tcp_proxy` 层**没有 L7 治理**（§13.5）。重试、熔断、限流、灰度、鉴权一项都交不出去。若验收报告写「治理已由网格接管」而应用侧配置并未撤除，等于双重治理 + 虚假陈述 → FAIL。正确表述是「本轮网格提供 mTLS 与连接级可观测，L7 治理仍在应用侧」。
 16. **把 Kitex 段没有 sidecar span 当成断链**：Istio tracing 由 Envoy HTTP connection manager 产生，纯 TCP（Kitex TTHeader）经 `tcp_proxy` 预期**不生成** sidecar span（§C-0c ③）。判 T10 只看 HTTP 段的 sidecar span 与应用链的完整性；反过来，若 bff→srv 竟然出现 sidecar span，要回来修正该条预期说明。
+17. **用 `.attributes[]` 取 Jaeger span 属性**（2026-10-05 实测踩到）：Jaeger REST API（`/api/traces`）返回的 span 属性在 **`.tags[]`**，结构是 `{"key","type","value"}`；`.attributes[]` **不存在**，取之恒为空数组。后果极隐蔽——`db.query.text | length == 0`、"空值数为 0"、`JOIN 数为 0` 全都"通过"，整套 T13 判据变成空壳。判据一律写 `.spans[].tags[]?`（见 §9b.3 顶部警示）。**自检方式**：先跑 `jq '[.data[].spans[].tags[]? | select(.key=="db.query.text")] | length'`，若得到 0 而 Jaeger UI 上明明有 SQL，就是命中本条。
+18. **Jaeger 查询早于 batch flush**：OTLP BatchSpanProcessor 默认约 5s 批量导出，请求刚发完立刻查 `/api/traces` 会拿到**上一条** trace（本次还没入库），于是"关闭 db 埋点后 SQL 仍为 2 条"这种假失败就出现了。判据必须**按 traceID 精确定位**新请求的那条（不能只看 `limit=1`），并在请求后等待 ≥10s 再查。
