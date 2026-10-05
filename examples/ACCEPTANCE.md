@@ -214,12 +214,12 @@ SQLS='[.data[0].spans[].attributes[]? | select(.key=="db.query.text") | (.value|
 # 1) 带完整 SQL 的 span 数（应等于该请求实际执行的 SQL 条数）
 jq "$SQLS | length" /tmp/t.json
 # 2) 空值 / 占位符必须为 0
-jq "$SQLS | map(select(. == \"\" or (ascii_downcase|test(\"placeholder|\\\\?\\\\?\\\\?\")))) | length" /tmp/t.json   # == 0
+jq "$SQLS | map(select(. == \"\" or length < 8 or (ascii_downcase|test(\"(?i)placeholder\")))) | length" /tmp/t.json   # == 0
 # 3) 连表语句必须含 join，且每条 JOIN 各自成 span（不得合并）
-jq "$SQLS | map(select(ascii_downcase|test(\"join\"))) | length" /tmp/t.json                                        # >= 1
+jq "$SQLS | map(select(ascii_downcase|test(\"(?i)join\"))) | length" /tmp/t.json                                    # >= 1
 # 4) 四类 CRUD 各至少一条
 for op in insert select update delete; do
-  printf "%-7s %s\n" "$op" "$(jq "$SQLS | map(select(ascii_downcase|test(\"^\\\\s*$op\"))) | length" /tmp/t.json)"
+  printf "%-7s %s\n" "$op" "$(jq "$SQLS | map(select(ascii_downcase|test(\"(?i)^[^a-z]*$op\"))) | length" /tmp/t.json)"
 done
 ```
 
