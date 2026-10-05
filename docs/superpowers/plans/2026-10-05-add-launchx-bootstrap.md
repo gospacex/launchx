@@ -58,7 +58,7 @@
 
 1. **Go 工具链**：`export PATH=/Users/hyx/sdk/go1.24.3/bin:$PATH`，`GOTOOLCHAIN=auto`（自动拉取 go1.27.1；webx 声明 `go 1.27.1`、dbx `go 1.26.2`、mqx `go 1.27`），不需要手工装新版。
 2. **中间件底座**：所有中间件一律由本机 `/Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml` 统一供给 —— consul `8500`、mysql `3306`、kafka `9092`（KRaft）、jaeger `16686`/`4317`/`4318`、redis `6379`、mongo 副本集 `27018`-`27020` 等；docker CLI 绝对路径 `/Applications/Docker.app/Contents/Resources/bin/docker`（不在 PATH 里）。**Elasticsearch 不在该 compose 内**，当前 `9200` 由独立容器提供（实测 `green`）；若整套环境重建必须自行补 ES，否则 `search` 组件无法验收。
-3. **服务网格**：网格由本机 minikube 提供，但**实测 minikube / kubectl / helm / istioctl / linkerd 均未安装**（`which` 全空），故网格验收 T10–T12 的真实跑分后置（见 Task 25）；集群内访问宿主中间件须经 `host.docker.internal` 或宿主 IP 改写地址。
+3. **服务网格**：网格由本机 minikube + Istio 提供。**2026-10-05 实测更正**：minikube `v1.36.0`、istioctl `1.30.1` **已安装**于 `/usr/local/bin`（早先「均未安装」的结论是 PATH 误判——WorkBuddy shell 默认 PATH 不含 `/usr/local/bin`，`which` 全空）；kubectl 未单独安装，走 `minikube kubectl --`。集群**尚未启动**（`minikube status` 报 `No such container: minikube`），故网格验收 T10–T12 的真实跑分仍需先 `minikube start --driver=docker --cpus=2 --memory=4096`（宿主 docker 总内存仅 8GB）与 `istioctl install`，详见 Task 25。集群内访问宿主中间件用 **`host.minikube.internal`**（`host.docker.internal` 在 minikube 的 k8s 内不保证解析）。
 4. **红线 —— otelx 只注册一半全局**：`otelx.New` 只注册 TracerProvider（`otelx/interface.go:207`，仅 `Tracer.Enabled` 为真时；关闭态返回 noop 且不碰全局），**从不注册传播器**。OTel 全局默认传播器是**空 Composite**（注入与提取皆空操作）→ `traceparent` 既不写出也不读取 → gateway→bff→srv 断成三段孤儿 trace，且**伪装成成功**（三服务各一根 trace、每条都能点开有 span），极难发现。故 launchx **必须**显式 `otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))`。同理 `webx.Config.FillDefaults` 的 Tracer 默认取 `otel.GetTracerProvider().Tracer("webx")` → **telemetry 必须先于 mode 装配**，否则 webx 拿到 noop tracer。
 
 ### 任务顺序提醒
@@ -1484,14 +1484,23 @@ git add -A && git commit -m "chore: 依赖面核对（mode-assembly RPC 依赖�
 > **trace:** plan-ready.md → `### Task 21: 网格部署验收（验收案例 E4/E5，两级）`（**关联项，非同名**：T10–T12 即其 (b) 级人工验证的链路断言部分，证据文件同为 `examples/mesh/docs/verify.md`） | tasks.md → `- [ ] 4.9 集成（网格）：minikube + Istio 就绪、sidecar 追踪 100% 采样并绑定 OTLP provider 后，触发 \`gateway → bff → srv\` 全链路，Jaeger 同一 trace 下同时存在应用 span（\`gateway\`/\`bff\`/\`srv\`）与 sidecar span（\`<workload>.<ns>\`），且应用 span 父子链仍为 gateway → bff → srv、srv 数据层 span 同 trace（验收案例 T10）`<br>`- [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）`<br>`- [ ] 4.11 证据落盘（网格）：\`examples/mesh/docs/verify.md\` 记录 trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始响应片段 / \`hubx.trace\` OFF-ON 对比 / minikube-kubectl-istioctl-Istio 版本（验收案例 T12）`
 > **sync:** tasks.md → `- [ ] 4.9 集成（网格）：minikube + Istio 就绪、sidecar 追踪 100% 采样并绑定 OTLP provider 后，触发 \`gateway → bff → srv\` 全链路，Jaeger 同一 trace 下同时存在应用 span（\`gateway\`/\`bff\`/\`srv\`）与 sidecar span（\`<workload>.<ns>\`），且应用 span 父子链仍为 gateway → bff → srv、srv 数据层 span 同 trace（验收案例 T10）`<br>`- [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）`<br>`- [ ] 4.11 证据落盘（网格）：\`examples/mesh/docs/verify.md\` 记录 trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始响应片段 / \`hubx.trace\` OFF-ON 对比 / minikube-kubectl-istioctl-Istio 版本（验收案例 T12）` | plan-ready.md → `### Task 21: 网格部署验收（验收案例 E4/E5，两级）`（关联项，非同名）
 
-**前置（硬，当前未就绪）：** 「内容基线」环境事实第 3 条 —— 实测本机 minikube / kubectl / helm / istioctl / linkerd **均未安装**。真实执行前先：
+**前置（2026-10-05 实测更正 —— 工具已装，只需起集群）：**
+
+| 项 | 实测 | 说明 |
+|---|---|---|
+| minikube | ✅ `v1.36.0` | `/usr/local/bin/minikube` |
+| istioctl | ✅ `1.30.1` | `/usr/local/bin/istioctl` |
+| kubectl | ❌ 未单独安装 | 用 `minikube kubectl --`（`~/.minikube/bin` 下无 kubectl 分发） |
+| 集群 | ❌ 未启动 | `minikube status` 报 `No such container: minikube` |
+| ⚠️ PATH | `/usr/local/bin` **不在** WorkBuddy shell 的默认 PATH | `which minikube` 会**误报未安装**——本文件此前「均未安装」的结论即由此误判，已更正为「已装、未起集群」 |
 ```bash
-brew install minikube kubectl && brew install istioctl
-minikube start --driver=docker
-istioctl install --set profile=demo     # 或 istioctl install -f <自定义 mesh config>
-minikube image load launchx-examples/gateway:dev   # 三服务镜像逐一 load 进集群
+export PATH=/usr/local/bin:$PATH           # 必须：否则 minikube / istioctl 不可见
+minikube start --driver=docker --cpus=2 --memory=4096     # 宿主 docker 总内存仅 8GB
+istioctl install --set profile=demo -y
+kubectl label namespace launchx-mesh istio-injection=enabled --overwrite
+minikube image load launchx-examples/gateway:dev          # 三服务镜像逐一 load
 ```
-采样须 100%，Istio 侧 OTLP provider 指向本机 Jaeger（集群内经 `host.docker.internal:4317` 或宿主 IP）。
+采样须 100%，Istio 侧 OTLP provider 指向本机 Jaeger（集群内经 **`host.minikube.internal:4318`**；`host.docker.internal` 在 minikube 的 k8s 内不保证解析）。
 
 **待真机核实（不得凭记忆定稿）：** Istio 侧追踪 provider 必须选 **`opentelemetry`** —— Envoy OTel tracer 走 W3C `traceparent`，与 launchx 的 Composite{TraceContext, Baggage} 对齐；若选 `zipkin`，默认走 **B3**（`x-b3-traceid`）会与 W3C 头不互通而断链。落地前须以 `istioctl proxy-config bootstrap <pod> -n launchx-mesh -o json` 查 tracing 配置，并对 demo 发一次请求抓 sidecar 实际写出的头名确认。
 

@@ -21,7 +21,9 @@
 | jaeger | UI `127.0.0.1:16686`，OTLP/HTTP `127.0.0.1:4318` | compose |
 | elasticsearch | `127.0.0.1:9200` | **不在 compose 内**，当前由独立容器 `elasticsearch:7.6.2` 提供，重建环境须自补 |
 | mongodb | `127.0.0.1:27018/27019/27020` | compose，需先 `docker compose --profile once up -d mongo-init` 初始化 rs0 |
-| 网格 | 本机 minikube | 用户给定；**实测 minikube/kubectl/istioctl 均未安装** |
+| 网格 | 本机 minikube + Istio | 用户给定。**已装**：minikube `v1.36.0`、istioctl `1.30.1`（均在 `/usr/local/bin`）；**kubectl 未单独安装**，走 `minikube kubectl --`。集群**未启动**（无 `minikube` 容器），须先 `minikube start` |
+| ⚠️ PATH | `/usr/local/bin` | WorkBuddy 的 shell PATH 不含 `/usr/local/bin`，`which minikube` 会**误报未安装**。所有脚本与手工命令必须先 `export PATH=/usr/local/bin:$PATH` |
+| 宿主资源 | docker 29.7.2，总内存 **8 GB** | `minikube start` 须限 `--cpus=2 --memory=4096`，否则与 compose 中间件争内存导致 Pod 反复 OOM/Evicted |
 | Go | `export PATH=/Users/hyx/sdk/go1.24.3/bin:$PATH` | GOTOOLCHAIN=auto 拉 go1.27.1 |
 
 端口约定（避免同机互撞）：monolith `8080`；micro gateway `8080`、bff `8081`、srv 走 RPC 端口（沿用 srv-order 原端口，写进各自 config.yaml）。monolith 与 gateway 都是 8080 但**不同时运行**，跑之前确认端口空闲。
@@ -184,11 +186,31 @@ kubectl apply --dry-run=client -f examples/mesh/ -R      # 清单全过
 bash examples/mesh/scripts/bring-up.sh check             # 前置检查
 ```
 
-**判据（重要）**：本机 minikube/kubectl/istioctl 均未安装 → `check` 必须**显式报出缺失并以非零码退出**；**静默返回 0 视为 FAIL**（这是伪装通过的高发点）。三 Deployment 探针字段须为 `tcpSocket` 且端口与业务一致（3.13/O3）。
+```bash
+export PATH=/usr/local/bin:$PATH          # 关键：否则 minikube/istioctl 不可见
+command -v minikube istioctl              # 必须命中
+minikube kubectl -- version --client      # kubectl 走 minikube 内置分发
+minikube status                           # 未起集群时须报 "No such container: minikube"（而非静默通过）
+kubectl apply --dry-run=client -f examples/mesh/ -R      # 清单全过
+bash examples/mesh/scripts/bring-up.sh check             # 前置检查
+```
+
+**判据（重要）**：`check` 对每一项前置（PATH、minikube、istioctl、kubectl、集群 Running、istio-system 就绪、镜像已 load）都必须**逐项显式输出并以非零码退出**；**任一项缺失却仍返回 0 = FAIL**（静默通过是本类验收最高发的伪装点）。三 Deployment 探针字段须为 `tcpSocket` 且端口与业务一致（3.13/O3）。
 
 ### 11b. 人工验证项（close 不硬阻塞，缺底座时记 SKIP）
 
-前置：`brew install minikube kubectl` → `minikube start --driver=driver` → `istioctl install` → `minikube image load` 三服务镜像 → 集群内经 `host.docker.internal` 访问宿主中间件。
+前置（工具已装，只需起集群）：
+
+```bash
+export PATH=/usr/local/bin:$PATH
+minikube start --driver=docker --cpus=2 --memory=4096     # 宿主总内存仅 8GB，必须限额
+istioctl install --set profile=demo -y                    # 含 tracing 所需组件
+kubectl label namespace launchx-mesh istio-injection=enabled --overwrite
+# 镜像：先在 hubx/ 仓库根构建（构建上下文必须是仓库根，见 §13.3 C-0），再
+minikube image load launchx-examples/gateway:dev          # 三服务各一次
+```
+
+集群内访问宿主中间件用 **`host.minikube.internal`**（minikube 提供的宿主 DNS 名；`host.docker.internal` 是 Docker Desktop 容器内的写法，在 minikube 的 k8s 里**不保证解析**）——这一点由 `configs/*.yaml` 的地址副本体现，也是网格与微服配置的**唯一**差异来源。
 
 - **T10**：同一 trace 下同时有应用 span（`gateway`/`bff`/`srv`）与 sidecar span（形如 `gateway.launchx-mesh`），且应用 span 父子链仍为 gateway → bff → srv。查询时**两侧都要查**：`service=demo-gateway` 与 `service=demo-gateway.<namespace>`。
 - **T11**（反向断言）：只开 sidecar 追踪、应用侧不注册传播器 → 呈分裂形态：1 条 sidecar 链 + 应用侧各自孤儿 trace，**trace 数 ≥ 4**。这是网格特有的伪装——sidecar 自己串得很完整，但 app span 全脱落。
@@ -205,7 +227,7 @@ grep -rn "redis/go-redis\|segmentio/kafka-go\|hashicorp/consul/api\|gorm.io/gorm
 
 # 网格不复制业务代码：mesh 目录内不应有 .go 文件，只放清单与配置副本
 find examples/mesh -name '*.go'                 # 必须为空
-# 网格配置副本与微服配置的差异只在地址段（*.mesh-external / host.docker.internal）
+# 网格配置副本与微服配置的差异只在地址段（127.0.0.1 → host.minikube.internal）
 for s in gateway bff srv; do
   diff <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/micro/$s/config.yaml) \
        <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/mesh/configs/$s.yaml)
@@ -229,7 +251,7 @@ done
 | 入口协议 | HTTP（webx/hertz） | HTTP → HTTP → Kitex RPC | 同 B，流量经 sidecar 接管 |
 | 服务间调用 | 进程内函数调用 | RPC + consul 发现 | 同 B（+ k8s Service 一层） |
 | 注册发现 | **不注册** | gateway 只发现不注册；bff/srv 注册 | 同 B |
-| Go 代码 | 有 | 有 | **禁止有**（只放清单与配置副本） |
+| Go 代码 | 有 | 有 | **禁止有**（镜像由 micro 侧 Dockerfile 构建；mesh 只有部署面，见 §13.3 C-0） |
 | 根 span 数 | 1 | 1 | 1（应用侧）；sidecar 侧另成并行链 |
 | Jaeger 服务名 | `demo-monolith` | `demo-gateway` / `demo-bff` / `demo-srv` | 应用名 + `<workload>.<ns>` 两套 |
 | 健康入口 | `GET /healthz`（webx 默认） | gateway/bff `/healthz`；srv 靠 consul TTL | k8s `tcpSocket` 探针 + consul |
@@ -462,28 +484,73 @@ curl -sf http://127.0.0.1:8080/api/order/1001  | grep -q 'order_id'             
 
 ### 13.3 案例 C — 网格（`examples/mesh`）
 
-#### C-1 目录树（**禁 Go 代码**）
+#### C-0 「业务代码与入口在哪」——代码面 vs 部署面的边界
 
-```
-examples/mesh/
-├── namespace.yaml                     # launchx-mesh
-├── workloads/
-│   ├── gateway.yaml                   # Deployment + Service（gateway）
-│   ├── bff.yaml
-│   └── srv.yaml
-├── telemetry.yaml                     # Istio Telemetry + extensionProvider(opentelemetry)
-├── configs/
-│   ├── gateway.yaml                   # 微服配置的地址副本
-│   ├── bff.yaml
-│   └── srv.yaml
-├── scripts/bring-up.sh                # start / check / down
-└── docs/verify.md                     # T12 证据落盘
-```
+`examples/mesh/` 里**故意没有**业务分层代码和 `main.go`。这不是漏写，而是 launchx 的核心主张（C4 / T8）：**换形态不改业务代码**。网格与微服跑的是**同一份二进制**，差异只存在于部署面。
+
+三层的「入口」分别落在：
+
+| 层级 | 入口 | 位置 |
+|---|---|---|
+| **源码 / 进程入口** | `func main()`：`Bootstrap → OnSetup → Run` | `examples/micro/{gateway,bff,srv}/cmd/main.go`（唯一业务代码所在地） |
+| **镜像入口** | Dockerfile 的 `ENTRYPOINT`（即上表的二进制） | `examples/docker/Dockerfile`，`--build-arg SVC=gateway\|bff\|srv` |
+| **部署入口** | `scripts/bring-up.sh start/check/down` | `examples/mesh/scripts/bring-up.sh` |
+| **流量入口** | Istio IngressGateway（或 NodePort）→ `gateway` Service | `examples/mesh/workloads/gateway.yaml` + `mesh/gateway.yaml`（Gateway/VirtualService，若需要对外暴露） |
+
+所以 `examples/mesh` 是**部署面**，它引用而非复制业务代码。判定这条边界的命令：
 
 ```bash
 find examples/mesh -name '*.go'                     # 必须为空（出现即 FAIL：网格走了独立代码路径）
-kubectl apply --dry-run=client -f examples/mesh/ -R # 全过
-bash examples/mesh/scripts/bring-up.sh check        # 缺失底座必须非零退出（静默 0 = FAIL）
+grep -rn "image:" examples/mesh/workloads/*.yaml    # 必须指向 launchx-examples/*，且 tag 与 micro 构建产物一致
+```
+
+#### C-1 目录树（部署面，**禁 Go 代码**）
+
+```
+examples/mesh/
+├── namespace.yaml                     # launchx-mesh（带 istio-injection=enabled 标签）
+├── workloads/
+│   ├── gateway.yaml                   # Deployment + Service（gateway）
+│   ├── bff.yaml                       # Deployment + Service（bff）
+│   └── srv.yaml                       # Deployment + Service（srv，tcpSocket 探 9013）
+├── configmap.yaml                     # ★ 三个 configs/*.yaml 的挂载载体（缺此则配置副本是死文件）
+├── telemetry.yaml                     # Istio Telemetry + extensionProvider(opentelemetry)
+├── configs/
+│   ├── gateway.yaml                   # 微服配置的地址副本（宿主地址 → host.minikube.internal）
+│   ├── bff.yaml
+│   └── srv.yaml
+├── scripts/bring-up.sh                # start / check / down（含镜像构建与 minikube image load）
+└── docs/verify.md                     # T12 证据落盘
+```
+
+镜像构建面在**代码面一侧**（不进 mesh，以保住「网格无 Go 代码」）：
+
+```
+examples/docker/Dockerfile             # 单一 Dockerfile，--build-arg SVC=gateway|bff|srv
+```
+
+**构建上下文必须是 `hubx/` 仓库根**，不是 `launchx/`——因为 `go.mod` 的 26 条 replace 指向 `../{webx,configx,logx,dbx,cachex,mqx,otelx,rpcx,...}` 兄弟目录（沿用 `micro_apps/docker/Dockerfile` 已验证的约定）。构建命令：
+
+```bash
+cd /Users/hyx/work/gowork/src/hubx            # 仓库根，不是 launchx/
+docker build -f launchx/examples/docker/Dockerfile \
+  --build-arg SVC=gateway -t launchx-examples/gateway:dev .
+minikube image load launchx-examples/gateway:dev
+```
+
+配置进容器靠 ConfigMap 挂载（**不 COPY 进镜像**，否则改配置要重建镜像，也破坏「配置副本是唯一差异」的可审计性）：
+
+```yaml
+# configmap.yaml 形态（要点）
+volumes:        - name: cfg
+                  configMap: { name: <svc>-config }
+volumeMounts:   - name: cfg
+                  mountPath: /app/config.yaml
+                  subPath: config.yaml
+```
+
+```bash
+kubectl create configmap gateway-config --from-file=config.yaml=examples/mesh/configs/gateway.yaml --dry-run=client -o yaml
 ```
 
 #### C-2 与微服的同构断言（T8）
@@ -583,7 +650,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | 3.14 | 依赖面 | §2/§12 | | grep 输出 |
 | A | 单体案例（目录树/链路/可观测） | §13.1 | | `/tmp/monolith.log` + `/tmp/trace.json` |
 | B | 微服案例（三进程/三段链/ consul） | §13.2 | | consul 实例数 + `/tmp/trace.json` |
-| C | 网格案例（清单/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 |
+| C | 网格案例（清单/镜像/挂载/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 + `kubectl exec cat /app/config.yaml` |
 | OBS | 可观测基线与缺口登记 | §13.4 | | 缺口项记 SKIP，不得记 PASS |
 
 ## 15. 「看起来过了其实没过」陷阱清单
@@ -593,7 +660,9 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 3. **尾部 span 缺失**：链路看着完整但少了最后一次落库 → 退出没冲刷（或用了 defer）。判据是"最后执行的那次操作有 span"。
 4. **降级被当成通过**：consul 挂了照样起来 → 这是设计内行为（A3），但**必须**有 Warn 日志；`strict=true` 时必须反过来变成启动失败。只测一种不算过。
 5. **网格 sidecar 假完整**：sidecar 之间靠 Envoy 自身透传，链路看着严丝合缝，但 app span 全脱落（trace 数 ≥ 4）。必须同时查应用服务名与 sidecar 服务名。
-6. **dry-run 静默通过**：minikube/kubectl 没装时 `check` 返回 0 → 视为 FAIL，必须显式报缺失并退非零。
+6. **dry-run 静默通过**：`bring-up.sh check` 对 PATH / minikube / istioctl / kubectl / 集群 Running / istio-system 就绪 / 镜像已 load 每一项都要逐条输出，缺失即非零退出；任一项缺失却返回 0 → FAIL。注意本机 `minikube`/`istioctl` 在 `/usr/local/bin` 而**不在默认 PATH**，`which` 找不到不等于没装——脚本里漏了 `export PATH=/usr/local/bin:$PATH` 会造成「工具齐全却被判缺失」和「真缺失却判通过」两种反向误判。
+12. **镜像构建上下文错**：在 `launchx/` 下 `docker build` 会因 `go.mod` replace 指向 `../webx` 等兄弟目录而失败（`../` 越出仓库根）。构建必须在 `hubx/` 根执行并 `-f launchx/examples/docker/Dockerfile`。看到 `../webx: no such file` 就是这个错。
+13. **配置副本没挂进容器**：`configs/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl exec ... -- cat /app/config.yaml` 必须与 `examples/mesh/configs/<svc>.yaml` 一致，且含 `host.minikube.internal`。
 7. **把缺口记成通过**：metrics / pprof / 日志 trace_id 关联这三类本轮**不存在**（§13.4）。`/metrics` 返回 404 是预期，记 SKIP；若为使表格好看而写 PASS，或临时加个返回空 JSON 的假端点凑数 → 一律 FAIL。
 8. **只跑一个进程就宣称微服链路通**：gateway 起来了、bff/srv 没起，`/api/ping` 也可能被 fallback 逻辑返回 200。判据必须同时看 consul 实例数（bff + srv 各 ≥1）与 Jaeger 中三个服务名同 trace，缺一不算过。
 9. **bff 端口漂移**：计划 Task 10 曾写 `8091`，本文档定稿为 `8081`。实现与文档必须单一口径；出现两个端口说明有人各写各的，配置与验收已脱节。
