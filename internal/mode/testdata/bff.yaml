@@ -1,0 +1,11 @@
+# BFF：HTTP 入口 + 下游 RPC 客户端，并注册自身供网关发现
+service:
+  name: bff-svc
+  mode: bff
+  addr: 127.0.0.1:18081
+
+webx:
+  addr: 127.0.0.1:18081
+
+trace:
+  enabled: false

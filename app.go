@@ -13,6 +13,7 @@ import (
 	"github.com/gospacex/coordx"
 	"github.com/gospacex/launchx/internal/component"
 	"github.com/gospacex/launchx/internal/configsrc"
+	"github.com/gospacex/launchx/internal/mode"
 	"github.com/gospacex/launchx/internal/pipeline"
 	"github.com/gospacex/launchx/internal/telemetry"
 	"github.com/gospacex/logx"
@@ -26,6 +27,9 @@ import (
 // componentOrder 组件挂载顺序。db/cache/mq 先（业务最先用到），
 // registry 次之（服务端起来前要能注册），search/mongodb 最后。
 var componentOrder = []string{"db", "cache", "mq", "registry", "search", "mongodb"}
+
+// serverShutdownTimeout 优雅停机排空 in-flight 请求的上限。
+const serverShutdownTimeout = 5 * time.Second
 
 // Mode 服务形态。四档之间只差「服务端 + 服务发现」的装配方式，
 // 业务代码完全一致（C4：换形态不改业务）。
@@ -76,6 +80,16 @@ type App struct {
 	logger      logx.Logger
 	tracer      otelx.Provider
 	comp        *component.Env
+
+	// 形态装配产物（stepMode 填充；服务端句柄以 any 承载，
+	// launchx 库源码不直接依赖 hertz/kitex）
+	holders          *mode.AppHolders
+	engine           any
+	rpcServer        any
+	rpcClientOptions func(service string) (any, error)
+	// serverStop 停止服务端的钩子，退出链在 server.stop 之后调用
+	//（退出链编排本身在任务 7，这里只留钩子）。
+	serverStop func() error
 }
 
 // 组件句柄访问器。业务经此处取中间件，不直接构造驱动
@@ -120,6 +134,47 @@ func (a *App) compProduct(fn func(*component.Env) any) any {
 		return nil
 	}
 	return fn(a.comp)
+}
+
+// Engine 返回 webx 引擎（*webx.App）：monolith/bff/gateway 档非空，srv 档为 nil。
+//
+// 业务在 Setup 内断言后挂自己的路由（须早于 Run，路由树起服后只读）。
+func (a *App) Engine() any { return a.engine }
+
+// RPCServerOptions 返回 srv 档的 kitex 服务端选项（[]server.Option）。
+//
+// kitex server 本体由业务用这些选项构造（业务代码与形态无关），
+// 构造出的句柄经 SetRPCServer 回存，由 Run 启动、Close 停止。
+func (a *App) RPCServerOptions() any {
+	if a.holders == nil {
+		return nil
+	}
+	return a.holders.Out.RPCServer
+}
+
+// RPCServer 返回业务回存的 RPC 服务端句柄（kitex server），未回存为 nil。
+func (a *App) RPCServer() any { return a.rpcServer }
+
+// SetRPCServer 回存业务构造的 RPC 服务端句柄，并把它接进退出链。
+func (a *App) SetRPCServer(srv any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.rpcServer = srv
+	if s, ok := srv.(interface{ Stop() error }); ok {
+		a.serverStop = s.Stop
+	}
+}
+
+// RPCClientOptions 按被调服务名产出下游 RPC 客户端选项（[]client.Option）。
+//
+// 仅 bff/gateway 档可用（发现经 rpcx 的 coordx resolver）；
+// 其余档返回带合法形态列表的 error，而不是返回一份没有任何目标的选项。
+func (a *App) RPCClientOptions(service string) (any, error) {
+	if a.rpcClientOptions == nil {
+		return nil, fmt.Errorf("launchx: rpc client is not available in mode %q, valid modes: %s",
+			a.mode, strings.Join(Modes(), "|"))
+	}
+	return a.rpcClientOptions(service)
 }
 
 // Events 返回启动/退出步骤事件记录器（顺序断言的唯一依据）。
@@ -245,15 +300,50 @@ func (a *App) stepLogger(e *pipeline.Env) error {
 	return nil
 }
 
-// stepMode 校验并解析服务形态（非法即退，错误信息含全部合法取值）。
-// 实际的服务端装配在任务 9 补入此处。
+// stepMode 解析服务形态并装配本档的服务端与发现（非法/缺失/mesh 即退）。
+//
+// 装配只在此处发生一次：产物挂在 App 上，Run 负责启动、Close 负责停止。
+// 组件层（含注册中心）挂载在其后，故注册/发现的地址在装配期从配置读取。
 func (a *App) stepMode(e *pipeline.Env) error {
-	m, err := ParseMode(a.cfg.GetString("service.mode"))
-	if err != nil {
+	a.holders = &mode.AppHolders{
+		Cfg:         a.cfg,
+		Logger:      a.logger,
+		Tracer:      a.tracer,
+		ServiceName: a.serviceName,
+	}
+	if err := mode.Assemble(a.holders); err != nil {
 		return err
 	}
-	a.mode = m
+	out := a.holders.Out
+	a.mode = Mode(out.Mode)
+	a.engine = out.Webx
+	a.rpcClientOptions = out.RPCClientOptions
+	if a.engine != nil {
+		a.serverStop = webxStop(a.engine)
+	}
 	return nil
+}
+
+// webxStop 产出 webx 引擎的停止闭包。
+//
+// 未启动的引擎直接跳过：hertz 对未运行的服务 Shutdown 会返回
+// errStatusNotRunning，而「从没起来过」不是错误，不该冒进退出链的错误聚合。
+func webxStop(engine any) func() error {
+	w, ok := engine.(interface {
+		Shutdown(context.Context) error
+		IsRunning() bool
+	})
+	if !ok {
+		return nil
+	}
+	return func() error {
+		if !w.IsRunning() {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+		defer cancel()
+		return w.Shutdown(ctx)
+	}
 }
 
 // stepComponents 按固定顺序挂载六类内置组件。
@@ -292,8 +382,48 @@ func (a *App) boolMap(key string) map[string]bool {
 	return out
 }
 
-// Run 启动服务并托管退出（服务端装配在 mode 层，任务 9 接入）。
-func (a *App) Run() error { return nil }
+// Run 执行业务 Setup 回调，然后启动本档的服务端（阻塞）。
+//
+//	monolith/bff/gateway → webx 引擎；srv → 业务构造的 RPC server；
+//	两者都没有 → 返回 nil（后台型服务，例如纯消费者）。
+//
+// 服务端句柄以 any 承载并断言 Run() error：hertz/kitex 只经 webx/rpcx 引入，
+// launchx 库源码不直接引入它们（验收 3.14 的依赖面红线）。
+func (a *App) Run() error {
+	if a.events != nil {
+		a.events.Record(pipeline.StepSetup)
+	}
+	// Setup 必须早于监听：路由与处理器注册只能在起服前完成。
+	for _, fn := range a.setupSnapshot() {
+		if err := fn(a); err != nil {
+			return fmt.Errorf("launchx: setup: %w", err)
+		}
+	}
+	a.mu.Lock()
+	rpc, engine := a.rpcServer, a.engine
+	a.mu.Unlock()
+	// srv 档优先：业务构造的 RPC server 是该档唯一入口。
+	for _, srv := range []any{rpc, engine} {
+		if srv == nil {
+			continue
+		}
+		r, ok := srv.(interface{ Run() error })
+		if !ok {
+			return fmt.Errorf("launchx: server %T does not implement Run() error", srv)
+		}
+		return r.Run()
+	}
+	return nil
+}
+
+// setupSnapshot 返回 Setup 回调快照（启动期只读，避免持锁执行业务代码）。
+func (a *App) setupSnapshot() []func(*App) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]func(*App) error, len(a.setups))
+	copy(out, a.setups)
+	return out
+}
 
 // Close 幂等执行反序退出链。
 //
@@ -326,8 +456,14 @@ func (a *App) Close() error {
 		}
 	}
 
-	// 2. 服务端停止（任务 9 接入 webx/rpcx 后填充）
+	// 2. 服务端停止：钩子由形态装配（webx）或业务回存（RPC server）提供。
+	//    未启动过则为 no-op，不往错误聚合里塞噪声。
 	rec(pipeline.StepServerStop)
+	if a.serverStop != nil {
+		if err := a.serverStop(); err != nil {
+			errs = append(errs, fmt.Errorf("server stop: %w", err))
+		}
+	}
 
 	// 3. 组件停止（反序：先起的后停）
 	rec(pipeline.StepComponentStop)

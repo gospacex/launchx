@@ -1,0 +1,4 @@
+# mesh 不是独立档：与微服共用同一份代码，差异只在部署清单
+service:
+  name: mesh-svc
+  mode: mesh

@@ -1,0 +1,4 @@
+# 非法形态
+service:
+  name: illegal-svc
+  mode: oops

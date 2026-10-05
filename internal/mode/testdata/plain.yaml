@@ -1,0 +1,8 @@
+# 未配 webx 段：按 presence-based 口径用缺省装配（service.addr 兜底监听地址）
+service:
+  name: plain-svc
+  mode: monolith
+  addr: 127.0.0.1:18083
+
+trace:
+  enabled: false

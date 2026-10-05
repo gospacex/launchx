@@ -1,0 +1,8 @@
+# 领域服务：只有 RPC 服务端，不建 webx
+service:
+  name: srv-svc
+  mode: srv
+  addr: 127.0.0.1:19013
+
+trace:
+  enabled: false

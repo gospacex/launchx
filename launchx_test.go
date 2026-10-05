@@ -169,6 +169,28 @@ func TestExitOrderReverseChain(t *testing.T) {
 	}
 }
 
+// TestBootstrapModeAssembly 断言形态装配产物已挂到 App（monolith 档）：
+// 有 webx 引擎、无 RPC 服务端选项、无下游 RPC 客户端工厂。
+func TestBootstrapModeAssembly(t *testing.T) {
+	app, err := Bootstrap("testdata/monolith.yaml")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+	if app.Engine() == nil {
+		t.Fatal("monolith must assemble a webx engine")
+	}
+	if app.RPCServerOptions() != nil {
+		t.Fatal("monolith must not build rpc server options")
+	}
+	if app.RPCServer() != nil {
+		t.Fatal("monolith must not hold an rpc server")
+	}
+	if _, err := app.RPCClientOptions("downstream"); err == nil {
+		t.Fatal("monolith has no rpc client factory")
+	}
+}
+
 // TestBootstrapStrictComponentFailsFast 断言 strict.<name>=true 时组件失败
 // 会冒泡为 Bootstrap 错误（错误带 "init db" 上下文），而非静默降级。
 func TestBootstrapStrictComponentFailsFast(t *testing.T) {

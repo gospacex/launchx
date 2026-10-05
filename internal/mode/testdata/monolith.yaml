@@ -1,0 +1,11 @@
+# 单体：仅 HTTP 服务端，不注册自身（无注册中心段 → 不做任何发现/注册连接）
+service:
+  name: mono
+  mode: monolith
+  addr: 127.0.0.1:18080
+
+webx:
+  addr: 127.0.0.1:18080
+
+trace:
+  enabled: false
