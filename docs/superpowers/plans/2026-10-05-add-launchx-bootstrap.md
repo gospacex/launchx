@@ -26,6 +26,48 @@
 6. 底座事实（写死在 config.yaml 与 e2e 脚本）：consul `127.0.0.1:8500`；mysql `127.0.0.1:3306`（`order_rw/hubx123`，库 `order_db`）；kafka `127.0.0.1:9092`（KRaft，auto-create topic，PLAINTEXT；**不**用 srv-order 旧配置的 19093）；jaeger OTLP `127.0.0.1:4318` / UI `16686`；redis `127.0.0.1:6379`（无密码）
 
 ---
+## 内容基线（2026-10-05 合并）
+
+> 本节由 2026-10-05 的文档合并动作补写：把两份旧计划收敛为本文件（唯一驱动），并记录已落地实现、最小偏差与必须沿用的环境事实。执行后续 Task 前先读本节，避免重复探测环境或推翻已落地代码。
+
+### 本文件的地位
+
+- **唯一执行驱动**：本文件（`docs/superpowers/plans/2026-10-05-add-launchx-bootstrap.md`）是 `add-launchx-bootstrap` 的唯一驱动文件 —— 原生 21 个 Task（本次合并追加 Task 22 / 23 / 23b / 24 / 25）、每个 Task 带 `trace` / `sync` 锚点与 `- [ ]` 步骤复选框，sddflow build 机制直接消费本文件。
+- **已归档 `archive/2026-10-04-add-launchx-bootstrap.md`**：初版全量计划，只有 5 个 Task、范围未收敛且内容过时 → 不再执行，仅留作回溯。
+- **已归档 `archive/2026-10-04-launchx-kernel-monolith-micro.md`**：本轮实际执行并落地代码的那份（18 个「## 任务 N：」章节，含最新决策）→ 其有效内容已并入本节与新增 Task 22 / 23 / 23b / 24 / 25；因全篇无 `- [ ]` 复选框、无 trace/sync 锚点，无法驱动 sddflow，故归档不删除。
+
+### 已完成清单（以真实提交为准）
+
+- **Task 1**：launchx module + 单入口 API（`Bootstrap(path)` / `App` 句柄 / `OnSetup` / `Run` / 幂等 `Close`，非法 mode 拒绝启动）→ `e7bf5b1`（初始化骨架另见 `0c81939`）。
+- **Task 2**：configsrc 注册表 + `local` 加载器 + `${ENV}` 展开 → `990d1a1`、`91565af`（缺失配置路径硬失败补齐）。
+- **Task 3**：nacos 加载器三裁决（本地兜底 + `hubx.<service>` dataId key 级裁决 + `HUBX_NACOS_SERVER` env 覆盖，dataId 空纯本地、远端不可达即退）→ `cdbab21`。
+- **Task 4**：组件注册表与组件构建器、strict/trace 双裁决、presence-based 装配 → `bdbbdbf`（**实际落地六类，偏差见下**）。
+- **Task 6**：pipeline 固定启动骨架 + telemetry 全局注册（含显式传播器 Composite{TraceContext, Baggage}）+ 事件记录器 → `fc02f6c`。
+- **组件挂载 + 反序退出链骨架**（对应本文件 Task 7）→ `37e5065`；**仅骨架**：缺 server 停止与注册实例跟踪，故 Task 7 在本文件中仍保持未勾选。
+- **跨仓前置**：0.1 coordx/consul 复核 → 零改动通过（`../coordx`，复验非修复）；0.2 新建 `hubx/rpcx` 模块 → `a047afa` / `25e3e9b`。
+
+### 最小偏差记录（必须写清）
+
+- **偏差项**：本文件 Task 4 标题写的是「component 注册表与四个内置组件」（db / cache / mq / registry），**实际落地的是六类** —— db / cache / mq / registry / **search（Elasticsearch，经 `searchx/elasticsearch`）** / **mongodb（经 `mongodbx`）**。
+- **原因**：用户验收标准明确要求「DB、缓存、队列、ES、MongoDB 都要入链」（tasks.md 1.4 与验收案例 T4 同此口径），且 2026-10-05 底座已提供 ES 与 mongo 副本集，具备验收条件。
+- **性质**：**超集实现** —— 原四类组件的构造、`trace.on.<name>` 只控入链不控构造、`strict.<name>` 裁决、registry 失败带病运行、presence-based 装配等行为一条未削减，仅新增两类。
+- **证据**：`bdbbdbf`；`go.mod` 的 `replace` 由 23 条增至 26 条（新增 `searchx`、`searchx/elasticsearch`、`mongodbx`）。
+- **附带事实**：`github.com/gospacex/mongodbx` 的**包名是 `docx`**，import 必须显式 alias。
+
+### 环境事实（2026-10-05 用户给定，写死不再探测）
+
+1. **Go 工具链**：`export PATH=/Users/hyx/sdk/go1.24.3/bin:$PATH`，`GOTOOLCHAIN=auto`（自动拉取 go1.27.1；webx 声明 `go 1.27.1`、dbx `go 1.26.2`、mqx `go 1.27`），不需要手工装新版。
+2. **中间件底座**：所有中间件一律由本机 `/Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml` 统一供给 —— consul `8500`、mysql `3306`、kafka `9092`（KRaft）、jaeger `16686`/`4317`/`4318`、redis `6379`、mongo 副本集 `27018`-`27020` 等；docker CLI 绝对路径 `/Applications/Docker.app/Contents/Resources/bin/docker`（不在 PATH 里）。**Elasticsearch 不在该 compose 内**，当前 `9200` 由独立容器提供（实测 `green`）；若整套环境重建必须自行补 ES，否则 `search` 组件无法验收。
+3. **服务网格**：网格由本机 minikube 提供，但**实测 minikube / kubectl / helm / istioctl / linkerd 均未安装**（`which` 全空），故网格验收 T10–T12 的真实跑分后置（见 Task 25）；集群内访问宿主中间件须经 `host.docker.internal` 或宿主 IP 改写地址。
+4. **红线 —— otelx 只注册一半全局**：`otelx.New` 只注册 TracerProvider（`otelx/interface.go:207`，仅 `Tracer.Enabled` 为真时；关闭态返回 noop 且不碰全局），**从不注册传播器**。OTel 全局默认传播器是**空 Composite**（注入与提取皆空操作）→ `traceparent` 既不写出也不读取 → gateway→bff→srv 断成三段孤儿 trace，且**伪装成成功**（三服务各一根 trace、每条都能点开有 span），极难发现。故 launchx **必须**显式 `otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))`。同理 `webx.Config.FillDefaults` 的 Tracer 默认取 `otel.GetTracerProvider().Tracer("webx")` → **telemetry 必须先于 mode 装配**，否则 webx 拿到 noop tracer。
+
+### 任务顺序提醒
+
+- 本文件里 Task 5（mode 装配）排在 Task 6（pipeline/telemetry）之前，但上述红线要求 **telemetry 先于 mode 装配**。
+- 本轮实际执行顺序已是**先 6 后 5**（`fc02f6c` 先于 `e7bf5b1`），代码已按此落地。
+- **实现 Task 5 时不得回退顺序**，一律以已落地代码为准。
+
+---
 
 ## 文件结构（锁定分解）
 
@@ -67,7 +109,7 @@ launchx/
 **文件：**
 - 创建：`launchx/go.mod`、`launchx/launchx.go`、`launchx/app.go`、`launchx/setup.go`、`launchx/launchx_test.go`
 
-- [ ] **步骤 1.1.0：git init（plan-ready 2026-10-04 本地环境裁决）**
+- [x] **步骤 1.1.0：git init（plan-ready 2026-10-04 本地环境裁决）**
 
 运行：
 ```bash
@@ -75,7 +117,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && git init && git add .sddflow .clau
 ```
 预期：`git log --oneline` 1 条提交。
 
-- [ ] **步骤 1.1.1：写 go.mod（replace 指本地兄弟目录）**
+- [x] **步骤 1.1.1：写 go.mod（replace 指本地兄弟目录）**
 
 创建 `launchx/go.mod`：
 ```go
@@ -108,7 +150,7 @@ replace (
 )
 ```
 
-- [ ] **步骤 1.1.2：写 App 句柄与单入口 API**
+- [x] **步骤 1.1.2：写 App 句柄与单入口 API**
 
 创建 `launchx/app.go`：
 ```go
@@ -204,7 +246,7 @@ func (a *App) OnStop(fn func()) {
 }
 ```
 
-- [ ] **步骤 1.1.3：写 A1 冒烟测试（RED）**
+- [x] **步骤 1.1.3：写 A1 冒烟测试（RED）**
 
 创建 `launchx/launchx_test.go`：
 ```go
@@ -226,7 +268,7 @@ func TestBootstrapAPI(t *testing.T) {
 }
 ```
 
-- [ ] **步骤 1.1.4：编译通过（骨架占位版）**
+- [x] **步骤 1.1.4：编译通过（骨架占位版）**
 
 运行：
 ```bash
@@ -234,14 +276,14 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && go mod tidy && go build ./...
 ```
 预期：`go build ./...` 通过（`pipeline.Run` 尚未存在 → 本步先以占位实现解锁编译：在 `internal/pipeline/pipeline.go` 写 `func Run(path string) (*launchx.App, error) { return nil, errors.New("pipeline not implemented") }`，import 循环用 `internal/pipeline` 定义 `Run(path) (*pipeline.Result, error)` 返回字段结构与 App 等价，Task 6 替换。若 import 循环不可解，将 `Bootstrap` 直接改在 `internal/pipeline` 实现、`launchx.go` 转调，保持 `launchx.Bootstrap` 对外签名不变）。
 
-- [ ] **步骤 1.1.5：Commit**
+- [x] **步骤 1.1.5：Commit**
 
 ```bash
 git add go.mod go.sum launchx.go app.go setup.go launchx_test.go internal/
 git commit -m "feat: launchx module 骨架 + Bootstrap 单入口 API（A1）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.1 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.1 同步） <!-- 已实现: e7bf5b1 -->
 
 ---
 
@@ -253,7 +295,7 @@ git commit -m "feat: launchx module 骨架 + Bootstrap 单入口 API（A1）"
 **文件：**
 - 创建：`internal/configsrc/registry.go`、`internal/configsrc/local.go`、`internal/configsrc/expand.go`、`internal/configsrc/local_test.go`
 
-- [ ] **步骤 2.1：写失败测试（local + ExpandEnv）**
+- [x] **步骤 2.1：写失败测试（local + ExpandEnv）**
 
 创建 `internal/configsrc/local_test.go`：
 ```go
@@ -299,12 +341,12 @@ func TestExpandEnv(t *testing.T) {
 }
 ```
 
-- [ ] **步骤 2.2：运行确认失败**
+- [x] **步骤 2.2：运行确认失败**
 
 运行：`cd /Users/hyx/work/gowork/src/hubx/launchx && go test ./internal/configsrc/`
 预期：FAIL（`undefined: LoadLocal / ExpandEnv`）。
 
-- [ ] **步骤 2.3：实现注册表 + local + ExpandEnv**
+- [x] **步骤 2.3：实现注册表 + local + ExpandEnv**
 
 `internal/configsrc/expand.go`：
 ```go
@@ -370,7 +412,7 @@ func LoadLocal(path string) (configx.Config, error) {
 }
 ```
 
-- [ ] **步骤 2.4：运行确认通过 + Commit**
+- [x] **步骤 2.4：运行确认通过 + Commit**
 
 运行：`go test ./internal/configsrc/ -run 'TestLocalLoader|TestExpandEnv' -v`
 预期：PASS。
@@ -378,7 +420,7 @@ func LoadLocal(path string) (configx.Config, error) {
 git add internal/configsrc && git commit -m "feat: configsrc 注册表 + local 加载器 + ExpandEnv（1.2）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.2 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.2 同步） <!-- 已实现: 990d1a1 / 91565af -->
 
 ---
 
@@ -390,7 +432,7 @@ git add internal/configsrc && git commit -m "feat: configsrc 注册表 + local �
 **文件：**
 - 创建：`internal/configsrc/nacos.go`、`internal/configsrc/nacos_test.go`
 
-- [ ] **步骤 3.1：读参考实现，锁定语义**
+- [x] **步骤 3.1：读参考实现，锁定语义**
 
 运行：
 ```bash
@@ -398,7 +440,7 @@ sed -n '1,120p' /Users/hyx/work/gowork/src/hubx/micro_apps/infra/nacos/*.go
 ```
 摘录：`LoadUnified`（该仓实际 API，历史文档 `LoadMerged` 即指此）的三裁决顺序——① 本地 yaml 兜底值；② nacos `hubx.<service>` dataId（group HUBX）按 key 覆盖（远端非空键优先）；③ `HUBX_NACOS_SERVER` env 覆盖 server 地址（地址级最高优先）。dataId 为空 → 纯本地直接返回兜底。
 
-- [ ] **步骤 3.2：写失败测试（B1：key 级裁决 + 纯本地 + 远端不可达即退）**
+- [x] **步骤 3.2：写失败测试（B1：key 级裁决 + 纯本地 + 远端不可达即退）**
 
 创建 `internal/configsrc/nacos_test.go`：
 ```go
@@ -432,7 +474,7 @@ func TestNacosUnreachableFailsFast(t *testing.T) {
 ```
 （测试体内补全第一个用例：构造本地 yaml + `&nacosClient{fetch: 返回 map{"a":"99"}}`，断言裁决结果；完整断言代码随实现一起落盘，不留占位——写实现前先把两条断言写死）
 
-- [ ] **步骤 3.3：实现 nacos 加载器**
+- [x] **步骤 3.3：实现 nacos 加载器**
 
 创建 `internal/configsrc/nacos.go`：
 ```go
@@ -450,7 +492,7 @@ type Fetcher interface {
 ```
 实现要点：`base, err := LoadLocal(path)`；`if dataID == "" { return base, nil }`；`remote, err := client.Fetch(ctx, "hubx."+dataID, "HUBX")`（dataID 传服务名，完整 dataId 拼接在函数内）；`err != nil → return nil, fmt.Errorf("configsrc: nacos 远端不可达（dataId %s）: %w", ...)`；逐 key 覆盖：对 remote 每个非空 key，`base.Set(key, val)`（configx.Config 若无 Set 方法，改为将本地 + 远端两份 yaml 文本合并后重读——以 configx 实际接口为准，Step 3.1 探查 `micro_apps/infra/nacos` 的合并写法并复制其语义）。
 
-- [ ] **步骤 3.4：运行确认通过 + 注册默认 nacos 源 + Commit**
+- [x] **步骤 3.4：运行确认通过 + 注册默认 nacos 源 + Commit**
 
 运行：`go test ./internal/configsrc/ -run Nacos -v`
 预期：PASS。
@@ -459,19 +501,21 @@ type Fetcher interface {
 git add internal/configsrc && git commit -m "feat: configsrc nacos 加载器（三裁决，B1）（1.3）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.3 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.3 同步） <!-- 已实现: cdbab21 -->
 
 ---
 
 ### Task 4: component 注册表与四个内置组件
 
-> **trace:** plan-ready.md → `### Task 4: component 注册表与四个内置组件` | tasks.md → `- [ ] 1.4 实现 \`internal/component\` 注册表与内置 db/cache/mq/registry 构建器：\`trace.on.<name>\` 只控入链不控构造（对应验收案例 D1）、\`strict.<name>\` 裁决降级 Warn 或返回 error（对应验收案例 D2）、registry 失败带病运行`
-> **sync:** tasks.md → `- [ ] 1.4 实现 \`internal/component\` 注册表与内置 db/cache/mq/registry 构建器：\`trace.on.<name>\` 只控入链不控构造（对应验收案例 D1）、\`strict.<name>\` 裁决降级 Warn 或返回 error（对应验收案例 D2）、registry 失败带病运行` | plan-ready.md → `### Task 4: component 注册表与四个内置组件`
+> **trace:** plan-ready.md → `### Task 4: component 注册表与四个内置组件` | tasks.md → `- [ ] 1.4 实现 \`internal/component\` 注册表与内置 **db / cache / mq / registry / search(ES) / mongodb** 六类构建器：\`trace.on.<name>\` 只控入链不控构造（对应验收案例 D1，判定经 \`traceflag\` 组件级注册，不自造布尔逻辑）、\`strict.<name>\` 裁决降级 Warn 或返回 error（对应验收案例 D2）、registry 失败带病运行；各组件经 \`dbx/orm\`、\`cachex/redis\`、\`mqx/kafka\`、\`coordx/consul\`、\`searchx/elasticsearch\`、\`mongodbx\` 构造，不直引 gorm / go-redis / kafka-go / consul-api / elastic / mongo-driver；\`search\` 与 \`mongodb\` 同 \`cachex/redis\`、\`mqx/kafka\`、\`coordx/consul\` 属独立 module，go.mod 补对应 \`replace\`；presence-based 启用（配了 \`xmiddleware.searchx\` / \`mongodbx\` 段才构造）（对应验收案例 T2/T3/T4）`
+> **sync:** tasks.md → `- [ ] 1.4 实现 \`internal/component\` 注册表与内置 **db / cache / mq / registry / search(ES) / mongodb** 六类构建器：\`trace.on.<name>\` 只控入链不控构造（对应验收案例 D1，判定经 \`traceflag\` 组件级注册，不自造布尔逻辑）、\`strict.<name>\` 裁决降级 Warn 或返回 error（对应验收案例 D2）、registry 失败带病运行；各组件经 \`dbx/orm\`、\`cachex/redis\`、\`mqx/kafka\`、\`coordx/consul\`、\`searchx/elasticsearch\`、\`mongodbx\` 构造，不直引 gorm / go-redis / kafka-go / consul-api / elastic / mongo-driver；\`search\` 与 \`mongodb\` 同 \`cachex/redis\`、\`mqx/kafka\`、\`coordx/consul\` 属独立 module，go.mod 补对应 \`replace\`；presence-based 启用（配了 \`xmiddleware.searchx\` / \`mongodbx\` 段才构造）（对应验收案例 T2/T3/T4）` | plan-ready.md → `### Task 4: component 注册表与四个内置组件`
+
+> **偏差说明（2026-10-05 合并时登记）**：tasks.md 现行 1.4 已是**六类**（含 search / mongodb），而 plan-ready.md 的 Task 标题仍写「四个内置组件」。本 Task 已按**六类超集**实现（`bdbbdbf`，replace 23→26 条），不削减原四类任何行为；plan-ready 标题为 build 阶段禁止修改的规格文档，故此处保留原文标题，以 tasks.md 现行条目为验收口径。
 
 **文件：**
 - 创建：`internal/component/{registry.go,db.go,cache.go,mq.go,consul.go,strict.go}`、`internal/component/*_test.go`
 
-- [ ] **步骤 4.1：前置——coordx/consul 修复确认（plan-ready Task 4 Step 4.1 落地记录）**
+- [x] **步骤 4.1：前置——coordx/consul 修复确认（plan-ready Task 4 Step 4.1 落地记录）**
 
 运行（已修复则跳过编辑；design.md 记载已改，此处复核）：
 ```bash
@@ -484,7 +528,7 @@ cd /Users/hyx/work/gowork/src/hubx/coordx/consul && go build ./... && go vet ./.
 ```
 预期：全绿。
 
-- [ ] **步骤 4.2：写失败测试（D1/D2：strict 双分支 + trace.on 只控入链 + registry 带病运行）**
+- [x] **步骤 4.2：写失败测试（D1/D2：strict 双分支 + trace.on 只控入链 + registry 带病运行）**
 
 创建 `internal/component/component_test.go`（TDD 先行，测试内以 fake Builder 断言裁决语义；真实 db/cache/mq builder 在步骤 4.3 接线后由步骤 4.5 集成断言）：
 ```go
@@ -514,7 +558,7 @@ func TestRegistryDegradedRun(t *testing.T) {
 ```
 测试体内断言完整写死（不留占位）；依赖 `Register`/builder 签名——与步骤 4.3 实现同文件一次落盘，先跑 RED 确认 `undefined: Register`。
 
-- [ ] **步骤 4.3：实现注册表 + 四个 builder**
+- [x] **步骤 4.3：实现注册表 + 四个 builder**
 
 `internal/component/registry.go`：
 ```go
@@ -539,18 +583,18 @@ func MountAll(ctx context.Context, c *Ctx, a *AppHolders) error // 依次挂 db/
 
 `db.go`：`dbx/dbsql.ReadConfigFromConfigx(cfg, name)` + `dbsql.OpenFromConfigx(cfg, name, logger)`（enable_trace 经 traceflag 收敛，false 时 SDK 自动走 `orm.OpenNoTrace`，本库无需分叉——API 事实 §4）；`cache.go`：`cachex.Init(cachex.WithConfig(cfg, "cachex"))` + `cachex.Instance(name)`（未 Init 返回 nil → 降级态保持 nil）；`mq.go`：`mqx.ReadConfigFromConfigx(cfg, instance)` + `mqx.NewProducer`（driver kafka，blank import `_ "github.com/gospacex/mqx/kafka"` 由入口 binary 承载——在组件包以 `_` import 保证库内测试也注册）；`consul.go`：coordx `NewRegister/NewDiscover` + 移植 `micro_apps/infra/consul/registry.go:148` 的 `Target(agentAddr, serviceID)` 与 `:124` 的 `Resolve`（读 Discovery 结果拼 kitex `ClientOptions.Target` 逗号分隔串；空表返回空串）。
 
-- [ ] **步骤 4.4：运行 RED→GREEN + 集成断言**
+- [x] **步骤 4.4：运行 RED→GREEN + 集成断言**
 
 运行：`go test ./internal/component/ -v`
 预期：全部 PASS（含 strict 双分支、trace.on 门控、registry 带病运行；降级断言中 db/cache/mq 用 fake/不可达地址触发，不依赖真底座）。
 
-- [ ] **步骤 4.5：Commit**
+- [x] **步骤 4.5：Commit**
 
 ```bash
 git add internal/component ../coordx 2>/dev/null; git add internal/component && git commit -m "feat: component 注册表 + db/cache/mq/registry 内置 builder（D1/D2，1.4）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.4 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.4 同步） <!-- 已实现: bdbbdbf -->
 
 ---
 
@@ -647,7 +691,7 @@ git add internal/mode && git commit -m "feat: mode 四档装配分支（C1-C3/C4
 **文件：**
 - 创建：`internal/telemetry/provider.go`、`internal/pipeline/{pipeline.go,events.go}`（替换 Task 1 占位）、`internal/telemetry/provider_test.go`、`internal/pipeline/pipeline_test.go`
 
-- [ ] **步骤 6.1：写失败测试（A2 顺序断言：telemetry 早于 db/cache/mq 构建；exit 序 deregister 早于 flush、flush 最后）**
+- [x] **步骤 6.1：写失败测试（A2 顺序断言：telemetry 早于 db/cache/mq 构建；exit 序 deregister 早于 flush、flush 最后）**
 
 创建 `internal/pipeline/pipeline_test.go`（事件记录器断言）：
 ```go
@@ -662,7 +706,7 @@ func TestShutdownOrder(t *testing.T) {
 }
 ```
 
-- [ ] **步骤 6.2：实现 telemetry 封装 + events + pipeline.Run**
+- [x] **步骤 6.2：实现 telemetry 封装 + events + pipeline.Run**
 
 `internal/telemetry/provider.go`：
 ```go
@@ -678,7 +722,7 @@ func Init(cfg *otelx.Config) (Shutdown func(ctx context.Context), err error)
 `internal/pipeline/events.go`：`type Recorder struct { events []string; mu sync.Mutex }`，`Record(evt)` + `ContainsInOrder(e1, e2 string) bool`（测试用）。
 `internal/pipeline/pipeline.go`：`Run(path string)` 按七步骨架调用 configsrc（按 yaml `configcenter:` 段裁决 local/nacos，缺省 local）→ telemetry.Init（**最先**，事件 `telemetry.init`）→ logx 装配（`_ "github.com/gospacex/logx/zap"` blank import 在此包声明，保证库内测试亦注册 zap provider；`logx.New + SetGlobal`）→ mode.Assemble → component.MountAll → 用户 Setup 回调；每步 `Recorder.Record`。地基失败（config/telemetry/logx）即返回 error 且走已装配部分的退出链。
 
-- [ ] **步骤 6.3：运行确认通过 + 解除 Task 1 占位 + Commit**
+- [x] **步骤 6.3：运行确认通过 + 解除 Task 1 占位 + Commit**
 
 运行：`go test ./internal/... -v`
 预期：`TestStartupOrder`/`TestShutdownOrder` PASS（ShutdownOrder 依赖 Task 7 的 shutdown.go，若尚未实现则以 `component.stop→deregister→tracing.flush→logger.close` 的桩事件先断言存在，Task 7 落实真实序列）。
@@ -686,7 +730,7 @@ func Init(cfg *otelx.Config) (Shutdown func(ctx context.Context), err error)
 git add internal/telemetry internal/pipeline launchx.go && git commit -m "feat: pipeline 七步骨架 + telemetry 封装（A2，1.6）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.6 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 1.6 同步） <!-- 已实现: fc02f6c -->
 
 ---
 
@@ -1270,13 +1314,222 @@ git add openspec/changes/add-launchx-bootstrap/close-issues.md && git commit -m 
 
 ---
 
+### Task 22: 跨仓前置复核（0.1 / 0.2）
+
+> **trace:** plan-ready.md → `### Task 26: 跨仓前置 —— coordx/consul 注册修复落地（对应 \`tasks.md\` 0.1）` / `### Task 27: 跨仓前置 —— 新建 \`hubx/rpcx\` 模块（对应 \`tasks.md\` 0.2）` | tasks.md → `- [ ] 0.1 复核 \`../coordx/consul\` 注册修复**已落地**（实测该仓 \`consul.go\`：Check 仅 \`TTL: "30s"\` 无 \`Interval\`；\`startBeat\`/\`stopBeat\` 俱在，10s \`UpdateTTL\`，\`Deregister\` 与 \`Close\` 停心跳，同 ID 重注册先停旧）——故本条为**复验**而非重新修复；复验：注册 200、passingOnly 发现 1 实例、35s 后 check 仍 passing、注销后归零，\`go build\` / \`go vet\` 于该仓全绿（E2 发现链与 C2/C3 装配的前置）。若复核发现未修复，则按 design.md 决策补齐后再继续`<br>`- [ ] 0.2 新建 \`../rpcx\` 模块（\`github.com/gospacex/rpcx\`）：封装 kitex \`server\` / \`client\` Option 装配（\`BuildServerOptions\` / \`BuildClientOptions\`，实现自 \`micro_apps/pkg/rpcx\` 移植 —— 缺省超时 / 优雅退出排空等待 / obs-opentelemetry 套件挂载点）；服务发现走 \`coordx\`，MUST NOT 引入 \`regdisx\`；套件只从 \`otel.GetTracerProvider()\` 取用，MUST NOT 自行装配 provider；README 注明与 \`micro_apps/pkg/rpcx\`、\`gospacex/rpcx\` 的关系与后续迁移路径`
+> **sync:** tasks.md → `- [ ] 0.1 复核 \`../coordx/consul\` 注册修复**已落地**（实测该仓 \`consul.go\`：Check 仅 \`TTL: "30s"\` 无 \`Interval\`；\`startBeat\`/\`stopBeat\` 俱在，10s \`UpdateTTL\`，\`Deregister\` 与 \`Close\` 停心跳，同 ID 重注册先停旧）——故本条为**复验**而非重新修复；复验：注册 200、passingOnly 发现 1 实例、35s 后 check 仍 passing、注销后归零，\`go build\` / \`go vet\` 于该仓全绿（E2 发现链与 C2/C3 装配的前置）。若复核发现未修复，则按 design.md 决策补齐后再继续`<br>`- [ ] 0.2 新建 \`../rpcx\` 模块（\`github.com/gospacex/rpcx\`）：封装 kitex \`server\` / \`client\` Option 装配（\`BuildServerOptions\` / \`BuildClientOptions\`，实现自 \`micro_apps/pkg/rpcx\` 移植 —— 缺省超时 / 优雅退出排空等待 / obs-opentelemetry 套件挂载点）；服务发现走 \`coordx\`，MUST NOT 引入 \`regdisx\`；套件只从 \`otel.GetTracerProvider()\` 取用，MUST NOT 自行装配 provider；README 注明与 \`micro_apps/pkg/rpcx\`、\`gospacex/rpcx\` 的关系与后续迁移路径` | plan-ready.md → `### Task 26: 跨仓前置 —— coordx/consul 注册修复落地（对应 \`tasks.md\` 0.1）` / `### Task 27: 跨仓前置 —— 新建 \`hubx/rpcx\` 模块（对应 \`tasks.md\` 0.2）`
+
+**文件：**
+- 跨仓（不在本仓改动）：`/Users/hyx/work/gowork/src/hubx/coordx/consul/consul.go`（0.1 复核）、`/Users/hyx/work/gowork/src/hubx/rpcx/{go.mod,options.go,server.go,client.go,README.md}`（0.2 新建）
+- 本仓联动：`go.mod`（`replace github.com/gospacex/rpcx => ../rpcx`）
+
+**说明：** 本 Task 已在 2026-10-05 执行完毕（详见「内容基线」已完成清单），此处登记状态与证据。
+
+- [x] **步骤 22.1：0.1 coordx/consul 注册修复复验** <!-- 已实现: a047afa / 25e3e9b / coordx 零改动 -->
+
+复核项（`Check` 仅 `TTL: "30s"` 无 `Interval`；`startBeat`/`stopBeat` 俱在，10s `UpdateTTL`；`Deregister` 与 `Close` 停心跳，同 ID 重注册先停旧）：
+```bash
+sed -n '70,100p' /Users/hyx/work/gowork/src/hubx/coordx/consul/consul.go
+grep -n 'startBeat\|UpdateTTL' /Users/hyx/work/gowork/src/hubx/coordx/consul/consul.go
+cd /Users/hyx/work/gowork/src/hubx/coordx/consul && go build ./... && go vet ./...
+```
+预期：注册 200、passingOnly 发现 1 实例、35s 后 check 仍 passing、注销后归零，`go build` / `go vet` 全绿。**实测：全部通过，`../coordx` 为零改动（复验非修复）。**
+
+- [x] **步骤 22.2：0.2 新建 `hubx/rpcx` 模块** <!-- 已实现: a047afa / 25e3e9b / coordx 零改动 -->
+
+形态：`BuildServerOptions` / `BuildClientOptions` 封装 kitex `server` / `client` Option（缺省超时：RPC 3s / 建连 500ms / 读写 30s / 退出排空 5s）+ `obs-opentelemetry` 套件挂载点；服务发现走 `coordx`，**MUST NOT** 引入 `regdisx`；套件只从 `otel.GetTracerProvider()` 取用，**MUST NOT** 自行装配 provider。
+验证：`cd /Users/hyx/work/gowork/src/hubx/rpcx && go build ./... && go vet ./...` 全绿。**实测：`a047afa` / `25e3e9b`（覆盖率 94.6%）。**
+
+- [x] **步骤 22.3：本仓 go.mod 以 replace 指向本地 `../rpcx`** <!-- 已实现: a047afa / 25e3e9b / coordx 零改动 -->
+
+rpcx 未发布版本，`go.mod` 必须走本地 `replace`（与其余 `*x` SDK 同策略）；**实测已接回（见 `9eb64cd` / `9a43c2d`）**。
+
+- [x] **步骤 22.4：跨仓 Commit 证据登记**
+
+```bash
+cd /Users/hyx/work/gowork/src/hubx/rpcx && git log --oneline   # a047afa / 25e3e9b
+cd /Users/hyx/work/gowork/src/hubx/coordx && git status --short # 期望：clean（零改动）
+```
+
+- [x] **Task complete**（跨仓前置已完成；coordx 零改动，rpcx 落地于 `a047afa` / `25e3e9b`） <!-- 已实现: a047afa / 25e3e9b / coordx 零改动 -->
+
+---
+
+### Task 23: 出向注入工具（1.9，验收案例 T1/T7）
+
+> **trace:** plan-ready.md 无对应 Task（该项为 2026-10-05 追加），跳过同步 | tasks.md → `- [ ] 1.9 导出极小出向注入工具（如 \`trace.Inject(ctx, carrier)\`，仅做 \`otel.GetTextMapPropagator().Inject\`，不含转发逻辑）：因 \`webx/middleware/otel.go\` 只有 Extract 无 Inject、全 hubx 无出向注入 helper；写法对齐已验证的 \`micro_apps/apps/gateway/internal/proxy/proxy.go:134\`；\`examples/micro/gateway\` MUST 调用它完成 gateway → bff 的 HTTP 续链（对应验收案例 T6）`
+> **sync:** tasks.md → `- [ ] 1.9 导出极小出向注入工具（如 \`trace.Inject(ctx, carrier)\`，仅做 \`otel.GetTextMapPropagator().Inject\`，不含转发逻辑）：因 \`webx/middleware/otel.go\` 只有 Extract 无 Inject、全 hubx 无出向注入 helper；写法对齐已验证的 \`micro_apps/apps/gateway/internal/proxy/proxy.go:134\`；\`examples/micro/gateway\` MUST 调用它完成 gateway → bff 的 HTTP 续链（对应验收案例 T6）` | plan-ready.md 无对应 Task（该项为 2026-10-05 追加），跳过同步
+
+**文件：**
+- 创建：`trace.go`（导出薄封装）、`trace_test.go`
+
+**背景（实测）：** `webx/middleware/otel.go` **只有 Extract 没有 Inject**，全 hubx 无出向注入 helper。gateway 转发 HTTP 到 bff 时若不在出向 Header 注入 `traceparent`，下游 Extract 拿不到上游 context，链路断开。已验证写法：`micro_apps/apps/gateway/internal/proxy/proxy.go:134` 的 `otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(outReq.Header))`。
+
+- [ ] **步骤 23.1：写失败测试（T1 注入 + T7 反向断言）**
+
+```go
+// trace_test.go
+func TestInjectWritesTraceParent(t *testing.T)      // 注入后 carrier 中存在合法 traceparent（T1）
+func TestDefaultPropagatorIsNoop(t *testing.T)      // 不注册传播器时提取不到上游 context（T7）
+```
+注意：用例必须成对使用 `t.Cleanup` 还原全局 provider / propagator，避免污染其它用例。
+
+- [ ] **步骤 23.2：运行确认失败** — `go test ./... -run 'Inject|DefaultPropagator'`
+
+- [ ] **步骤 23.3：实现 `trace.Inject(ctx, carrier)`**
+
+`trace.go` 只做一件事：`otel.GetTextMapPropagator().Inject(ctx, carrier)`，**不含任何转发逻辑**；carrier 入参类型对齐 `propagation.HeaderCarrier`。链路正确性依赖 Task 6 已注册的 Composite{TraceContext, Baggage}（见「内容基线」红线 4）。
+
+- [ ] **步骤 23.4：`examples/micro/gateway` 调用注入完成 gateway → bff 续链**
+
+转发前 MUST 调用 `trace.Inject(ctx, propagation.HeaderCarrier(outReq.Header))`；缺此步则 T6 的三段同 trace 断言无法通过。
+
+- [ ] **步骤 23.5：Commit**
+
+```bash
+git add trace.go trace_test.go examples/micro/gateway && git commit -m "feat(launchx): 出向注入工具 trace.Inject（T1/T7，1.9）"
+```
+
+- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 1.9 同步；plan-ready.md 无对应 Task）
+
+---
+
+### Task 23b: Jaeger 端到端调用链验收（4.1–4.8，验收案例 T1–T9）
+
+> **trace:** plan-ready.md 无对应 Task（该项为 2026-10-05 追加），跳过同步 | tasks.md → `- [ ] 4.1 单测：telemetry 步骤后 \`otel.GetTextMapPropagator().Fields()\` 含 \`traceparent\`/\`tracestate\`/\`baggage\`，且注入后 carrier 中存在合法 \`traceparent\`（验收案例 T1）；反向断言——不跑 telemetry 步骤时提取不到上游 span context（验收案例 T7）`<br>`- [ ] 4.2 集成：\`examples/monolith\` 落库接口在 Jaeger 中形成 span 树深度 ≥ 3（入口 → 业务层 → 数据层），数据层 span 祖先链含入口 span，无孤儿（验收案例 T5）`<br>`- [ ] 4.3 集成：数据库**单表** CRUD 四类 span 均带非空 \`db.query.text\`（完整 SQL）与 \`db.sql.table\`（验收案例 T2）`<br>`- [ ] 4.4 集成：数据库**多表**操作入链——\`JOIN\`（或 \`Preload\`）查询的 \`db.query.text\` 含关联文本；跨表事务内多条 SQL 为同 trace 的兄弟 span；回滚时相关 span 标 Error（验收案例 T3）`<br>`- [ ] 4.5 集成：同一请求内 cache / mq / \`db.elasticsearch.*\` / \`db.mongodb.*\` 四类 span 共存于同一 trace，均为业务 span 子节点（验收案例 T4）`<br>`- [ ] 4.6 集成：\`gateway → bff → srv\` 三段 span 共享同一 trace-id 且父子链正确（非三个并列根），srv 侧数据层 span 亦在同一 trace（验收案例 T6）`<br>`- [ ] 4.7 集成：Jaeger API \`http://127.0.0.1:16686/api/traces?service=<service.name>\` 可检索到上述 trace，且尾部 span 不缺失（证明退出冲刷生效）（验收案例 T9）`<br>`- [ ] 4.8 代码断言：全仓无网格专属 trace 分支，\`mode\` 枚举无 \`mesh\` 取值；\`examples/mesh\` 与 \`examples/micro\` 三服务 main.go 差异仅在配置路径与地址副本（验收案例 T8）`
+> **sync:** tasks.md → `- [ ] 4.1 单测：telemetry 步骤后 \`otel.GetTextMapPropagator().Fields()\` 含 \`traceparent\`/\`tracestate\`/\`baggage\`，且注入后 carrier 中存在合法 \`traceparent\`（验收案例 T1）；反向断言——不跑 telemetry 步骤时提取不到上游 span context（验收案例 T7）`<br>`- [ ] 4.2 集成：\`examples/monolith\` 落库接口在 Jaeger 中形成 span 树深度 ≥ 3（入口 → 业务层 → 数据层），数据层 span 祖先链含入口 span，无孤儿（验收案例 T5）`<br>`- [ ] 4.3 集成：数据库**单表** CRUD 四类 span 均带非空 \`db.query.text\`（完整 SQL）与 \`db.sql.table\`（验收案例 T2）`<br>`- [ ] 4.4 集成：数据库**多表**操作入链——\`JOIN\`（或 \`Preload\`）查询的 \`db.query.text\` 含关联文本；跨表事务内多条 SQL 为同 trace 的兄弟 span；回滚时相关 span 标 Error（验收案例 T3）`<br>`- [ ] 4.5 集成：同一请求内 cache / mq / \`db.elasticsearch.*\` / \`db.mongodb.*\` 四类 span 共存于同一 trace，均为业务 span 子节点（验收案例 T4）`<br>`- [ ] 4.6 集成：\`gateway → bff → srv\` 三段 span 共享同一 trace-id 且父子链正确（非三个并列根），srv 侧数据层 span 亦在同一 trace（验收案例 T6）`<br>`- [ ] 4.7 集成：Jaeger API \`http://127.0.0.1:16686/api/traces?service=<service.name>\` 可检索到上述 trace，且尾部 span 不缺失（证明退出冲刷生效）（验收案例 T9）`<br>`- [ ] 4.8 代码断言：全仓无网格专属 trace 分支，\`mode\` 枚举无 \`mesh\` 取值；\`examples/mesh\` 与 \`examples/micro\` 三服务 main.go 差异仅在配置路径与地址副本（验收案例 T8）` | plan-ready.md 无对应 Task（该项为 2026-10-05 追加），跳过同步
+
+**前置（硬）：** 「内容基线」环境事实第 2 条的共享底座就绪 —— jaeger `16686`/`4317`/`4318`、mysql `3306`、kafka `9092`、elasticsearch `9200`（**注意：ES 不在 `hubx/dockers` compose 内，当前由独立容器提供**）。
+
+**文件：**
+- 创建：`examples/monolith/trace_e2e_test.go`、`examples/micro/trace_e2e_test.go`、`internal/traceutil/`（Jaeger API 检索助手）
+
+- [ ] **步骤 23b.1：T1 传播器字段与注入断言 / T7 反向断言（4.1）**
+
+断言 telemetry 步骤后 `otel.GetTextMapPropagator().Fields()` 含 `traceparent` / `tracestate` / `baggage`，且注入后 carrier 中存在合法 `traceparent`；反向断言 —— 不跑 telemetry 步骤时提取不到上游 span context。
+
+- [ ] **步骤 23b.2：T5 monolith span 树深度 ≥ 3（4.2）**
+
+落库接口的一条 trace 中，span 树须为「入口 → 业务层 → 数据层」，数据层 span 的祖先链含入口 span，**无孤儿**。
+
+- [ ] **步骤 23b.3：T2 单表 CRUD 四类 span（4.3）**
+
+`db.query.text`（完整 SQL）与 `db.sql.table` 均非空；单表四类操作（INSERT / SELECT / UPDATE / DELETE）逐一断言。
+
+- [ ] **步骤 23b.4：T3 多表操作入链（4.4）**
+
+`JOIN`（或 `Preload`）查询的 `db.query.text` 含关联文本；跨表事务内多条 SQL 为同 trace 的兄弟 span；回滚时相关 span 标 Error。
+
+- [ ] **步骤 23b.5：T4 四类组件同 trace（4.5）**
+
+同一请求内依次操作 cache / mq / `db.elasticsearch.*` / `db.mongodb.*`，断言四类 span 共存于同一 trace 且均为业务 span 的子节点（依托 Task 4 的六类组件超集实现）。
+
+- [ ] **步骤 23b.6：T6 gateway → bff → srv 三段同 trace（4.6）**
+
+**这是最容易假通过的断言**：不注册传播器时三服务各产一根 trace，每条都能点开、都有 span，看起来完全正常。必须断言 **traceID 相等 + 父子关系**（gateway → bff → srv，而不是三个并列根），而非「各服务都能查到 trace」。
+
+- [ ] **步骤 23b.7：T9 尾部 span 不缺失（4.7）**
+
+经 `traceutil` 检索 Jaeger API `http://127.0.0.1:16686/api/traces?service=<service.name>`，断言 span 数量符合预期且尾部节点不缺失 —— 证明退出链 `tracing.shutdown(15s)` 冲刷生效（批量导出器未冲刷会静默丢最后一个 span）。
+
+- [ ] **步骤 23b.8：T8 网格同构代码断言（4.8）**
+
+全仓无网格专属 trace 分支；`mode` 枚举无 `mesh` 取值；`examples/mesh` 与 `examples/micro` 三服务 main.go 差异仅在配置路径与地址副本。
+
+- [ ] **步骤 23b.9：Commit**
+
+```bash
+git add examples/monolith/trace_e2e_test.go examples/micro/trace_e2e_test.go internal/traceutil/ trace_test.go && git commit -m "test: Jaeger 端到端调用链验收 T1-T9（4.1-4.8）"
+```
+
+- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 4.1–4.8 同步；plan-ready.md 无对应 Task）
+
+---
+
+### Task 24: 依赖面核对（3.14）
+
+> **trace:** plan-ready.md → `### Task 28: 依赖面核对（对应 \`tasks.md\` 3.14）` | tasks.md → `- [ ] 3.14 依赖面核对（mode-assembly「RPC 依赖面收敛」）：launchx 库源码（含 \`internal/*\`）零 \`cloudwego/*\` import，go.mod 中 kitex 仅 \`// indirect\`；\`examples/\` 中仅 \`micro/srv\` 与 \`micro/bff\` 的 kitex 构造处出现 kitex import（\`kitex_gen\` 所需），且全仓无 \`cloudwego/hertz\`、\`redis/go-redis\`、\`segmentio/kafka-go\`、\`hashicorp/consul/api\`、\`gorm.io/gorm\` 的直接引用`
+> **sync:** tasks.md → `- [ ] 3.14 依赖面核对（mode-assembly「RPC 依赖面收敛」）：launchx 库源码（含 \`internal/*\`）零 \`cloudwego/*\` import，go.mod 中 kitex 仅 \`// indirect\`；\`examples/\` 中仅 \`micro/srv\` 与 \`micro/bff\` 的 kitex 构造处出现 kitex import（\`kitex_gen\` 所需），且全仓无 \`cloudwego/hertz\`、\`redis/go-redis\`、\`segmentio/kafka-go\`、\`hashicorp/consul/api\`、\`gorm.io/gorm\` 的直接引用` | plan-ready.md → `### Task 28: 依赖面核对（对应 \`tasks.md\` 3.14）`
+
+**说明：** 纯核对动作，不合格则修正 import 与 `go.mod`；用于坐实 mode-assembly 的「RPC 依赖面收敛」。
+
+- [ ] **步骤 24.1：库源码零 cloudwego 直接 import**
+
+```bash
+grep -rn "cloudwego" --include="*.go" . | grep -v "^./examples/"    # 期望：空
+```
+含 `internal/*` 全量；期望无命中。
+
+- [ ] **步骤 24.2：`go.mod` 中 kitex 仅 `// indirect`**
+
+检查 `go.mod`：`github.com/cloudwego/kitex` 只能出现在 indirect 区；RPC 相关 import 只指向 `github.com/gospacex/rpcx`（前置 Task 22）。
+
+- [ ] **步骤 24.3：`examples/` 白名单核对**
+
+仅 `micro/srv` 与 `micro/bff` 的 kitex 构造处允许出现 kitex import（`kitex_gen` 所需）；全仓无 `cloudwego/hertz`、`redis/go-redis`、`segmentio/kafka-go`、`hashicorp/consul/api`、`gorm.io/gorm` 的直接引用。
+
+- [ ] **步骤 24.4：Commit（仅在有修正时）**
+
+```bash
+go list -deps ./...    # 依赖面清单核对
+git add -A && git commit -m "chore: 依赖面核对（mode-assembly RPC 依赖面收敛，3.14）"
+```
+
+- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.14 同步）
+
+---
+
+### Task 25: 网格形态端到端链路验收（4.9–4.11，验收案例 T10–T12）
+
+> **trace:** plan-ready.md → `### Task 21: 网格部署验收（验收案例 E4/E5，两级）`（**关联项，非同名**：T10–T12 即其 (b) 级人工验证的链路断言部分，证据文件同为 `examples/mesh/docs/verify.md`） | tasks.md → `- [ ] 4.9 集成（网格）：minikube + Istio 就绪、sidecar 追踪 100% 采样并绑定 OTLP provider 后，触发 \`gateway → bff → srv\` 全链路，Jaeger 同一 trace 下同时存在应用 span（\`gateway\`/\`bff\`/\`srv\`）与 sidecar span（\`<workload>.<ns>\`），且应用 span 父子链仍为 gateway → bff → srv、srv 数据层 span 同 trace（验收案例 T10）`<br>`- [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）`<br>`- [ ] 4.11 证据落盘（网格）：\`examples/mesh/docs/verify.md\` 记录 trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始响应片段 / \`hubx.trace\` OFF-ON 对比 / minikube-kubectl-istioctl-Istio 版本（验收案例 T12）`
+> **sync:** tasks.md → `- [ ] 4.9 集成（网格）：minikube + Istio 就绪、sidecar 追踪 100% 采样并绑定 OTLP provider 后，触发 \`gateway → bff → srv\` 全链路，Jaeger 同一 trace 下同时存在应用 span（\`gateway\`/\`bff\`/\`srv\`）与 sidecar span（\`<workload>.<ns>\`），且应用 span 父子链仍为 gateway → bff → srv、srv 数据层 span 同 trace（验收案例 T10）`<br>`- [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）`<br>`- [ ] 4.11 证据落盘（网格）：\`examples/mesh/docs/verify.md\` 记录 trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始响应片段 / \`hubx.trace\` OFF-ON 对比 / minikube-kubectl-istioctl-Istio 版本（验收案例 T12）` | plan-ready.md → `### Task 21: 网格部署验收（验收案例 E4/E5，两级）`（关联项，非同名）
+
+**前置（硬，当前未就绪）：** 「内容基线」环境事实第 3 条 —— 实测本机 minikube / kubectl / helm / istioctl / linkerd **均未安装**。真实执行前先：
+```bash
+brew install minikube kubectl && brew install istioctl
+minikube start --driver=docker
+istioctl install --set profile=demo     # 或 istioctl install -f <自定义 mesh config>
+minikube image load launchx-examples/gateway:dev   # 三服务镜像逐一 load 进集群
+```
+采样须 100%，Istio 侧 OTLP provider 指向本机 Jaeger（集群内经 `host.docker.internal:4317` 或宿主 IP）。
+
+**待真机核实（不得凭记忆定稿）：** Istio 侧追踪 provider 必须选 **`opentelemetry`** —— Envoy OTel tracer 走 W3C `traceparent`，与 launchx 的 Composite{TraceContext, Baggage} 对齐；若选 `zipkin`，默认走 **B3**（`x-b3-traceid`）会与 W3C 头不互通而断链。落地前须以 `istioctl proxy-config bootstrap <pod> -n launchx-mesh -o json` 查 tracing 配置，并对 demo 发一次请求抓 sidecar 实际写出的头名确认。
+
+**文件：**
+- 依赖：`examples/mesh/`（2.5 清单后置，见 Task 21）、`examples/mesh/scripts/bring-up.sh`、`examples/mesh/docs/verify.md`
+
+- [ ] **步骤 25.1：环境前置检查脚本（缺失即非零退出）**
+
+`bring-up.sh check` 须显式检查 `minikube` / `kubectl` / `istioctl` 是否存在、`minikube status` 是否 Running、istio-system 是否就绪、宿主中间件端口（consul 8500 / mysql 3306 / kafka 9092 / jaeger 16686）是否可达；缺失时**打印缺失项并以非零码退出**，不得静默通过。
+
+- [ ] **步骤 25.2：传播头对齐实测（决定 provider 选型）**
+
+按上文「待真机核实」执行，结论写入 `examples/mesh/docs/verify.md` 的「环境与配置」段。
+
+- [ ] **步骤 25.3：T10 — 应用 span 与 sidecar span 同 trace**
+
+经 Ingress Gateway 触发 `gateway → bff → srv`；用 `http://127.0.0.1:16686/api/traces?service=gateway` 与 `?service=gateway.<ns>` 双向检索，断言：同一 trace-id；应用 span 父子链仍为 gateway → bff → srv；srv 数据层 span 同 trace。
+
+- [ ] **步骤 25.4：T11 — 网格下「半断链」反向断言**
+
+以不注册传播器的临时构建（仅实验，不入主干）跑一次请求，断言 Jaeger 出现「1 条 sidecar 完整链 + 应用侧各自孤儿 trace」（trace 数 ≥ 4），记录为反例证据。
+
+- [ ] **步骤 25.5：T12 — 证据落盘**
+
+`examples/mesh/docs/verify.md` 记录：trace-id、span 总数、应用 span 数 / sidecar span 数、sidecar 服务名、Jaeger API 原始响应片段、`hubx.trace` OFF/ON 对比、minikube / kubectl / istioctl / Istio 版本。
+
+- [ ] **步骤 25.6：Commit**
+
+```bash
+git add examples/mesh/ && git commit -m "test(mesh): 网格形态端到端链路验收 T10-T12（4.9-4.11）与证据落盘"
+```
+
+- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 4.9–4.11 同步）
+
+---
+
 ## 自检（writing-plans Self-Review）
 
 1. **规格覆盖**：1.1→T1、1.2→T2、1.3→T3、1.4→T4、1.5→T5、1.6→T6、1.7→T7、2.1→T8、2.2→T9、2.3→T10、2.4→T11、3.1→T12、3.2→T13、3.3→T14、3.4→T15、3.5→T16、3.6→T17、3.7→T18、3.9→T19、2.6→T20；1.8/2.5/3.8/3.11–3.13/3.10(后置部分)→T21 占位。无遗漏。
 2. **占位符扫描**：唯一有意占位为 T21（后置项，spec 明确本轮不做，正文仅锁定插入点与规格引用，无 TBD/TODO 型实现占位）；T1 步骤 1.1.4 给出 import 循环的两种解法，非占位。
 3. **类型一致性**：`App` 字段名（DB/Cache/MQ/Registry/Server/RPCServer）在 T1/T4/T6 一致；`Registry.Target(agentAddr, serviceID)` 签名在 T4（移植自 micro_apps/infra/consul/registry.go:148）与 T5/T9/T10 一致；`RPCClientOptions(service)` 工厂 T5 产出、T10 消费；事件名（telemetry.init/component.*/registry.deregister/tracing.flush/logger.close）在 T6/T7/T13 一致。
-## 自检（writing-plans Self-Review）
-
-1. **规格覆盖**：1.1→T1、1.2→T2、1.3→T3、1.4→T4、1.5→T5、1.6→T6、1.7→T7、2.1→T8、2.2→T9、2.3→T10、2.4→T11、3.1–3.4+3.9→T12、3.5–3.7→T13、2.6→T14；1.8/2.5/3.8/3.10(后置部分)/3.11–3.13→T15 占位。无遗漏。
-2. **占位符扫描**：唯一有意占位为 T15（后置项，spec 明确本轮不做，正文仅锁定插入点与规格引用，无 TBD/TODO 型实现占位）；T1 步骤 1.1.4 允许 import 循环时的等价调整已给出两种解法，非占位。
-3. **类型一致性**：`App` 字段名（DB/Cache/MQ/Registry/Server/RPCServer）在 T1/T4/T6 一致；`Registry.Target(agentAddr, service)` 签名在 T4（移植自 infra/consul:148）与 T5/T9/T10 一致；`RPCClientOptions(service)` 工厂 T5 产出、T10 消费。
