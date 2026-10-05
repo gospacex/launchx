@@ -62,7 +62,7 @@ db → cache → mq → kv → lock → registry → search → mongodb
 | mongodbx | ✅ `db.mongodb.<op>` | **实例级** `EnableTrace` | 关 | ⚠ 全局 `SetTracingConfig` / `IsTracingEnabled()` **全库无调用者**（死开关） |
 | coordx | ✅ consul 驱动有 `coord.register` / `coord.deregister` | 实例级 `cfg.EnableTrace` | 关 | 后台轮询已做孤儿 span 抑制（`consul.go:176-178`），但 `Deregister` 未见同样保护 ← 即我们见过的那条孤儿 span |
 | kvx / lockx / searchx | ✅ 各自驱动 | 实例级 `EnableTrace` | 关 | ⚠ 三者 `Config` 无 mapstructure tag：业务自行 `Unmarshal` 时 `enable_trace` 静默失效（launchx 用逐字段 `Get` 绕开） |
-| mqx | ✅ `messaging.kafka.send` 等 | **管不住** | 恒产 span | ⚠ 见下节第 1 条 |
+| mqx | ✅ `messaging.kafka.send` 等 | `trace.on.mq` → `EnableTrace \|\| CallChainEnabled` | 关 | 2026-10-05 前恒产 span，已修（见下节第 ① 条） |
 | rpcx | ✅ kitex obs-opentelemetry suite | 实例级 `TraceEnabled`（`trace.enabled`） | 关 | 只从 `otel.GetTracerProvider()` 取用，绝不自建 |
 | webx | ✅ 中间件（**只有 Extract 无 Inject**） | `trace.enabled` | 关 | 出向注入要靠业务自己调 `trace.Inject` |
 
@@ -70,19 +70,19 @@ db → cache → mq → kv → lock → registry → search → mongodb
 
 ## 3. 三个会咬人的点（按危害排序）
 
-### ① mqx：span 无条件产生，违反「`trace.on.*` 只控入链」红线
-`mqx/kafka/kafka.go:259`：
+### ① mqx：span 曾无条件产生（**2026-10-05 已修**）
+原状：五个驱动（kafka / nsq / pulsar / rocketmq / rabbitmq）一律 `otel.Tracer(...)` 直接 `Start`，外层无 `EnableTrace` 包裹。`trace.on.mq=false` 只压住 `EnableTrace` / `CallChainEnabled`（它们只管日志与内存调用链条目），**span 照产照报** —— 违反「`trace.on.*` 只控入链」的红线。
+
+修法（改在 SDK 内，launchx 拦不住）：
 
 ```go
-func (p *ProducerImpl) Send(ctx context.Context, msg *mqx.Message) error {
-    ctx, span := p.tracer.Start(ctx, "messaging.kafka.send")   // 外层无 if EnableTrace
+tracer: traceflag.NewTracer(cfg.EnableTrace || cfg.CallChainEnabled,
+                            "github.com/gospacex/mqx/kafka", "mqx"),
 ```
 
-`callchain.go:231` 同理。后果：
-- `trace.enabled: false`（全局）→ provider 是 noop，span 不导出，**符合预期**；
-- 只关 `trace.on.mq: false`、全局仍开 → `EnableTrace` / `CallChainEnabled` 被压成 false（它们只管日志与内存调用链条目），**span 照产照报**。
+`traceflag.Tracer.Start` 在开关关闭时返回 `(ctx, noop.Span{})`，且仍受全局总闸与 `SetComponent("mqx", false)` 约束。字段类型同步从 `trace.Tracer` 改成 `*traceflag.Tracer`（otel 1.29 的 `trace.Tracer` 含未导出方法，外部类型实现不了 —— 这也是 `testTracer()` 这类测试 helper 要跟着改返回类型的原因）。
 
-属 mqx 侧缺陷，launchx 拦不住（span 在 SDK 内部产生）。需要彻底关只能关全局或用 `traceflag.SetComponent("mqx", false)`（该名字与 launchx 的 `trace.on.mq` 不是同一个键位，见 ③）。
+回归测试 `mqx/kafka/tracer_gate_test.go` 同时钉住两条：开关开则入链、开关关则不入链，且**两种情况下 producer 都建得出来**（开关不是构造开关）。
 
 ### ② cachex / mongodbx：同一个 SDK 里"实例级"与"全局"两个开关，只有一个有效
 - cachex 只看全局（`redis.go` 的 `startSpan` 查 `IsTracingEnabled()`），实例级 `EnableTrace` 存了从不读；
@@ -118,4 +118,5 @@ yaml 里写 `trace.on.<launchx 名>`，代码里 `traceflag.SetComponent("<SDK �
 ## 5. 本轮库侧改动
 
 - `internal/component/mongodb.go`：注释校正 —— 原注释称"实例级 enable_trace 不存在、必须走 SetTracingConfig"，与代码不符（实例级才有效，全局是死开关）。
-- `internal/component/mq.go`：把 mqx 无条件 span 的偏差写成注释（含触发条件与"只能关全局"的规避口径），避免下一个人再把它当 launchx 的 bug 查一遍。
+- `internal/component/mq.go`：记录 mqx 无条件 span 的历史偏差与修法（含"launchx 侧不要另加拦截"的结论）。
+- `mqx`（五个驱动 + kafka 回归测试）：span 改由 `traceflag.NewTracer` 按开关产出，恢复「`trace.on.*` 只控入链」红线。
