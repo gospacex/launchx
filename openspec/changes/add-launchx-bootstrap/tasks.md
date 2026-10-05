@@ -20,7 +20,7 @@
 
 ## 2. Examples Demos
 
-- [ ] 2.1 新建 `examples/monolith/`：参考 `webx/examples` 的 config.yaml 与分层（handler→logic→service→repository），`Bootstrap + OnSetup` 一行启动；订单存储经 launchx db 组件接真实 mysql（DSN 经 `${ENV}` 展开，底座复用 `hubx/dockers` compose 的 mysql 8.4）（对应验收案例 E1）
+- [x] 2.1 新建 `examples/monolith/`：参考 `webx/examples` 的 config.yaml 与分层（handler→logic→service→repository），`Bootstrap + OnSetup` 一行启动；订单存储经 launchx db 组件接真实 mysql（DSN 经 `${ENV}` 展开，底座复用 `hubx/dockers` compose 的 mysql 8.4）（对应验收案例 E1） <!-- 已实现: 3c1f31c -->
 - [ ] 2.2 新建 `examples/micro/gateway`：webx 转发 + consul 上游发现，`Bootstrap` 一行启动
 - [ ] 2.3 新建 `examples/micro/bff`：webx 入口 + consul 注册 + 下游 srv rpcx 客户端，`Bootstrap` 一行启动（与 2.2 共同对应验收案例 E2）
 - [ ] 2.4 迁移 `micro_apps/srv-order` 为 `examples/micro/srv`：删除原 300 行 main.go 与 `infra/` 复制件，改为 `Bootstrap` 一行形态，业务分层保留（对应验收案例 E3，main.go ≤ 50 行）

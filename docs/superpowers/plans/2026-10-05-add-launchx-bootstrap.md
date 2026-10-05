@@ -790,7 +790,7 @@ git add internal/pipeline app.go setup.go && git commit -m "feat: 反序退出�
 **文件：**
 - 创建：`examples/monolith/config.yaml`、`examples/monolith/cmd/main.go`（≤50 行）、`examples/monolith/app/{setup.go,routes.go}`、`examples/monolith/internal/{handler,logic,service,repository,model}/*.go`
 
-- [ ] **步骤 8.1：底座前置（plan-ready 2026-10-04 底座事实）**
+- [x] **步骤 8.1：底座前置（plan-ready 2026-10-04 底座事实）**
 
 运行：
 ```bash
@@ -798,7 +798,7 @@ docker compose -f /Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml up 
 ```
 预期：mysql `127.0.0.1:3306` 监听；账号 `order_rw/hubx123`、库 `order_db` 由 `hubx/micro_apps/docker/mysql/init.sql` 幂等灌入（`hubx/dockers` compose 挂载该 init 则自动完成，否则手动 `mysql -uroot -p$(docker inspect 提取) < .../init.sql` 一次）。
 
-- [ ] **步骤 8.2：config.yaml（mode monolith + DSN 占位）**
+- [x] **步骤 8.2：config.yaml（mode monolith + DSN 占位）**
 
 创建 `examples/monolith/config.yaml`（对齐 srv-order 契约风格，DSN 用 `${HUBX_DB_PW}` 占位，运行前 `export HUBX_DB_PW=hubx123`；kafka 段本 demo 不用则不写）：
 ```yaml
@@ -823,7 +823,7 @@ logx:
     endpoint: "127.0.0.1:4318"
 ```
 
-- [ ] **步骤 8.3：分层代码 + main.go（≤50 行）+ 路由**
+- [x] **步骤 8.3：分层代码 + main.go（≤50 行）+ 路由**
 
 `internal/model`（Order 表 GORM model）、`repository`（经 `*gorm.DB` 读写 order_db）、`service`（订单创建/查询逻辑）、`logic`（参数校验/错误映射）、`handler`（hertz handler）、`app/routes.go`（`func RegisterRoutes(e *app.Engine, h *handler.OrderH)`——经 `webx.WithPreRun` 挂入）、`app/setup.go`（`func Setup(lx *launchx.App) error`：装配 repo→service→logic→handler 并存闭包）。
 `cmd/main.go` 核心形态（实际 ≤50 行，含注释）：
@@ -836,7 +836,7 @@ func main() {
 }
 ```
 
-- [ ] **步骤 8.4：启动 + HTTP 断言（E1 前半）**
+- [x] **步骤 8.4：启动 + HTTP 断言（E1 前半）**
 
 运行：
 ```bash
@@ -844,7 +844,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx/examples/monolith && export HUBX_DB_P
 ```
 预期：GET 返回 JSON 列表（初始空数组或既有数据）；POST 201/200 且再 GET 可见新增行（落 mysql）。
 
-- [ ] **步骤 8.5：SIGTERM 优雅退出断言（E1 后半）+ Commit**
+- [x] **步骤 8.5：SIGTERM 优雅退出断言（E1 后半）+ Commit**
 
 运行：
 ```bash
@@ -855,7 +855,7 @@ kill -TERM $(pgrep -f 'examples/monolith') && sleep 2 && grep -E 'deregister|flu
 git add examples/monolith && git commit -m "feat: examples/monolith 单体 demo（E1，2.1）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.1 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.1 同步） <!-- 已实现: 3c1f31c -->
 
 ---
 

@@ -131,7 +131,7 @@
 - 验证方式：`go test ./... -count=1` 全绿 — 退出顺序断言（server.stop 早于 component.stop 与 tracing.shutdown、deregister 早于 flush）、bff/srv 注册一次且注销同一实例、monolith/gateway 零注册零注销日志、`strict.registry=true` 即退、缺省降级带后果 Warn（验收案例 A3）
 
 ### Task 8: examples/monolith 单体 demo
-- [ ] **任务完成**（与 superpowers plan `Task 8`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 8`、`tasks.md` 对应条目同步勾选）
 - 目标：参考 `webx/examples` 分层（handler→logic→service→repository）新建 `examples/monolith/`：`config.yaml`（mode monolith）+ `cmd/main.go`（Bootstrap+OnSetup+Run ≤50 行）+ 分层代码 + 路由（GET /orders、POST /orders）；repository 经 launchx db 组件接真实 mysql（底座复用 `hubx/dockers` compose mysql 8.4，DSN 经 `${ENV}` 展开），不再用内存替身
 - 改动文件：`examples/monolith/{config.yaml,cmd/main.go,app/setup.go,app/routes.go,internal/{handler,logic,service,repository,model}/*.go}`
 - 验证方式：`go build ./... && go run ./examples/monolith/cmd` 启动；`curl localhost:8080/orders` 返回 JSON（验收案例 E1 起）
