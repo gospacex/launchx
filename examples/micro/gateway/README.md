@@ -93,14 +93,13 @@ webx 的 otel 中间件**只做 Extract、不做 Inject**。所以转发前必�
 
 ```go
 // internal/proxy/proxy.go
-otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+launchx.Inject(ctx, propagation.HeaderCarrier(req.Header))
 ```
 
-> launchx 根包**当前没有导出 `Inject`**（Task 23 的产出）。
-> 故本 demo 直接用官方 OTel API，并留了 TODO：Task 23 落地 `launchx.Inject`
-> 后替换为该入口。全局传播器由 launchx 的 telemetry 步骤设好
-> （`internal/telemetry/telemetry.go:56` 的 Composite{TraceContext, Baggage}），
-> 这里取全局即可。
+走库侧入口而不是裸 `otel.GetTextMapPropagator().Inject`：注入口统一在 launchx，
+传播器由 telemetry 步骤注册（`internal/telemetry/telemetry.go:56` 的
+Composite{TraceContext, Baggage}），库侧换实现时本 demo 无需改动。
+`launchx.Extract` 与 `launchx.PropagatorFields()` 一并导出，后者用于 T1 的字段断言。
 
 span 层级（`gateway.proxy.*` 是 webx 入口根 span 的**子** span，不另起根）：
 

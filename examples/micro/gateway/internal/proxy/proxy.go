@@ -18,6 +18,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/gospacex/coordx"
+	"github.com/gospacex/launchx"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -178,8 +179,10 @@ func (p *Proxy) forward(ctx context.Context, c *app.RequestContext, path, target
 
 	// webx 的 otel 中间件只做 Extract、不做 Inject：不在这里显式注入的话，
 	// 上游收不到 traceparent 会另起一根 trace（验收 T6/T7 的断链判据）。
-	// TODO: Task 23 落地 launchx.Inject 后替换为该入口。
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+	// 走 launchx.Inject 而非裸 otel 调用：注入入口统一在库侧，
+	// 传播器由 telemetry 步骤注册（Composite{TraceContext, Baggage}），
+	// 库侧换实现时本处无需改动。
+	launchx.Inject(ctx, propagation.HeaderCarrier(req.Header))
 
 	resp, err := p.client.Do(req)
 	if err != nil {
