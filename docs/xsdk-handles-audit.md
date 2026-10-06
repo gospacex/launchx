@@ -137,14 +137,15 @@ yaml 里写 `trace.on.<launchx 名>`，代码里 `traceflag.SetComponent("<SDK �
 行为改动必须落到 tag 上，否则外部依赖方拿到的仍是旧行为（本仓各模块之间
 靠 `replace` 指向本地路径，所以**仓内**不受影响，坑在仓外）。
 
-| 仓库 | 模块 | tag | 含的改动 |
-|---|---|---|---|
-| mqx | `mqx` / `kafka` / `nsq` / `pulsar` / `rabbitmq` / `rocketmq` | `v0.1.0` 及 `<子模块>/v0.1.0` | span 改由 traceflag 裁决 |
-| cachex | `cachex` / `redis` / `memcached` | `v0.1.0` 及 `redis|memcached/v0.1.0` | 实例级开关生效 |
-| lockx | `lockx` / `redis` | `v0.1.0` 及 `redis/v0.1.0` | 三套 tag 补齐 |
-| searchx | `searchx` / `elasticsearch` | `v0.1.0` 及 `elasticsearch/v0.1.0` | 三套 tag 补齐 + LegacyCluster |
+| 仓库 | 模块 | tag | 指向 | 含的改动 |
+|---|---|---|---|---|
+| mqx | `mqx` / `kafka` / `nsq` / `pulsar` / `rabbitmq` / `rocketmq` | `v0.1.0` 及 `<子模块>/v0.1.0` | `4e22bba` | span 改由 traceflag 裁决 |
+| cachex | `cachex` / `redis` / `memcached` | `v0.1.0` 及 `redis/v0.1.0`、`memcached/v0.1.0` | `40bb0bd` | 实例级开关生效 |
+| lockx | `lockx` / `redis` | `v0.1.0` 及 `redis/v0.1.0` | `b3a9f95` | 三套 tag 补齐 |
+| searchx | `searchx` / `elasticsearch` | `v0.1.0` 及 `elasticsearch/v0.1.0` | `f62601c` | 三套 tag 补齐 + LegacyCluster |
 
 子模块是**独立 go.mod**，必须各自打 `<子模块名>/v0.1.0`；只打根模块的
 `v0.1.0` 对子模块无效（Go 的模块版本按模块路径解析）。
 
-均未 push —— 推送属对外动作，须人工确认。
+四个仓库的所有 `v0.1.0` tag 均已对齐到各自 `main` 的 HEAD（未推送，可安全
+`git tag -f` 重指）。**均未 push** —— 推送属对外动作，须人工确认。
