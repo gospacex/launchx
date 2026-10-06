@@ -13,11 +13,13 @@ import (
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/configx"
 	"github.com/gospacex/coordx"
+	"github.com/gospacex/kvx"
 	"github.com/gospacex/launchx/internal/component"
 	"github.com/gospacex/launchx/internal/configsrc"
 	"github.com/gospacex/launchx/internal/mode"
 	"github.com/gospacex/launchx/internal/pipeline"
 	"github.com/gospacex/launchx/internal/telemetry"
+	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	_ "github.com/gospacex/logx/zap" // 注册 logx 的 zap provider（无此空白导入 logx.New 会失败）
 	mongodbx "github.com/gospacex/mongodbx"
@@ -26,9 +28,10 @@ import (
 	"github.com/gospacex/searchx"
 )
 
-// componentOrder 组件挂载顺序。db/cache/mq 先（业务最先用到），
-// registry 次之（服务端起来前要能注册），search/mongodb 最后。
-var componentOrder = []string{"db", "cache", "mq", "registry", "search", "mongodb"}
+// componentOrder 组件挂载顺序。db/cache/mq 先（业务最先用到），kv/lock 次之
+// （业务态与并发互斥，不依赖注册中心），registry 再次（服务端起来前要能注册），
+// search/mongodb 最后。
+var componentOrder = []string{"db", "cache", "mq", "kv", "lock", "registry", "search", "mongodb"}
 
 // serverShutdownTimeout 优雅停机排空 in-flight 请求的上限。
 const serverShutdownTimeout = 5 * time.Second
@@ -195,6 +198,26 @@ func (a *App) Search() searchx.SearchClient {
 // Mongo 返回文档库命名实例表。
 func (a *App) Mongo() mongodbx.Instances {
 	v, _ := a.compProduct(func(c *component.Env) any { return c.Mongo }).(mongodbx.Instances)
+	return v
+}
+
+// KV 返回键值存储命名实例表（kvx）。
+//
+// 与 Cache() 的分工：Cache 面向可失效的缓存语义（TTL 对象缓存、限流计数），
+// KV 面向需要直接读写的键值状态（幂等键、跨请求状态位）。两者可能同指一个
+// redis 实例，但句柄分开，业务不应拿缓存句柄存必须持久的状态。
+func (a *App) KV() kvx.Stores {
+	v, _ := a.compProduct(func(c *component.Env) any { return c.KV }).(kvx.Stores)
+	return v
+}
+
+// Lock 返回分布式锁器（lockx，单实例）。
+//
+// 未装配（未配 xmiddleware.lockx 段或构造降级）时返回 nil，业务须显式判空并
+// 决定姿态：要么 fail-fast，要么在日志里说清"本次未走锁路径"，**不可**静默
+// 当作已加锁继续跑（超卖类故障最难排查的形态就是"锁没生效但没人报错"）。
+func (a *App) Lock() lockx.Locker {
+	v, _ := a.compProduct(func(c *component.Env) any { return c.Lock }).(lockx.Locker)
 	return v
 }
 

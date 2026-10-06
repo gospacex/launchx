@@ -12,6 +12,10 @@ require (
 	github.com/gospacex/coordx v0.0.0
 	github.com/gospacex/coordx/consul v0.0.0
 	github.com/gospacex/dbx v0.0.0-00010101000000-000000000000
+	github.com/gospacex/kvx v0.0.0
+	github.com/gospacex/kvx/redis v0.0.0-00010101000000-000000000000
+	github.com/gospacex/lockx v0.0.0
+	github.com/gospacex/lockx/redis v0.0.0-00010101000000-000000000000
 	github.com/gospacex/logx v0.0.0
 	github.com/gospacex/mongodbx v0.0.0-00010101000000-000000000000
 	github.com/gospacex/mqx v0.0.1
@@ -22,6 +26,7 @@ require (
 	github.com/gospacex/searchx/elasticsearch v0.0.0-00010101000000-000000000000
 	github.com/gospacex/traceflag v0.0.0
 	github.com/gospacex/webx v0.0.0-00010101000000-000000000000
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
@@ -60,10 +65,12 @@ require (
 	github.com/elastic/go-elasticsearch/v8 v8.15.0 // indirect
 	github.com/fatih/color v1.16.0 // indirect
 	github.com/fatih/structtag v1.2.0 // indirect
+	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-redis/redis/v8 v8.11.5 // indirect
+	github.com/go-redsync/redsync/v4 v4.11.0 // indirect
 	github.com/go-sql-driver/mysql v1.7.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
@@ -185,6 +192,10 @@ replace (
 	github.com/gospacex/coordx/nacos => ../coordx/nacos
 	github.com/gospacex/dbx => ../dbx
 	github.com/gospacex/hubx => ../hubx
+	github.com/gospacex/kvx => ../kvx
+	github.com/gospacex/kvx/redis => ../kvx/redis
+	github.com/gospacex/lockx => ../lockx
+	github.com/gospacex/lockx/redis => ../lockx/redis
 	github.com/gospacex/logx => ../logx
 	github.com/gospacex/mqx => ../mqx
 	github.com/gospacex/mqx/kafka => ../mqx/kafka

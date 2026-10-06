@@ -2,15 +2,35 @@ package component
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gospacex/configx"
 	"github.com/gospacex/logx"
 	_ "github.com/gospacex/logx/zap" // 注册 zap provider：测试必须用真实日志器
 )
+
+// redisAddr 是 kvx / lockx 两个用例连的实例，与 *_YAML 里的 addr 保持一致。
+const redisAddr = "127.0.0.1:6379"
+
+// requireRedis 在无本地 redis 时跳过用例。
+//
+// kvx / lockx 的构造会真连 redis（建连接池并探活），无实例时构造必然失败，
+// 此时该用例的命题（"trace 关闭也仍要构造"）根本无从验证。
+// 这种"缺外部依赖"必须与"组件降级有缺陷"区分开：前者 Skip 并打印原因，后者才是
+// 真失败 —— 混为一谈会把本机没开 redis 这种环境问题伪装成代码回归。
+func requireRedis(t *testing.T) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", redisAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("needs local redis at %s: %v", redisAddr, err)
+	}
+	_ = c.Close()
+}
 
 // warnLogger 捕获 Warn 文案供降级断言。
 // 内嵌一个**真实**日志器（而非 nil 接口）：组件会调用 InfoContext 等方法，
@@ -144,7 +164,7 @@ func TestDBFailureDegradesByDefault(t *testing.T) {
 	}
 }
 
-// presence-based：未配置任何中间件段时，六类组件都不构造、不报错、不告警。
+// presence-based：未配置任何中间件段时，八类组件都不构造、不报错、不告警。
 func TestPresenceBasedSkip(t *testing.T) {
 	env, w := newTestEnv(t, "service: {name: srv-order, mode: srv}\n")
 	for _, name := range Names() {
@@ -152,7 +172,8 @@ func TestPresenceBasedSkip(t *testing.T) {
 			t.Fatalf("component %q must be skipped silently when unconfigured: %v", name, err)
 		}
 	}
-	if env.DB != nil || env.Cache != nil || env.MQ != nil || env.Registry != nil || env.Search != nil || env.Mongo != nil {
+	if env.DB != nil || env.Cache != nil || env.MQ != nil || env.KV != nil || env.Lock != nil ||
+		env.Registry != nil || env.Search != nil || env.Mongo != nil {
 		t.Fatal("no component must be constructed without config sections")
 	}
 	if w.joined() != "" {
@@ -160,9 +181,9 @@ func TestPresenceBasedSkip(t *testing.T) {
 	}
 }
 
-// 六类组件必须都已注册（D1/验收案例 T2–T4 的前提）。
-func TestAllSixComponentsRegistered(t *testing.T) {
-	want := []string{"db", "cache", "mq", "registry", "search", "mongodb"}
+// 八类组件必须都已注册（D1/验收案例 T2–T4 的前提）。
+func TestAllComponentsRegistered(t *testing.T) {
+	want := []string{"db", "cache", "mq", "kv", "lock", "registry", "search", "mongodb"}
 	got := Names()
 	for _, w := range want {
 		if Lookup(w) == nil {
@@ -183,6 +204,83 @@ func TestMountUnknownComponentFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sqlx") || !strings.Contains(err.Error(), "db") {
 		t.Fatalf("error must name the unknown component and list registered ones, got: %v", err)
+	}
+}
+
+const kvYAML = `
+service: {name: srv-order, mode: srv}
+xmiddleware:
+  kvx:
+    driver: redis
+    instances:
+      srv-order: {addr: "127.0.0.1:6379"}
+`
+
+// D1 的 kv 面：trace.on.kv=false 时 KV 仍被构造（只不产 span）。
+// 与 mq 同源的红线：开关只裁决入链，绝不裁决构造 —— KV 变 nil 会让幂等键
+// 静默失效（重复请求不再被挡），故障形态是"扣了两次款但没人报错"。
+func TestTraceOffStillConstructsKV(t *testing.T) {
+	requireRedis(t) // kvx 建实例要连真 redis，缺依赖时跳过而非误报成降级缺陷
+	env, _ := newTestEnv(t, kvYAML)
+	env.TraceOn["kv"] = false
+	b := Lookup("kv")
+	if b == nil {
+		t.Fatal("kv builder not registered")
+	}
+	if err := b(env); err != nil {
+		t.Fatalf("kv must be constructed even with trace off: %v", err)
+	}
+	if len(env.KV) == 0 {
+		t.Fatal("KV must not be empty when trace.on.kv=false (D1)")
+	}
+	if len(env.Stops()) == 0 {
+		t.Fatal("kv must register a stop func for the reverse exit chain")
+	}
+}
+
+const lockYAML = `
+service: {name: srv-order, mode: srv}
+xmiddleware:
+  lockx:
+    driver: redis
+    addr: "127.0.0.1:6379"
+    namespace: mall
+    ttl: 30s
+    retry: {enabled: true, max_attempts: 3, backoff_ms: 100}
+`
+
+// D1 的 lock 面 + ttl/retry 解码：这两个键是蛇形（max_attempts / backoff_ms），
+// lockx.Config 又缺 mapstructure tag，走 Unmarshal 会被静默丢弃 —— 本例固定
+// 逐字段读取，这里断言重试参数确实落进了 Config（不是 0 值默认）。
+func TestLockConstructedWithRetryConfig(t *testing.T) {
+	requireRedis(t) // 同 kvx：lockx/redis 构造要连真实例
+	env, _ := newTestEnv(t, lockYAML)
+	env.TraceOn["lock"] = false
+	if err := Lookup("lock")(env); err != nil {
+		t.Fatalf("lock must be constructed even with trace off: %v", err)
+	}
+	if env.Lock == nil {
+		t.Fatal("Lock must not be nil when trace.on.lock=false (D1)")
+	}
+}
+
+// 锁器构造失败（驱动未注册）必须降级而非即退，且 Warn 带"超卖"后果。
+func TestLockFailureDegradesByDefault(t *testing.T) {
+	env, w := newTestEnv(t, `
+service: {name: srv-order, mode: srv}
+xmiddleware:
+  lockx:
+    driver: no-such-driver
+    addr: "127.0.0.1:6379"
+`)
+	if err := Lookup("lock")(env); err != nil {
+		t.Fatalf("default strict=false must not fail: %v", err)
+	}
+	if env.Lock != nil {
+		t.Fatal("lock must be nil in degraded state")
+	}
+	if !strings.Contains(w.joined(), "超卖") {
+		t.Fatalf("warn must carry consequence, got: %q", w.joined())
 	}
 }
 

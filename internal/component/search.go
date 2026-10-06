@@ -44,6 +44,9 @@ func buildSearch(env *Env) error {
 		Username:    env.Cfg.GetString(key + ".username"),
 		Password:    env.Cfg.GetString(key + ".password"),
 		EnableTrace: env.Cfg.GetBool(key+".enable_trace") && traceOn(env, "search"),
+		// 旧集群（ES < 7.14）不返回 X-Elastic-Product，v8 客户端会拒绝全部响应。
+		// 这里只做透传：是否宽容由部署方在配置里显式声明，库侧不擅自放宽校验。
+		LegacyCluster: env.Cfg.GetBool(key + ".legacy_cluster"),
 	}
 	client, err := searchx.New(cfg)
 	if err != nil {

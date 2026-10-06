@@ -18,6 +18,8 @@ const (
 	ConsequenceRegistry = "服务不被发现，上游调用将 502"
 	ConsequenceSearch   = "搜索功能不可用，检索请求将报错"
 	ConsequenceMongo    = "文档库不可用，非结构化读写将报错"
+	ConsequenceKV       = "键值状态不可用，幂等键与状态位将退化为进程内态（重启即失忆）"
+	ConsequenceLock     = "分布式锁不可用，并发预占/扣减将退化成无锁路径（超卖风险）"
 )
 
 // degrade 按 strict.<name> 裁决组件构造失败：

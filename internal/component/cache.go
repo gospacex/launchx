@@ -28,9 +28,13 @@ func buildCache(env *Env) error {
 	if len(sec.Instances) == 0 {
 		return degrade(env, "cache", ConsequenceCache, fmt.Errorf("xmiddleware.cachex.instances is empty"))
 	}
-	// 组件级开关：入链 = 全局总闸 AND trace.on.cache AND 实例/段级 enable_trace。
-	// 注意它只影响入链，不影响下面的构造。
+	// 组件级开关（T13 反向断言落点）：既裁决实例级 EnableTrace，也要同步给 SDK 的
+	// 全局开关 —— redis 驱动的 span 全挂在 IsTracingEnabled() 上，只配实例级开关
+	// 会让 Jaeger 上一个 redis span 都没有，且无任何报错提示。
 	wantTrace := traceOn(env, "cache")
+	// 宿主模式：宿主已注册全局 provider 与传播器，SDK 不得再自建 provider 抢全局位
+	// （cachex.Config.HostProvider 的语义），否则其余组件的 span 会全部消失。
+	cachex.SetTracingConfig(cachex.TracingConfig{Enabled: wantTrace, HostProvider: true})
 	cfgs := make([]*cachex.Config, 0, len(sec.Instances))
 	for name := range sec.Instances {
 		inst := sec.Instances[name] // 值拷贝，避免改到 map 里的原值

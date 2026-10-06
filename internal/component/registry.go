@@ -1,10 +1,11 @@
-// Package component 是 launchx 的组件层：内置六类中间件组件的构造与裁决。
+// Package component 是 launchx 的组件层：内置八类中间件组件的构造与裁决。
 //
 // 三条设计红线：
 //
 //  1. **presence-based 启用**：只有 yaml 里配了对应段（xmiddleware.sqlx /
-//     xmiddleware.cachex / xmiddleware.mqx / xmiddleware.coordx /
-//     xmiddleware.searchx / xmiddleware.mongodbx）才构造，未配置即静默跳过。
+//     xmiddleware.cachex / xmiddleware.mqx / xmiddleware.kvx / xmiddleware.lockx /
+//     xmiddleware.coordx / xmiddleware.searchx / xmiddleware.mongodbx）才构造，
+//     未配置即静默跳过。
 //  2. **trace.on.<name> 只控入链，不控构造**：它决定调 `orm.Open` 还是
 //     `orm.OpenNoTrace`（以及是否把 EnableTrace 传给 SDK），**绝不**决定组件是否
 //     被创建。历史 bug：把该开关当构造开关，producer 变 nil，outbox 静默堆积到
@@ -18,6 +19,8 @@ import (
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/configx"
 	"github.com/gospacex/coordx"
+	"github.com/gospacex/kvx"
+	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	mongodbx "github.com/gospacex/mongodbx" // 包名为 docx，此处显式改名以对齐模块名
 	"github.com/gospacex/mqx"
@@ -48,6 +51,9 @@ type Env struct {
 	Discover coordx.Discover
 	Search   searchx.SearchClient
 	Mongo    mongodbx.Instances
+	// KV 键值存储命名实例表（kvx）；Lock 分布式锁器（lockx，单实例）。
+	KV   kvx.Stores
+	Lock lockx.Locker
 
 	stops []func() error
 }
