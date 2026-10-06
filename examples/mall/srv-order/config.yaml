@@ -1,0 +1,109 @@
+# ============================================================
+# mall 示例 · 订单域（srv 档）
+#
+# 纪律：端口 / DSN / 中间件地址一律来自本文件，Go 代码不出现任何硬编码地址。
+# 本档不建 webx，故**不出现** webx 段；注册进 consul 由 launchx 按 mode 自己做
+# （地址取 service.self.addr），业务侧不调 Register / Deregister。
+#
+# 运行前导出库密码：export HUBX_DB_PW=hubx123
+# ============================================================
+
+service:
+  name: srv-order              # 服务名 = Jaeger 的 service，也是 dbx/cachex/mqx/kvx 的实例名
+  mode: srv                    # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:9102"       # rpcx(kitex) 监听地址
+  self:
+    addr: "${SRV_ORDER_SELF_ADDR}"  # 容器内外地址不一致时显式声明注册地址
+
+# 调用链：全局闸 + 组件级开关。trace.on.<name> 只裁决入链，不裁决构造。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    db: true
+    cache: true
+    mq: true
+    kv: true
+    lock: true
+    registry: true
+
+logx:
+  level: info
+  otel:
+    enable_trace: true
+    exporter: otlp
+    endpoint: "127.0.0.1:4318"
+
+# 地基失败即退：连不上库就启动失败，而不是降级成"起来但落不了库"。
+strict:
+  db: true
+
+xmiddleware:
+
+  # ----- sqlx：私有库 order_db（账号 mall_rw）-----
+  sqlx:
+    driver: gorm
+    databases:
+      srv-order:                # 实例名须与 service.name 一致（dbx loader 按名字取段）
+        dsn: "mall_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        conn_max_lifetime: 5m
+        conn_max_idle_time: 1m
+        tracing:
+          enabled: true
+
+  # ----- cachex：订单详情缓存（状态流转后 Delete 显式失效）-----
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-order:
+        addr: "127.0.0.1:6379"
+        db: 0
+        pool_size: 50
+
+  # ----- mqx：outbox 补发用的生产者（topic order.completed.v1）-----
+  mqx:
+    driver: kafka
+    instances:
+      srv-order:
+        brokers:
+          - "127.0.0.1:9092"
+        enable_trace: true
+        producer:
+          topic: order.completed.v1
+          batch_size: 100
+          batch_timeout: 10ms
+          required_acks: -1   # sarama WaitForAll
+
+  # ----- kvx：限流计数（原子 Incr；入口自保护，KV 不可用即放行）-----
+  #
+  # 为什么这一段不是 cachex：cachex.Cache 只有 Get/Set，计数只能读-改-写，
+  # 并发下计数丢失 → 限了却被打穿且无痕可查。kvx 的 Incr 是原子的，语义正对。
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-order:
+        addr: "127.0.0.1:6379"
+        db: 1
+        pool_size: 30
+
+  # ----- lockx：同用户并发下单互斥（TTL 内未释放自动过期，不会死锁业务）-----
+  lockx:
+    driver: redis
+    addr: "127.0.0.1:6379"
+    namespace: mall-order
+    ttl: 10s
+    enable_trace: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff_ms: 50
+
+  # ----- coordx：注册中心（注册/注销由 launchx 按 mode 负责）-----
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true

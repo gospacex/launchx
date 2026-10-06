@@ -1,0 +1,108 @@
+# ============================================================
+# mall 示例 · 商品域（srv 档）
+#
+# 纪律：端口 / DSN / 中间件地址一律来自本文件，Go 代码不出现任何硬编码地址。
+# 本档不建 webx，故**不出现** webx 段；注册进 consul 由 launchx 按 mode 自己做
+# （地址取 service.self.addr），业务侧不调 Register / Deregister。
+#
+# 运行前导出库密码：export HUBX_DB_PW=hubx123
+# ============================================================
+
+service:
+  name: srv-product             # 服务名 = Jaeger 的 service，也是 dbx/cachex/mqx/kvx 的实例名
+  mode: srv                     # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:9101"        # rpcx(kitex) 监听地址
+  self:
+    addr: "${SRV_PRODUCT_SELF_ADDR}"  # 容器内外地址不一致时显式声明注册地址
+
+# 调用链：全局闸 + 组件级开关。trace.on.<name> 只裁决入链，不裁决构造。
+# 商品域用到了 db / cache / mq / kv / lock / registry 六类，缺一项的 span
+# 会在 Jaeger 上静默消失（不是报错），故这里逐项显式列出。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    db: true
+    cache: true
+    mq: true
+    kv: true
+    lock: true
+    registry: true
+
+logx:
+  level: info
+  otel:
+    enable_trace: true
+    exporter: otlp
+    endpoint: "127.0.0.1:4318"
+
+# 地基失败即退：连不上库就启动失败，而不是降级成"起来但落不了库"。
+strict:
+  db: true
+
+xmiddleware:
+
+  # ----- sqlx：私有库 product_db（账号 mall_rw）-----
+  sqlx:
+    driver: gorm
+    databases:
+      srv-product:              # 实例名须与 service.name 一致（dbx loader 按名字取段）
+        dsn: "mall_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/product_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        conn_max_lifetime: 5m
+        conn_max_idle_time: 1m
+        tracing:
+          enabled: true
+
+  # ----- cachex：商品详情缓存（可失效的派生状态，改价/上下架后 Delete）-----
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-product:
+        addr: "127.0.0.1:6379"
+        db: 0
+        pool_size: 50
+
+  # ----- mqx：商品创建事件（topic product.created.v1，经 outbox 补发）-----
+  mqx:
+    driver: kafka
+    instances:
+      srv-product:
+        brokers:
+          - "127.0.0.1:9092"
+        enable_trace: true
+        producer:
+          topic: product.created.v1
+          batch_size: 100
+          batch_timeout: 10ms
+          required_acks: -1   # sarama WaitForAll
+
+  # ----- kvx：限流计数 + 商品访问热度计数（两项都需要原子 Incr）-----
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-product:
+        addr: "127.0.0.1:6379"
+        db: 1
+        pool_size: 30
+
+  # ----- lockx：上下架按商品维度互斥（防并发改状态互相覆盖）-----
+  lockx:
+    driver: redis
+    addr: "127.0.0.1:6379"
+    namespace: mall-product
+    ttl: 10s
+    enable_trace: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff_ms: 50
+
+  # ----- coordx：注册中心（注册/注销由 launchx 按 mode 负责）-----
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true

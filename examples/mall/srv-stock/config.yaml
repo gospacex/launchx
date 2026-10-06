@@ -1,0 +1,109 @@
+# ============================================================
+# mall 示例 · 库存域（srv 档）
+#
+# 纪律：端口 / DSN / 中间件地址一律来自本文件，Go 代码不出现任何硬编码地址。
+# 本档不建 webx，故**不出现** webx 段；注册进 consul 由 launchx 按 mode 自己做
+# （地址取 service.self.addr），业务侧不调 Register / Deregister。
+#
+# 库存是本示例唯一"防超卖"的域：预占路径同时用 lockx（互斥）与 SQL 条件
+# 更新（available >= quantity）两道闸，缺任一道都会在并发下超卖。
+#
+# 运行前导出库密码：export HUBX_DB_PW=hubx123
+# ============================================================
+
+service:
+  name: srv-stock              # 服务名 = Jaeger 的 service，也是 dbx/cachex/mqx/kvx 的实例名
+  mode: srv                    # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:9103"       # rpcx(kitex) 监听地址
+  self:
+    addr: "${SRV_STOCK_SELF_ADDR}"  # 容器内外地址不一致时显式声明注册地址
+
+# 调用链：全局闸 + 组件级开关。trace.on.<name> 只裁决入链，不裁决构造。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    db: true
+    cache: true
+    mq: true
+    kv: true
+    lock: true
+    registry: true
+
+logx:
+  level: info
+  otel:
+    enable_trace: true
+    exporter: otlp
+    endpoint: "127.0.0.1:4318"
+
+# 地基失败即退：连不上库就启动失败 —— 库存不准比库存服务不可用更糟。
+strict:
+  db: true
+
+xmiddleware:
+
+  # ----- sqlx：私有库 stock_db（账号 mall_rw）-----
+  sqlx:
+    driver: gorm
+    databases:
+      srv-stock:                # 实例名须与 service.name 一致（dbx loader 按名字取段）
+        dsn: "mall_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/stock_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 30      # 预占是写热点，连接池比读域开得大
+        max_idle_conns: 10
+        conn_max_lifetime: 5m
+        conn_max_idle_time: 1m
+        tracing:
+          enabled: true
+
+  # ----- cachex：库存快照缓存（读多写少，预占成功后 Delete 失效）-----
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-stock:
+        addr: "127.0.0.1:6379"
+        db: 0
+        pool_size: 50
+
+  # ----- mqx：预占结果事件（topic stock.reserved.v1，经 outbox 补发）-----
+  mqx:
+    driver: kafka
+    instances:
+      srv-stock:
+        brokers:
+          - "127.0.0.1:9092"
+        enable_trace: true
+        producer:
+          topic: stock.reserved.v1
+          batch_size: 100
+          batch_timeout: 10ms
+          required_acks: -1   # sarama WaitForAll
+
+  # ----- kvx：限流计数 + 预占失败熔断计数（两项都需要原子 Incr）-----
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-stock:
+        addr: "127.0.0.1:6379"
+        db: 1
+        pool_size: 30
+
+  # ----- lockx：预占按商品维度互斥（防超卖，本服最关键的一把锁）-----
+  lockx:
+    driver: redis
+    addr: "127.0.0.1:6379"
+    namespace: mall-stock
+    ttl: 10s
+    enable_trace: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff_ms: 50
+
+  # ----- coordx：注册中心（注册/注销由 launchx 按 mode 负责）-----
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true
