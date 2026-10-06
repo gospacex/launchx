@@ -3,6 +3,9 @@ service:
   name: bff-svc
   mode: bff
   addr: 127.0.0.1:18081
+  # 下游服务直连兜底目标（未配注册中心时经此解析）
+  upstream:
+    downstream-svc: 127.0.0.1:19013
 
 webx:
   addr: 127.0.0.1:18081
