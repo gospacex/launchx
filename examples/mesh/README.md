@@ -7,6 +7,12 @@
 **部署面**：监听地址、注册中心位置、配置载体。一旦这里出现 `main.go`，
 就说明「为网格 fork 了代码」，C4/T8 的论证当场失效。
 
+> 这条结论由根包 `examples_layout_test.go` 的 `TestMeshHasNoGoCode` 钉住
+> （顺带由 `TestMicroNotCoupledToMesh` 断言 `examples/micro` 不引用本目录）。
+> 历史教训：曾有人把 `examples/micro` 的旧快照拷成 `examples/mesh/micro/**`，
+> 那份快照反向 import `examples/micro/**/internal` —— 违反 Go internal 规则，
+> 直接让 `go build ./...` 挂掉。已清除，别再拷回来。
+
 ## 1. 目录
 
 ```
