@@ -28,7 +28,7 @@
 | ⑥ | `GET /api/order/12` | `caff1f6973e0` | 21 | + order | `db.query`×1 + redis/kvx |
 | ⑦ | `GET /api/points/1001` | `998899766821` | 21 | + points | `db.query`×1 + redis/kvx |
 | ⑧ | `GET /api/product/99999999` 领域失败 | `e9ac58dd8f72` | 21 | + product | `db.query`×1（查不到，bff 侧标 domain error，HTTP 404） |
-| ⑨ | `POST /api/order` **补偿路径** | `43983186dcb7` | 64 | product + stock | 见 §4 |
+| ⑨ | `POST /api/order` **补偿路径** | `43983186dcb7` | 64 | product + stock | 见 §4（**故意注入的失败**，不是链路故障） |
 
 ## 3. 主证据：复合下单 `3b49ebe80350`（90 span，单根，树深 16）
 
@@ -75,7 +75,13 @@
 + 每个域服六跳（rpc / route / audit / rate_limit / handler / service / repository）+ 数据层，
 全在同一根 trace 上。
 
-## 4. 补偿路径 `43983186dcb7`（停掉 srv-order 注入建单失败）
+## 4. 补偿路径 `43983186dcb7` / `950f07cc2817180d4d`（停掉 srv-order 注入建单失败）
+
+> ⚠️ **这一节是「故意让它失败」的证据，不是链路故障。** 网关在这里返回的
+> **502 是正确行为**（下游真的不可达）。把本节与 §3 对照着看，不要单独拿去判
+> 「链路通没通」—— 二者长得完全不一样：本节的 trace 里**只有 4 个服务**
+> （无 `demo-order`）、带 `biz.compensation=true` 标记；§3 是 6 个服务、零错误。
+> 判读口径见 §9。
 
 ```
 [demo-bff] handler.PlaceOrder
@@ -138,3 +144,73 @@ bash examples/micro/scripts/chain.sh --compensate        # 期望 502 + 补偿 s
 - CRUD 覆盖缺 `delete`：bff 未暴露删除路径，域服侧有 `Delete` 方法但链路到不了。
   要补齐得在 bff 加一条 `DELETE /product/:id`。
 - 限流拒绝分支未实测触发：四域阈值 120/min，压测成本高于收益；代码路径与 span 已就位。
+
+## 9. 复验（2026-10-06 17:2x）：三类 trace 的形态对照
+
+同一套进程，三种场景各取一条 trace，**形态互不相同**，这是判读的基准：
+
+| 场景 | traceID | span | 参与了几个服务 | error span | 识别标记 |
+|---|---|---|---|---|---|
+| **主链路**（healthy `POST /api/order`） | `e91626f74db710d00f` | 88 | **6**（gateway+bff+product+order+stock+points） | **0** | — |
+| 主链路（同上，另一条） | `1e72dea7b50fab1b7c` / `ef3319999709f9e27a` | 89 | 6 | 0 | — |
+| **补偿路径**（停 srv-order 后下单） | `950f07cc2817180d4d` | 66 | **4**（gateway+bff+product+stock，**无 demo-order**） | 8 | `biz.compensation=true` |
+| **客户端身份错误**（`GET /api/order/1` 不带 `user_id`） | `27ddbd76003240566e` | 19 | 3（gateway+bff+order） | 4 | HTTP **401**，非 502 |
+
+判据：**「服务数 < 6」+「有 compensation 标记」= 我注入的补偿路径**；服务数 6 且
+error 0 = 链路正常。仅凭「网关有 502」不足以判断链路故障 —— 见 §10。
+
+复验用的八条路径全部通过（`chain.sh` 8/8，含新单 `order_id=14/15/16`），
+`trace-audit.py --service demo-gateway,demo-bff,demo-product,demo-order,demo-stock,demo-points`
+仍 PASS。
+
+## 10. 修正：客户端错误曾被伪装成 502（误诊来源）
+
+**症状**：`GET /api/order/1`（不带 `user_id`）经网关返回 **502** `{"error":"user required"}`，
+看起来像"下游挂了 / srv 不通"，实际只是请求缺身份字段。
+
+**根因**：`examples/micro/bff/internal/handler/mall.go` 的 `statusOf()` 只映射了
+NotFound / RateLimited / 冲突 / 参数非法几类，**漏了 `CodeUnauthorized`(1004)**，
+于是落进 `default: http.StatusBadGateway` —— 客户端错误被渲染成网关级故障。
+
+**修法**：补齐语义确定的映射，并把「谁错映射谁」写进函数注释。
+
+| 领域码 | 修前 | 修后 |
+|---|---|---|
+| `CodeUnauthorized` 1004 | 502 | **401** |
+| `CodeInternal` 1003 / 三处 `WriteFailed` | 502 | 500 |
+| `CodeOrderItemsEmpty` 3004 / `CodeProductTitleInvalid` 2006 / `CodePointsAmountInvalid` 5005 | 502 | 400 |
+| `CodeOrderCancelled` 3002 / `CodeOrderStatus` 3003 / `CodeStockOverRelease` 4006 | 502 | 409 |
+| `CodeStockLockFailed` 4004 / `CodeUpstream` 1006 | 502 | 429 |
+| `CodeCategoryNotFound` 2005 | 502 | 404 |
+
+**502 被收窄到只剩「下游真的不可达 / 未列出的未知码」**，于是 502 重新变得可诊断：
+
+```bash
+curl -s -w '\nHTTP %{http_code}\n' 'http://127.0.0.1:8080/api/order/1'          # 401 user required（修复后）
+curl -s -w '\nHTTP %{http_code}\n' 'http://127.0.0.1:8080/api/product/99999999' # 404 product not found
+# 真·502 只有这一种：停掉域服后打它
+kill $(lsof -nP -iTCP:9022 -sTCP:LISTEN -t | head -1)
+curl -s -w '\nHTTP %{http_code}\n' -X POST http://127.0.0.1:8080/api/order \
+  -H 'Content-Type: application/json' -d '{"user_id":1001,"product_id":1,"quantity":1}'  # 502 connection closed
+```
+
+**教训**：`default: 502` 是个"什么都兜、什么都说不清"的口袋。兜得越多，
+一个 4xx 就越容易被读成"基础设施挂了"，排查方向被整体带偏。
+
+## 11. 两个环境侧发现（会影响复验，不影响 launchx 本身）
+
+**① 注册实例 ID 撞名连坐**：实例 ID 固定为 `<服务名>-<host>-<port>`（`app.go` 的
+`stepRegister`），因此**同机同端口的两个进程共用一个 ID**。旧的 bff 进程退出时走
+`coord.deregister`，会把新实例刚注册的条目一起摘掉 —— 现象是"进程在监听、consul 里
+`[]`、日志里却明明打过 `launchx: service registered`"。
+
+- 复现：连续重启两次 bff，中间用 `curl /v1/health/service/demo-bff` 观察；
+- 单机 demo 的处置：确认 consul 里是 `[]` 时**重启一次**即可恢复（新起的会重新注册）；
+- 多实例部署要注意：同一台机器上同端口的两个实例不会出现，但**滚动发布时旧实例的
+  退出会摘掉同名条目**，需要实例 ID 带唯一后缀（如 PID / 随机串）才能根治。
+
+**② 宿主 8081 被容器 `etcdkeeper` 映射**：`docker ps` 显示 `etcdkeeper 0.0.0.0:8081->8080/tcp`。
+bff 绑的是 `127.0.0.1:8081`（loopback），容器绑的是 `*:8081`，在 macOS 上两者可共存，
+所以链路照跑；但如果 bff 改成绑 `0.0.0.0:8081` 就会**直接起不来**（address already in use）。
+复验环境里要么换端口，要么接受这个共存关系。
+

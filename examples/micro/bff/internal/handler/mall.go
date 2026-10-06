@@ -285,22 +285,44 @@ func parseInt64(span trace.Span, c *app.RequestContext, name string) (int64, boo
 
 // statusOf 领域错误码 → HTTP 状态码。
 //
-// 只映射语义确定的两类，其余一律按下游故障透传 502 —— 猜出来的状态码比
-// 502 更难排查。
+// 判据是「谁能区分故障归属，就映射谁」：**客户端错误必须映射成 4xx**，
+// 只有真正的下游故障才留在 502。原因是 502 会被读成"下游挂了"，
+// 把一个「你没带 user_id」渲染成 502，排查方向会被直接带偏 —— 曾经在
+// 真机验收里就出现过「网关报 502，误判为 srv 不通，实际是缺 user_id」
+// 的一次完整误诊。
+//
+// 未列出的一律按下游故障透传 502：猜出来的状态码比 502 更难排查。
 func statusOf(code int64) int {
 	switch code {
-	case codes.CodeInvalidParam:
+	// —— 客户端错误：参数 / 身份 / 状态冲突 ——
+	case codes.CodeInvalidParam,
+		codes.CodeOrderItemsEmpty,     // 下单明细为空
+		codes.CodeProductTitleInvalid, // 标题非法
+		codes.CodePointsAmountInvalid: // 积分数量非法
 		return http.StatusBadRequest
+	case codes.CodeUnauthorized:
+		return http.StatusUnauthorized
 	case codes.CodeNotFound,
 		codes.CodeProductNotFound, codes.CodeProductOffShelf,
+		codes.CodeCategoryNotFound,
 		codes.CodeOrderNotFound,
 		codes.CodeStockNotFound,
 		codes.CodePointsAccountNF:
 		return http.StatusNotFound
-	case codes.CodeRateLimited, codes.CodeOrderConcurrent:
-		return http.StatusTooManyRequests
-	case codes.CodeStockInsufficient, codes.CodePointsInsufficient:
+	case codes.CodeStockInsufficient, codes.CodePointsInsufficient,
+		codes.CodeOrderCancelled, codes.CodeOrderStatus, // 状态机不允许该操作
+		codes.CodeStockOverRelease: // 释放量超过预占量
 		return http.StatusConflict
+	case codes.CodeRateLimited, codes.CodeUpstream,
+		codes.CodeOrderConcurrent, // 同用户并发下单（可重试）
+		codes.CodeStockLockFailed: // 分布式锁未获取（可重试）
+		return http.StatusTooManyRequests
+	// —— 服务端错误：本域写库失败 / 内部错误 ——
+	case codes.CodeInternal,
+		codes.CodeProductWriteFailed,
+		codes.CodeStockReserveFailed,
+		codes.CodePointsWriteFailed:
+		return http.StatusInternalServerError
 	default:
 		return http.StatusBadGateway
 	}
