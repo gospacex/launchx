@@ -174,6 +174,26 @@ func pickOperatorTrace(traces []traceutil.Trace, notBefore time.Time) (traceutil
 	return picked, found
 }
 
+// stableTrace 反复拉取同一条 trace 直到 span 数不再增长。
+//
+// 为什么必须有这一步：OTLP 导出是分批量抵达的，Jaeger 第一次返回时常常只有根
+// span 那一批（实测：先拿到 1 个 span 的 trace，判据误报"没走到数据层"）。
+// 拿半棵树判断据，得到的失败是测试自己的竞态，不是实现缺陷。
+func stableTrace(t *testing.T, c *traceutil.Client, tr traceutil.Trace) traceutil.Trace {
+	t.Helper()
+	for i := 0; i < 6; i++ {
+		time.Sleep(1500 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		got, err := c.FetchTrace(ctx, tr.TraceID)
+		cancel()
+		if err != nil || len(got.Spans) <= len(tr.Spans) {
+			return tr
+		}
+		tr = *got
+	}
+	return tr
+}
+
 func anyDomain(tr traceutil.Trace, svcs map[string]bool) bool {
 	for _, d := range domainServiceSet() {
 		if svcs[d] {
@@ -200,7 +220,7 @@ func TestT6ThreeHopsShareOneTrace(t *testing.T) {
 	deadline := time.Now().Add(40 * time.Second)
 	for !time.Now().After(deadline) {
 		if got, ok := pickOperatorTrace(fetchSince(t, c, gatewayService, before, 20), before); ok {
-			tr = got
+			tr = stableTrace(t, c, got)
 			break
 		}
 		time.Sleep(2 * time.Second)
@@ -319,7 +339,7 @@ func TestT9TailSpansNotDropped(t *testing.T) {
 	deadline := time.Now().Add(40 * time.Second)
 	for !time.Now().After(deadline) {
 		if got, ok := pickOperatorTrace(fetchSince(t, c, gatewayService, before, 20), before); ok {
-			tr = got
+			tr = stableTrace(t, c, got)
 			break
 		}
 		time.Sleep(2 * time.Second)

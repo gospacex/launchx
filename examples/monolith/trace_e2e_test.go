@@ -145,18 +145,43 @@ func awaitTrace(t *testing.T, c *traceutil.Client, since time.Time, methodToken 
 			if !strings.Contains(root.OperationName, methodToken) {
 				continue
 			}
+			// 只取至少 3 个 span 的候选：单 span 的 trace 是"刚写到一半"
+			// （OTLP 批量导出按批抵达），拿它判断据会误判成"没走到数据层"。
+			if len(tr.Spans) < 3 {
+				continue
+			}
 			if best.Spans == nil || root.StartTime > best.Roots()[0].StartTime {
 				best = tr
 			}
 		}
 		if best.Spans != nil {
-			return best
+			return stableTrace(t, c, best)
 		}
 		time.Sleep(1 * time.Second)
 	}
 	t.Fatalf("30s 内没有出现在 %q 之后、根 span 含 %q 的 trace（Jaeger 导出有 ~5s 延迟）",
 		since.Format(time.RFC3339), methodToken)
 	return traceutil.Trace{}
+}
+
+// stableTrace 反复拉取同一条 trace，直到 span 数不再增长。
+//
+// 为什么必须有这一步：OTLP 导出是**分批量**抵达的，Jaeger 第一次返回时常常只有
+// 根 span 那一批。直接拿第一批判断据，得到的失败是"span 没到"而不是"span 没产生"
+// —— 前者是测试自己的竞态，后者才是实现缺陷，混在一起会浪费大量排查时间。
+func stableTrace(t *testing.T, c *traceutil.Client, tr traceutil.Trace) traceutil.Trace {
+	t.Helper()
+	for i := 0; i < 6; i++ {
+		time.Sleep(1500 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		got, err := c.FetchTrace(ctx, tr.TraceID)
+		cancel()
+		if err != nil || len(got.Spans) <= len(tr.Spans) {
+			return tr
+		}
+		tr = *got
+	}
+	return tr
 }
 
 // sqlSpans 取指定 SQL 类别的 span（db.create / db.query / db.update / db.delete）。
@@ -230,10 +255,7 @@ func TestT2SingleTableCRUDCarriesSQL(t *testing.T) {
 
 // TestT3MultiTableSpansInOneTrace T3：多表操作入链 —— JOIN 文本可见、跨表写为兄弟 span。
 //
-// 第三个要求（回滚时相关 span 标 Error）本 demo **没有经 HTTP 可触发的回滚路径**：
-// UpdateStatus 的非法状态在 service 层就返回了，事务根本没开； drools 类校验也在入口。
-// 与其构造一条假请求假装验证过，这里明确 Skip 并写明缺口 —— 见文件末尾的
-// TestT3RollbackMarksErrorSpansNotReachable 说明。
+// 第三条要求（回滚时相关 span 标 Error）见下方 TestT3RollbackMarksErrorSpans。
 func TestT3MultiTableSpansInOneTrace(t *testing.T) {
 	c := requireJaeger(t)
 	requireApp(t)
@@ -362,15 +384,58 @@ func TestT4ComponentSpansShareTrace(t *testing.T) {
 	t.Logf("cache ✓ %v 挂在 %s 下（订单 %s）", opNamesOf(tr, cacheSpans), bizSpan.OperationName, orderNo)
 }
 
-// TestT3RollbackMarksErrorSpansNotReachable 记录一条**不可达**判据，避免它被悄悄算作已验证。
+// TestT3RollbackMarksErrorSpans T3 第三条：跨表事务回滚时相关 span 标 Error。
 //
-// T3 的第三个要求（跨表事务回滚时相关 span 标 Error）在本 demo 无 HTTP 触发路径：
-// UpdateStatus 对非法状态在 service 层即返回（事务未开），构造其它回滚要么改业务
-// 代码、要么直接连库造，两者都超出了"验收"的本分。这里显式 Skip 并登记缺口，
-// 待 demo 增加一条可触发回滚的接口后再实跑。
-func TestT3RollbackMarksErrorSpansNotReachable(t *testing.T) {
-	t.Skip("本 demo 无经 HTTP 可触发的事务回滚路径（UpdateStatus 非法状态在 service 层返回，事务未开）；" +
-		"待 demo 补一条会回滚的接口后可将本条改为实断言（判据：trace 内含 error=true 的 SQL span，且其兄弟 SQL span 同父）")
+// 触发方式必须是"经公共 API 真回滚"，而不是直接连库造 —— 后者回滚了也只能证明
+// gorm 会回滚，证明不了**这一跳的失败有没有进链路**。这里喂一组会撞
+// `amount decimal(10,2)` 上界的数量/单价，让 service.Create 的同事务里第二句
+// INSERT 报错（HTTP 500，订单与明细一同回滚）。
+func TestT3RollbackMarksErrorSpans(t *testing.T) {
+	c := requireJaeger(t)
+	requireApp(t)
+
+	since := time.Now()
+	body, code := request(t, http.MethodPost, appBase()+"/orders",
+		`{"user_id":1,"item":"t3-rollback","qty":1000000000,"unit_price":99999999}`, nil)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("预期 HTTP 500（金额越界触发回滚），实际 %d：%s —— 若实现已修，本用例的触发方式需同步调整",
+			code, truncate(body, 160))
+	}
+
+	tr := awaitTrace(t, c, since, http.MethodPost)
+	t.Logf("回滚 trace %s：ops=%v", tr.TraceID, tr.OperationNames())
+
+	var (
+		errDB   bool
+		errRepo bool
+		errBiz  bool
+	)
+	for _, s := range tr.Spans {
+		if !tr.IsError(s) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(s.OperationName, "db."):
+			errDB = true
+		case strings.HasPrefix(s.OperationName, "repository."):
+			errRepo = true
+		case strings.HasPrefix(s.OperationName, "service."), strings.HasPrefix(s.OperationName, "handler."):
+			errBiz = true
+		}
+	}
+	// ① 回滚的事实必须落在**数据层 span** 上 —— 只有业务层标错、SQL span 却绿着，
+	// 排查时会误判成"这条 SQL 是成功的，错在别处"。
+	if !errDB {
+		t.Fatalf("回滚的 trace %s 内没有任何带 error 标记的 db.* span（ops=%v）", tr.TraceID, tr.OperationNames())
+	}
+	// ② 事务边界那一层也要标错：repository 是事务持有者，它干净就等于"没人认领这次失败"。
+	if !errRepo {
+		t.Fatalf("回滚的 trace %s 内没有带 error 标记的 repository.* span（ops=%v）", tr.TraceID, tr.OperationNames())
+	}
+	if !errBiz {
+		t.Fatalf("回滚的 trace %s 内没有带 error 标记的 service/handler span（ops=%v）", tr.TraceID, tr.OperationNames())
+	}
+	t.Logf("T3 回滚 ✓ 数据层 / repository / 业务层均标 Error（trace %s）", tr.TraceID)
 }
 
 // TestT5MonolithSpanTreeShape T5：span 树形态 —— 入口 → 业务层 → 数据层，无孤儿。
