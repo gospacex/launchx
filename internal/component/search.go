@@ -38,12 +38,18 @@ func buildSearch(env *Env) error {
 		name = env.ServiceName
 	}
 	cfg := &searchx.Config{
-		Driver:      driver,
-		Name:        name,
-		Address:     addrs,
-		Username:    env.Cfg.GetString(key + ".username"),
-		Password:    env.Cfg.GetString(key + ".password"),
-		EnableTrace: env.Cfg.GetBool(key+".enable_trace") && traceOn(env, "search"),
+		Driver:   driver,
+		Name:     name,
+		Address:  addrs,
+		Username: env.Cfg.GetString(key + ".username"),
+		Password: env.Cfg.GetString(key + ".password"),
+		// 只由 trace.on.search 裁决，不再与段内 enable_trace 做 AND。
+		//
+		// 原写法要求两个键同时为 true：而段内 enable_trace 是本 SDK 的历史键，
+		// 四份示例配置里都没写，结果 trace.on.search: true 也换不来一个
+		// db.elasticsearch.* span（默认零值 false 把整条链按住）。组件级开关
+		// 与实例级开关应当是「AND 收敛后由组件级说了算」，不是「两个都要写」。
+		EnableTrace: traceOn(env, "search"),
 		// 旧集群（ES < 7.14）不返回 X-Elastic-Product，v8 客户端会拒绝全部响应。
 		// 这里只做透传：是否宽容由部署方在配置里显式声明，库侧不擅自放宽校验。
 		LegacyCluster: env.Cfg.GetBool(key + ".legacy_cluster"),

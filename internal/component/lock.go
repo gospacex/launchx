@@ -9,9 +9,14 @@ func init() { Register("lock", buildLock) }
 
 // buildLock 构造分布式锁组件（yaml 段：xmiddleware.lockx）。
 //
-// 为什么逐字段读而不 Unmarshal：lockx.Config 的三套 tag 里没有 mapstructure
-// （与 mongodbx 同一个坑），`enable_trace / max_attempts` 这类蛇形键经 viper
-// 通道解码会被**静默丢弃** —— 比字段名拼错更难发现（没有报错，只是永远关着）。
+// 为什么逐字段读而不 Unmarshal：本段的键位（xmiddleware.lockx.*）是 launchx
+// 自己定的扁平段，且 Name/Addr 要按 ServiceName 兜底、EnableTrace 要由
+// trace.on.lock 裁决 —— 直接 Unmarshal 会先按 SDK 自己的默认值填一遍，再被
+// 这些兜底覆盖，顺序一乱就出现「写了却不生效」。
+//
+// 注：lockx.Config 原先缺 mapstructure tag（`enable_trace` / `retry.max_attempts`
+// 这类蛇形键会被 viper 静默丢弃），已在 SDK 侧补齐；这里逐字段读取不依赖那套
+// tag，但补齐后 SDK 的其它调用方（configx / ReadAndCreate）不会再踩同一个坑。
 //
 // lockx.New 是单实例工厂（不像 kvx/cachex 有 instances 表），故配置段是平铺的：
 // 一个进程一把锁器，锁的隔离靠 Config.Namespace 与业务侧的 key 前缀。
