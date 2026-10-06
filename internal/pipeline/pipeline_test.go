@@ -46,6 +46,61 @@ func TestStartupOrderTelemetryBeforeComponents(t *testing.T) {
 	}
 }
 
+// TestStartupOrder 断言完整启动骨架的顺序红线（验收案例 A2）。
+//
+// 事件名取骨架常量（config.load / telemetry.init / logger.init / mode.assemble /
+// component.mount / registry.register / setup）：组件挂载在真实实现里是**一步**
+// （component.mount 内部按 db/cache/mq/kv/lock/registry/search/mongodb 顺序挂），
+// 不拆成 component.db 等逐组件事件；logx 全局设置为 logger.init。
+func TestStartupOrder(t *testing.T) {
+	ev := NewEvents()
+	noop := func(*Env) error { return nil }
+	err := Run(&Env{Events: ev, Logger: nopLogger{}}, []Step{
+		{Name: StepConfigLoad, Fn: noop},
+		{Name: StepTelemetryInit, Fn: noop},
+		{Name: StepLoggerInit, Fn: noop},
+		{Name: StepModeAssemble, Fn: noop},
+		{Name: StepComponentMount, Fn: noop},
+		{Name: StepRegistryRegister, Fn: noop},
+		{Name: StepSetup, Fn: noop},
+	})
+	if err != nil {
+		t.Fatalf("pipeline: %v", err)
+	}
+	at := func(name string) int {
+		i := ev.IndexOf(name)
+		if i < 0 {
+			t.Fatalf("missing startup event %q in %v", name, ev.Order())
+		}
+		return i
+	}
+	// config.load 最早（配置是后面每一步的输入）。
+	if got := at(StepConfigLoad); got != 0 {
+		t.Fatalf("config.load must be first, got index %d: %v", got, ev.Order())
+	}
+	// telemetry.init 严格早于组件挂载与注册（否则组件拿到 noop tracer）。
+	for _, later := range []string{StepComponentMount, StepRegistryRegister} {
+		if at(StepTelemetryInit) >= at(later) {
+			t.Fatalf("telemetry.init must precede %s: %v", later, ev.Order())
+		}
+	}
+	// logger.init 在 telemetry.init 之后、mode.assemble 之前。
+	if at(StepLoggerInit) <= at(StepTelemetryInit) {
+		t.Fatalf("logger.init must follow telemetry.init: %v", ev.Order())
+	}
+	if at(StepLoggerInit) >= at(StepModeAssemble) {
+		t.Fatalf("logger.init must precede mode.assemble: %v", ev.Order())
+	}
+	// 形态装配早于组件挂载（组件按形态取地址与发现句柄）。
+	if at(StepModeAssemble) >= at(StepComponentMount) {
+		t.Fatalf("mode.assemble must precede component.mount: %v", ev.Order())
+	}
+	// setup 最后：基础设施就绪后才交给业务。
+	if at(StepSetup) != len(ev.Order())-1 {
+		t.Fatalf("setup must be last: %v", ev.Order())
+	}
+}
+
 // TestStepFailureAborts 断言任一步失败即中止，后续步骤不执行。
 func TestStepFailureAborts(t *testing.T) {
 	ev := NewEvents()

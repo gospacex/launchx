@@ -51,6 +51,9 @@ type Env struct {
 	Logger logx.Logger
 	Tracer otelx.Provider
 	Ctx    context.Context
+
+	// shutdownDone 退出链已走过一轮（Shutdown 幂等的判据，见 shutdown.go）。
+	shutdownDone bool
 }
 
 // Run 按序执行骨架步骤；任一步失败立即返回，后续步骤不再执行。
