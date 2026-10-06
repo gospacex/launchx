@@ -74,7 +74,7 @@
 - 验证方式：`go build ./... && go vet ./...` 全绿；README 注明与 `micro_apps/pkg/rpcx`、`gospacex/rpcx` 的关系与迁移路径（收敛不在本轮）
 
 ### Task 28: 依赖面核对（对应 `tasks.md` 3.14）
-- [ ] **任务完成**（与 `tasks.md` 3.14 同步勾选）
+- [x] **任务完成**（与 `tasks.md` 3.14 同步勾选）
 - 目标：核对 launchx 与 `examples/*` 各模块 `go.mod` 与 import 中无 `cloudwego/kitex`、`cloudwego/hertz`、`redis/go-redis`、`segmentio/kafka-go`、`hashicorp/consul/api`、`gorm.io/gorm` 直接引用；RPC 相关 import 仅指向 `github.com/gospacex/rpcx`
 - 改动文件：无（核对；不符合则修正 import 与 go.mod）
 - 验证方式：`go list -deps` / grep 全仓 import 清单核对通过

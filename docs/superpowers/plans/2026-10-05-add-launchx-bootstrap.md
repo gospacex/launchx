@@ -1264,18 +1264,18 @@ git add examples/monolith/degrade_test.go && git commit -m "test: 降级路径�
 **文件：**
 - 创建：`examples/monolith/README.md`、`examples/micro/README.md`
 
-- [ ] **步骤 20.1：写两份 README（启动步骤 + 依赖 + 验收案例编号 + 观测方式）**
+- [x] **步骤 20.1：写两份 README（启动步骤 + 依赖 + 验收案例编号 + 观测方式）**
 
 每份含：前置底座命令（`docker compose -f /Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml up -d consul mysql kafka jaeger redis` + `export HUBX_DB_PW=hubx123`）、逐服务启动步骤（`go run ./cmd`）、依赖清单（端口事实：consul 8500 / mysql 3306 / kafka 9092 / jaeger 4318+16686 / redis 6379）、验收案例编号与预期结果（monolith→E1；micro→E2/E3）、观测方式（span 经 otelx 推 jaeger UI 16686；**无 HTTP 探针端点**，探针语义交 k8s TCP + consul——mesh 后置后 README 同步补 TCP+consul 探针说明，见 close-issues）。
 人工核对：每个 README 含「验收案例」小节且编号与 `specs/example-demos/spec.md` Scenario 一致。
 
-- [ ] **步骤 20.2：Commit**
+- [x] **步骤 20.2：Commit**
 
 ```bash
 git add examples/monolith/README.md examples/micro/README.md && git commit -m "docs: monolith/micro demo README（2.6 本轮范围）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.6（本轮范围）同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 2.6（本轮范围）同步）
 
 ---
 
@@ -1288,7 +1288,7 @@ git add examples/monolith/README.md examples/micro/README.md && git commit -m "d
 **文件：**
 - 创建：`openspec/changes/add-launchx-bootstrap/close-issues.md`（sddflow close 阶段消费的文档，非实现文件）
 
-- [ ] **步骤 21.1：写入回补清单（占位，不实现）**
+- [x] **步骤 21.1：写入回补清单（占位，不实现）**
 
 ```markdown
 # close-issues — 后置项（本轮不验收，回补开新 change）
@@ -1304,13 +1304,13 @@ git add examples/monolith/README.md examples/micro/README.md && git commit -m "d
 - [ ] examples/mesh/README.md（随 2.5）
 ```
 
-- [ ] **步骤 21.2：Commit**
+- [x] **步骤 21.2：Commit**
 
 ```bash
 git add openspec/changes/add-launchx-bootstrap/close-issues.md && git commit -m "docs: 后置项回补清单（1.8/2.5/3.8/3.11-3.13，占位不实现）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；占位登记完成，后置条目本身保持未勾选）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；占位登记完成，后置条目本身保持未勾选）
 
 ---
 
@@ -1453,29 +1453,29 @@ git add examples/monolith/trace_e2e_test.go examples/micro/trace_e2e_test.go int
 
 **说明：** 纯核对动作，不合格则修正 import 与 `go.mod`；用于坐实 mode-assembly 的「RPC 依赖面收敛」。
 
-- [ ] **步骤 24.1：库源码零 cloudwego 直接 import**
+- [x] **步骤 24.1：库源码零 cloudwego 直接 import**
 
 ```bash
 grep -rn "cloudwego" --include="*.go" . | grep -v "^./examples/"    # 期望：空
 ```
 含 `internal/*` 全量；期望无命中。
 
-- [ ] **步骤 24.2：`go.mod` 中 kitex 仅 `// indirect`**
+- [x] **步骤 24.2：`go.mod` 中 kitex 仅 `// indirect`**
 
 检查 `go.mod`：`github.com/cloudwego/kitex` 只能出现在 indirect 区；RPC 相关 import 只指向 `github.com/gospacex/rpcx`（前置 Task 22）。
 
-- [ ] **步骤 24.3：`examples/` 白名单核对**
+- [x] **步骤 24.3：`examples/` 白名单核对**
 
 仅 `micro/srv` 与 `micro/bff` 的 kitex 构造处允许出现 kitex import（`kitex_gen` 所需）；全仓无 `cloudwego/hertz`、`redis/go-redis`、`segmentio/kafka-go`、`hashicorp/consul/api`、`gorm.io/gorm` 的直接引用。
 
-- [ ] **步骤 24.4：Commit（仅在有修正时）**
+- [x] **步骤 24.4：Commit（仅在有修正时）**
 
 ```bash
 go list -deps ./...    # 依赖面清单核对
 git add -A && git commit -m "chore: 依赖面核对（mode-assembly RPC 依赖面收敛，3.14）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.14 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.14 同步）
 
 ---
 

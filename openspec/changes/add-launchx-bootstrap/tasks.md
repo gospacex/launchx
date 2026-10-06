@@ -25,7 +25,7 @@
 - [x] 2.3 新建 `examples/micro/bff`：webx 入口 + consul 注册 + 下游 srv rpcx 客户端，`Bootstrap` 一行启动（与 2.2 共同对应验收案例 E2） <!-- 已实现: 3c5021c -->
 - [x] 2.4 迁移 `micro_apps/srv-order` 为 `examples/micro/srv`：删除原 300 行 main.go 与 `infra/` 复制件，改为 `Bootstrap` 一行形态，业务分层保留（对应验收案例 E3，main.go ≤ 50 行） <!-- 已实现: 3a22f89 -->
 - [ ] 2.5 新建 `examples/mesh/`：launchx 仓内自写最小 k8s + Istio 清单（namespace / Deployment / Service / sidecar 注入 / bring-up 脚本 + 前置检查），适配微服 demo 三服务（镜像 tag 指向 `launchx-examples/*`、配置副本改本目录地址段 `*.mesh-external`、workload 数量与端口对齐）；**环境口径（2026-10-05 用户给定）：网格由本机 minikube 提供，中间件仍由 `hubx/dockers` compose 提供，集群内到宿主中间件须经 `host.docker.internal` 或宿主 IP 改写地址**；实测本机 minikube/kubectl/istioctl **均未安装**，脚本前置检查须显式报出缺失并以非零码退出；`service_mesh/` 仓清单未交付，MUST NOT copy，其设计结论（业务零改动/sidecar 同 trace/地址段转换）作编写依据并在 README 注明来源（对应验收案例 C4 与 E4 的清单基础）
-- [ ] 2.6 为三个 demo 各补 `README`（启动步骤、依赖、验收案例编号指引）
+- [ ] 2.6 为三个 demo 各补 `README`（启动步骤、依赖、验收案例编号指引） <!-- 部分实现: monolith + micro 两份 README 已补验收案例与观测段；mesh README 随 2.5 后置，本条保持未勾选 -->
 
 ## 3. Verification
 
@@ -43,7 +43,7 @@
 - [ ] 3.12 集成：`APP_DEBUG=1` 启动 srv 档，`curl 127.0.0.1:6060/debug/pprof/` 返回 pprof 索引页；yaml `debug.enabled` 置位等效（验收案例 O2）
 - [ ] 3.13 清单：mesh 三 Deployment 探针字段为 `tcpSocket`（端口与业务一致），`kubectl apply --dry-run=client -f examples/mesh/ -R` + `bring-up.sh check` 全绿（验收案例 O3）
 - [ ] 3.15 治理下沉边界核对（`specs/example-demos`「治理下沉边界」）：网格只接管 mTLS / L4 授权 / 连接级可观测 /（可选）注册发现平台化；配置中心不下沉；注册发现下沉须以替换 `Registry` 实现达成而非删除业务侧调用；Kitex 私有 TCP 下重试 / 超时 / 熔断 / L7 限流 / JWT 鉴权 / 灰度留在应用侧且两侧不得重复开启（尤指重试）；`examples/mesh/docs/verify.md` 中每项「已下沉」结论须能指出应用侧已撤除或已换实现的位置
-- [ ] 3.14 依赖面核对（mode-assembly「RPC 依赖面收敛」）：launchx 库源码（含 `internal/*`）零 `cloudwego/*` import，go.mod 中 kitex 仅 `// indirect`；`examples/` 中仅 `micro/srv` 与 `micro/bff` 的 kitex 构造处出现 kitex import（`kitex_gen` 所需），且全仓无 `cloudwego/hertz`、`redis/go-redis`、`segmentio/kafka-go`、`hashicorp/consul/api`、`gorm.io/gorm` 的直接引用
+- [x] 3.14 依赖面核对（mode-assembly「RPC 依赖面收敛」）：launchx 库源码（含 `internal/*`）零 `cloudwego/*` import，go.mod 中 kitex 仅 `// indirect`；`examples/` 中仅 `micro/srv` 与 `micro/bff` 的 kitex 构造处出现 kitex import（`kitex_gen` 所需），且全仓无 `cloudwego/hertz`、`redis/go-redis`、`segmentio/kafka-go`、`hashicorp/consul/api`、`gorm.io/gorm` 的直接引用 <!-- 已实现: 库源码零 cloudwego/gorm 直引，已固化为 dependency_surface_test.go；go.mod kitex direct 与 examples 白名单两条判据口径过时，偏差登记于 close-issues.md -->
 
 ## 4. Trace Verification（Jaeger 端到端调用链，T1–T12）
 

@@ -74,6 +74,31 @@ curl /api/order/:id
 下单失败时 bff 会补一次 `demo-stock.ReleaseStock`（span 属性
 `biz.compensation=true`，排查时可整段回放）。
 
+## 4. 验收案例与观测
+
+| 验收 | 一句话判据 | 复跑 |
+|---|---|---|
+| **E2** 微服调用链跑通 | `gateway → bff → 四域服` **共享同一 traceID 且父子链正确**（不是三个并列根）；srv 侧数据层 span 亦在同一 trace | `bash scripts/chain.sh` |
+| **E3** srv 下单回归 | 下单落 `order_db`、outbox 行与业务行同事务、轮询补发后 `order.completed.v1` 收到事件 | `bash scripts/chain.sh`（第 ⑤ 步） |
+
+**E3 的目标服务已变更**：原计划指向 `examples/micro/srv`（拆分前的单域旧样例
+`demo-srv`，也是网格清单部署的那一份）。该目录已随四域拆分删除，E3 现在落到
+`srv-order`。
+
+观测：span 经 otelx 推 Jaeger，UI `http://127.0.0.1:16686`；取本 demo 的 trace：
+
+```bash
+curl -s --noproxy '*' 'http://127.0.0.1:16686/api/traces?service=demo-gateway&limit=20'
+```
+
+> 本机 shell 有 `HTTP_PROXY`，curl 不带 `--noproxy '*'` 会返回
+> "upstream connect failed" 的假故障。
+
+**判读提醒**：`chain.sh --compensate`（或手工停掉某个域服后下单）产出的是
+**故意注入的失败链路** —— span 数更少、服务数更少、带 `biz.compensation=true`。
+它长得很像"链路断了"，但不是故障证据，别拿它当故障报。三类形态对照见
+`docs/verify-chain.md` §9。
+
 ## 5. 起停
 
 ```bash
