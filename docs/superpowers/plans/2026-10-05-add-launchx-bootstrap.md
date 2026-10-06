@@ -987,7 +987,7 @@ git add examples/micro/srv && git commit -m "feat: srv-order 迁移为 examples/
 **文件：**
 - 修改：`internal/configsrc/local_test.go`、`internal/configsrc/nacos_test.go`
 
-- [ ] **步骤 12.1：补全 B1 全分支（本地 + 远端不可达；真机 nacos 分支 Skip）**
+- [x] **步骤 12.1：补全 B1 全分支（本地 + 远端不可达；真机 nacos 分支 Skip）**
 
 追加至 `internal/configsrc/nacos_test.go`（key 级裁决与不可达即退已有，补两处）：
 ```go
@@ -1013,13 +1013,13 @@ func TestNacosServerEnvOverride(t *testing.T) {
 运行：`go test ./internal/configsrc/ -v`
 预期：全绿（Skip 项可见不阻塞）。
 
-- [ ] **步骤 12.2：Commit**
+- [x] **步骤 12.2：Commit**
 
 ```bash
 git add internal/configsrc && git commit -m "test: configsrc B1 全分支单测（3.1，真机分支 Skip 保留）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.1 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.1 同步） <!-- 已实现: 54f85d5 -->
 
 ---
 
@@ -1031,13 +1031,13 @@ git add internal/configsrc && git commit -m "test: configsrc B1 全分支单测�
 **文件：**
 - 修改：`internal/pipeline/pipeline_test.go`、`internal/pipeline/shutdown_test.go`（Task 7 已建则补全断言）
 
-- [ ] **步骤 13.1：启动序断言**
+- [x] **步骤 13.1：启动序断言**
 
 `pipeline_test.go` 补全事件记录器断言（Task 6 的 Recorder）：`telemetry.init` 严格早于 `component.db`/`component.cache`/`component.mq`；`configsrc.load` 最早；`logx.global` 在 `telemetry.init` 后、`mode.assemble` 前。
 运行：`go test ./internal/pipeline/ -run TestStartupOrder -v`
 预期：PASS。
 
-- [ ] **步骤 13.2：退出序断言 + Commit**
+- [x] **步骤 13.2：退出序断言 + Commit**
 
 `shutdown_test.go` 补全：`registry.deregister` 早于 `tracing.flush`；`tracing.flush` 早于 `logger.close` 且为最后一条 flush 类事件；会标 span 资源（db/mq 组件 Stop 事件）均早于 `tracing.flush`。
 运行：`go test ./internal/pipeline/ -run 'TestShutdown|TestSetupFailure|TestCloseIdempotent' -v`
@@ -1046,7 +1046,7 @@ git add internal/configsrc && git commit -m "test: configsrc B1 全分支单测�
 git add internal/pipeline && git commit -m "test: pipeline 启动/退出顺序断言（3.2，A2/A3）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.2 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.2 同步）
 
 ---
 
@@ -1058,7 +1058,7 @@ git add internal/pipeline && git commit -m "test: pipeline 启动/退出顺序�
 **文件：**
 - 修改：`internal/component/component_test.go`（Task 4 已有骨架则补全；无则新建）
 
-- [ ] **步骤 14.1：补全三组断言（TDD 风格，先写断言再核对实现）**
+- [x] **步骤 14.1：补全三组断言（TDD 风格，先写断言再核对实现）**
 
 ```go
 // D2 降级：strict 缺省 → MountAll 返回 nil、App.DB==nil、Warn 记录含 "db" 与降级后果文案
@@ -1069,13 +1069,13 @@ git add internal/pipeline && git commit -m "test: pipeline 启动/退出顺序�
 运行：`go test ./internal/component/ -v`
 预期：全 PASS。
 
-- [ ] **步骤 14.2：Commit**
+- [x] **步骤 14.2：Commit**
 
 ```bash
 git add internal/component && git commit -m "test: component strict 双分支 + trace.on 门控单测（3.3，D1/D2）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.3 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.3 同步）
 
 ---
 
@@ -1087,7 +1087,7 @@ git add internal/component && git commit -m "test: component strict 双分支 + 
 **文件：**
 - 修改：`internal/mode/mode_test.go`（Task 5 已有 C 系列骨架则补全映射矩阵；无则新建）
 
-- [ ] **步骤 15.1：补全四档映射矩阵断言**
+- [x] **步骤 15.1：补全四档映射矩阵断言** <!-- 已实现: 4621fd9 -->
 
 ```go
 // monolith：webx 构建、不注册、无下游工厂
@@ -1099,13 +1099,13 @@ git add internal/component && git commit -m "test: component strict 双分支 + 
 运行：`go test ./internal/mode/ -v`
 预期：全 PASS。
 
-- [ ] **步骤 15.2：Commit**
+- [x] **步骤 15.2：Commit** <!-- 已实现: 4621fd9 -->
 
 ```bash
 git add internal/mode && git commit -m "test: mode 四档装配 + 非法/缺失/mesh 拒绝单测（3.4，C1-C3）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.4 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.4 同步） <!-- 已实现: 4621fd9 -->
 
 ---
 

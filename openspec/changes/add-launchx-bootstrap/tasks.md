@@ -29,10 +29,10 @@
 
 ## 3. Verification
 
-- [ ] 3.1 单测：configsrc 三裁决规则 + local env 展开 + 远端不可达即退（验收案例 B1）
-- [ ] 3.2 单测：pipeline 启动顺序断言（telemetry 先于组件）与退出顺序断言（deregister 先于 flush、flush 最后）（验收案例 A2/A3）
-- [ ] 3.3 单测：component 双分支（strict 降级/失败）、`trace.on` 门控不改变组件构造（验收案例 D1/D2）
-- [ ] 3.4 单测：mode 四档装配与非法 mode 报错（验收案例 C1/C2/C3）
+- [x] 3.1 单测：configsrc 三裁决规则 + local env 展开 + 远端不可达即退（验收案例 B1） <!-- 已实现: 54f85d5 nacos_test.go 补 dataId 空纯本地（不可达地址反证未触达远端）、HUBX_NACOS_SERVER 覆盖 yaml 地址（err 中 addr 全等断言，含 env 空回落 yaml）、地址未配置纯本地三分支；真机分支 TestNacosRealServer 以 Skip 保留 -->
+- [x] 3.2 单测：pipeline 启动顺序断言（telemetry 先于组件）与退出顺序断言（deregister 先于 flush、flush 最后）（验收案例 A2/A3） <!-- 已实现: pipeline_test.go TestStartupOrder + 新建 shutdown_test.go（TestShutdown/TestSetupFailure/TestCloseIdempotent）与 pipeline.Shutdown 退出链执行器，事件名按实现真实值 config.load/telemetry.init/logger.init/mode.assemble/component.mount/registry.register/setup 与 server.stop/component.stop/registry.deregister/tracing.shutdown/logger.close，commit 7668ee1 -->
+- [x] 3.3 单测：component 双分支（strict 降级/失败）、`trace.on` 门控不改变组件构造（验收案例 D1/D2） <!-- 已实现: component_test.go 补 D2 降级（Mount 返回 nil/DB nil/Warn 点名 component=db + 后果文案）、D2 即退（init db + errors.Is 穿透 %w 到哨兵根因）、D1 门控（trace.on.mq=false 构造器仍被调用且 MQ 非 nil）三组断言，a1b9af3 -->
+- [x] 3.4 单测：mode 四档装配与非法 mode 报错（验收案例 C1/C2/C3） <!-- 已实现: 四档映射矩阵（webx/注册/RPCServer/RPCClientOptions 互斥）+ srv ServerOptions 服务名端口 + 非法/缺失/mesh 报错含合法取值，4621fd9 -->
 - [ ] 3.5 集成验收：`examples/monolith` 在共享底座（`hubx/dockers` compose，mysql 就绪）下启动 + HTTP 请求（订单读写落 mysql）+ SIGTERM 正常退出（验收案例 E1）
 - [ ] 3.6 集成验收：共享底座（consul + kafka + jaeger，`hubx/dockers` compose）就绪下，`gateway → bff → srv` 调用链返回预期响应（验收案例 E2）
 - [ ] 3.7 回归验收：迁移后 srv 跑原 srv-order e2e 下单链路全绿，含 outbox 经 kafka 投递断言（topic 自动创建），`examples/micro/srv/cmd/main.go` ≤ 50 行（验收案例 E3）

@@ -170,25 +170,25 @@
 - 验证方式：人工核对每个 README 含「验收案例」小节且编号与 spec Scenario 一致
 
 ### Task 14: configsrc 单测套件（验收案例 B1）
-- [ ] **任务完成**（与 superpowers plan `Task 14`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 14`、`tasks.md` 对应条目同步勾选）
 - 目标：补齐 `internal/configsrc` 测试：三裁决规则（本地兜底/远程 key 覆盖/env 覆盖地址）、dataId 空纯本地、远端不可达即退、`${ENV}` DSN 展开
 - 改动文件：`internal/configsrc/*_test.go`
 - 验证方式：`go test ./internal/configsrc/ -v` 全绿，覆盖 B1 场景断言
 
 ### Task 15: pipeline 顺序单测（验收案例 A2/A3）
-- [ ] **任务完成**（与 superpowers plan `Task 15`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 15`、`tasks.md` 对应条目同步勾选）
 - 目标：事件记录器断言：telemetry.Init 调用序早于 db/cache/mq 构建；退出序 deregister 早于 flush、flush 晚于全部会标 span 资源、logger 最后关闭
 - 改动文件：`internal/pipeline/{pipeline_test.go,shutdown_test.go}`
 - 验证方式：`go test ./internal/pipeline/ -v` 全绿
 
 ### Task 16: component 单测（验收案例 D1/D2）
-- [ ] **任务完成**（与 superpowers plan `Task 16`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 16`、`tasks.md` 对应条目同步勾选）
 - 目标：strict 默认降级（字段 nil + Warn 含后果文案）/strict 置真返回 `init <name>` 包装 error；`trace.on.<name>=false` 时组件仍构造；registry 失败带病运行
 - 改动文件：`internal/component/*_test.go`
 - 验证方式：`go test ./internal/component/ -v` 全绿
 
 ### Task 17: mode 单测（验收案例 C1/C2/C3）
-- [ ] **任务完成**（与 superpowers plan `Task 17`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 17`、`tasks.md` 对应条目同步勾选）
 - 目标：四档装配分支断言（webx 构造与否、consul 注册与否、srv ServerOptions 产出）；非法 mode/缺失 mode 返回含合法取值列表的 error
 - 改动文件：`internal/mode/mode_test.go`
 - 验证方式：`go test ./internal/mode/ -v` 全绿
