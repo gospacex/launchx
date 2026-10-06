@@ -18,7 +18,12 @@ import (
 // 不碰请求也不建连接。能注入出什么取决于 telemetry 步骤注册的传播器
 // （Composite{TraceContext, Baggage}）；未注册时全局是 noop，注入为空，
 // 这本身就是一条可断言的反向判据（验收案例 T7）。
-func Inject(ctx context.Context, carrier propagation.HeaderCarrier) {
+//
+// 入参取 TextMapCarrier 而不是 HeaderCarrier：HTTP 头是一类 carrier，
+// MQ 消息头（MapCarrier / 自定义单值 map）是另一类。只认 HTTP 头会逼着
+// 消息侧在业务代码里裸调 otel 全局，等于把唯一的续链入口堵死一半。
+// HeaderCarrier 本身实现 TextMapCarrier，故这次放宽对既有调用方是兼容的。
+func Inject(ctx context.Context, carrier propagation.TextMapCarrier) {
 	if carrier == nil {
 		return
 	}
@@ -29,7 +34,7 @@ func Inject(ctx context.Context, carrier propagation.HeaderCarrier) {
 //
 // 与 Inject 成对提供：反向代理既要从入站请求取 context（Extract），
 // 也要把它写进出站请求（Inject）。只做一半等于断链。
-func Extract(ctx context.Context, carrier propagation.HeaderCarrier) context.Context {
+func Extract(ctx context.Context, carrier propagation.TextMapCarrier) context.Context {
 	if carrier == nil {
 		return ctx
 	}
