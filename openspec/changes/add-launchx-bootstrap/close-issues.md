@@ -59,7 +59,36 @@ Task 24 实测三条判据，两条与现状冲突，**判据口径过时而非�
       redis/go-redis、segmentio/kafka-go、hashicorp/consul/api。
       已做变异验证：注入 `import _ "gorm.io/gorm"` 即 FAIL 并点名文件行号。
 
-## 三、与本轮其它决策的交叉影响
+## 三、wire 入图的范围变更与本 fork 的代码生成陷阱
+
+- [x] **hubx 移出注册面（用户裁决）**：本次注册面为 **15 个 SDK**
+      （cachex configx coordx dbx kvx lockx logx mongodbx mqx objectx otelx
+      rpcx searchx vectorx webx），**不含 hubx**。原因见本文件第二节。
+      连带：tasks.md 5.6（hubx 侧接线）保持未勾选，5.10 为部分完成。
+      go.mod 里 `replace github.com/gospacex/hubx => ../hubx` **保留** ——
+      `dbx/go.mod` 自身 require 了 hubx，去掉该 replace 会让 dbx 无法解析。
+      真要彻底删掉 hubx，得先动 dbx，属于另一个 change。
+
+- [x] **objectx / vectorx 登记在册但默认不构造**：实测二者的依赖面代价过高 ——
+      objectx 会拖入阿里云 / 华为云 / 七牛 / minio / 腾讯 COS 全套 SDK，
+      vectorx 会拖入 elasticsearch v9 及大量间接依赖（且与现有 otel 1.46 /
+      viper 版本相冲）。在**不能跑 `go mod tidy`** 的纪律下无法安全收敛，
+      故不新增模块依赖；provider 在 presence 未命中时返回零值，接入只需补构造调用。
+
+- [x] **goforj/wire v1.2.0 的代码生成会把它自己写进运行时**（实测，已规避）：
+      该 fork 的生成器会把 `wireinject` 文件的**全部声明**原样拷进 `wire_gen.go`，
+      包括 `var X = wire.NewSet(...)`。第一版把 ProviderSet 写在 `wire.go`，
+      生成物第 10 行就是 `import "github.com/goforj/wire"`，W1「build-time only」
+      当场失效。**规避方式**：`wire.go` 只放注入器，provider 直接列在
+      `wire.Build(...)` 里，分组语义交给 `wiring.go` 的 `Catalog`。
+      详见 `internal/wiring/GENERATE.md`。
+
+- [x] **判据口径更正**：W1 原写「依赖闭包（`go list -deps ./...`）不含 wire」，
+      该判据**不可满足也不可靠** —— Go 解析依赖时会把所有构建配置（含被 build
+      tag 排除的文件）一并计入。已改为三层判据：源码级（parser 查真实 import）、
+      产物级（wire_gen.go 零 wire）、链接级（`go version -m` 查二进制模块清单）。
+
+## 四、与本轮其它决策的交叉影响
 
 - [ ] **`examples/micro/srv` 已删除**（网格清单部署的 demo-srv，拆分前单域旧样例，
       含 3 个单测）。受影响的既有条目：tasks.md 3.7（E3 回归）、4.9–4.11

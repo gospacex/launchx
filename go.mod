@@ -73,6 +73,7 @@ require (
 	github.com/go-redsync/redsync/v4 v4.11.0 // indirect
 	github.com/go-sql-driver/mysql v1.7.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+	github.com/goforj/wire v1.2.0
 	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
 	github.com/golang-sql/sqlexp v0.1.0 // indirect
 	github.com/golang/mock v1.6.0 // indirect
@@ -191,7 +192,6 @@ replace (
 	github.com/gospacex/coordx/k8s_configmap => ../coordx/k8s_configmap
 	github.com/gospacex/coordx/nacos => ../coordx/nacos
 	github.com/gospacex/dbx => ../dbx
-	github.com/gospacex/hubx => ../hubx
 	github.com/gospacex/kvx => ../kvx
 	github.com/gospacex/kvx/redis => ../kvx/redis
 	github.com/gospacex/lockx => ../lockx
@@ -214,3 +214,5 @@ replace github.com/gospacex/searchx => ../searchx
 replace github.com/gospacex/searchx/elasticsearch => ../searchx/elasticsearch
 
 replace github.com/gospacex/mongodbx => ../mongodbx
+
+replace github.com/gospacex/hubx => ../hubx

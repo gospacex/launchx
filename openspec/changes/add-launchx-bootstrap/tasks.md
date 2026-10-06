@@ -68,13 +68,13 @@
 `go install github.com/goforj/wire/cmd/wire@<固定 tag>`（MUST 固定版本，不用 `@latest`）。
 硬纪律：**MUST NOT 执行 `go mod tidy`**（go.mod 与 replace 块手工维护）。
 
-- [ ] 5.1 依赖切换：launchx 与 hubx 的 go.mod 以 `go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>` 迁到维护分支（既有 wire 代码无需改动）；若 launchx 侧为新增，则手工补 require + replace，禁止 tidy（对应验收案例 W1）
-- [ ] 5.2 具名句柄类型改造（**本次最大成本点**）：为 `component.Env` 中弱类型句柄（至少 `DB any`）引入具名类型，使 wire 可按 type identity 求解；对外暴露形态保持向后兼容（对应验收案例 W5）
-- [ ] 5.3 实现 16 个 SDK 的 provider 与 ProviderSet：`cachex / configx / coordx / dbx / hubx / kvx / lockx / logx / mongodbx / mqx / objectx / otelx / rpcx / searchx / vectorx / webx`；按分类表归属（地基 3 → `internal/pipeline`；可选组件 10 → `internal/component`；形态产物 2 → `internal/mode`；`hubx` → 客户端注册表）；`objectx` / `vectorx` 登记在册但 presence-based 未命中即零值（对应验收案例 W2）
-- [ ] 5.4 运行时裁决留在 provider 内：presence-based 启用、`trace.on.<name>` 只控入链不控构造、`strict.<name>` 失败姿态三者 MUST 仍在 provider 内读 `Env` 裁决；provider 允许返回零值 + `nil` error 表示未构造/已降级（对应验收案例 W3/W4）
-- [ ] 5.5 注入器与生成：补 `//go:build wireinject` 的 injector（含 `wire.Build(...)`），执行 `wire gen ./...` 产出 `wire_gen.go` 并入库；wire cleanup 仅用于构造中途失败回滚，MUST NOT 取代 `Env.AddStop` 退出链（对应验收案例 W6/W7）
-- [ ] 5.6 hubx 侧接线：给 `hubx/wire.go` 的 `InitializeApp` 补 `wire.Build(...)`（现为未接线的占位）并生成 `wire_gen.go`，其中须含对 `Registry` 与 `configx.ViperLoader` 的显式构造调用（对应验收案例 W8）
-- [ ] 5.7 单测：build-time 依赖断言——不带 `wireinject` 标签构建后依赖闭包不含 `goforj/wire` 与 `google/wire`（W1）；`wire_gen.go` 重新生成后 `git diff --exit-code` 为空（W7）
-- [ ] 5.8 回归单测（红线不回归）：`trace.on.db=false` 时 `App.DB` 仍非 nil（W3，D1 不回归）；Setup 失败路径下 A3 事件序列一字不改（W6）；依赖面核对 3.14 结论仍成立——launchx go.mod 不直接 require `gorm.io/gorm`（W5）
-- [ ] 5.9 反向断言：`wire` 不承载 presence-based（W4）——若把可选组件有无编进图需 2^10 个注入器，以单测断言「组件层仍按 `Env` 运行时裁决」锁死该边界
-- [ ] 5.10 验收案例对齐核对：W1–W8 每个编号在 `specs/dependency-injection/spec.md` 的 Scenario 与本文件验证项双向可追溯
+- [x] 5.1 依赖切换：launchx 与 hubx 的 go.mod 以 `go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>` 迁到维护分支（既有 wire 代码无需改动）；若 launchx 侧为新增，则手工补 require + replace，禁止 tidy（对应验收案例 W1） <!-- 已实现: go.mod 加 goforj/wire v1.2.0（require，非 tidy）；hubx 的 replace 保留（dbx 需要它传递解析） -->
+- [x] 5.2 具名句柄类型改造（**本次最大成本点**）：为 `component.Env` 中弱类型句柄（至少 `DB any`）引入具名类型，使 wire 可按 type identity 求解；对外暴露形态保持向后兼容（对应验收案例 W5） <!-- 已实现: internal/wiring 的具名句柄类型（DBHandle 等 15 个），Env.DB 仍为 any，App.DB() 调用方断言不变 -->
+- [x] 5.3 实现 16 个 SDK 的 provider 与 ProviderSet：`cachex / configx / coordx / dbx / hubx / kvx / lockx / logx / mongodbx / mqx / objectx / otelx / rpcx / searchx / vectorx / webx`；按分类表归属（地基 3 → `internal/pipeline`；可选组件 10 → `internal/component`；形态产物 2 → `internal/mode`；`hubx` → 客户端注册表）；`objectx` / `vectorx` 登记在册但 presence-based 未命中即零值（对应验收案例 W2） <!-- 已实现: 15 个 SDK provider（hubx 按裁决移出）；objectx/vectorx 登记在册默认零值，未新增模块依赖（依赖面代价过高） -->
+- [x] 5.4 运行时裁决留在 provider 内：presence-based 启用、`trace.on.<name>` 只控入链不控构造、`strict.<name>` 失败姿态三者 MUST 仍在 provider 内读 `Env` 裁决；provider 允许返回零值 + `nil` error 表示未构造/已降级（对应验收案例 W3/W4） <!-- 已实现: presence/trace.on/strict 三裁决均在 provider 内读 Env；presence 未命中返回零值+nil -->
+- [x] 5.5 注入器与生成：补 `//go:build wireinject` 的 injector（含 `wire.Build(...)`），执行 `wire gen ./...` 产出 `wire_gen.go` 并入库；wire cleanup 仅用于构造中途失败回滚，MUST NOT 取代 `Env.AddStop` 退出链（对应验收案例 W6/W7） <!-- 已实现: wire.go(wireinject) 只放注入器，wire gen 产出 wire_gen.go 入库；cleanup 未使用，退出链仍 Env.AddStop 独占 -->
+- [ ] 5.6 hubx 侧接线：给 `hubx/wire.go` 的 `InitializeApp` 补 `wire.Build(...)`（现为未接线的占位）并生成 `wire_gen.go`，其中须含对 `Registry` 与 `configx.ViperLoader` 的显式构造调用（对应验收案例 W8） <!-- 未实现（按用户裁决移出）: hubx 不再纳入注册面。hubx 已演进到类型化注册表，且其 wire.go 引用的 configx/hubx 包与 configx.ViperLoader 类型均已不存在，加 wireinject 标签根本编不过 -->
+- [x] 5.7 单测：build-time 依赖断言——不带 `wireinject` 标签构建后依赖闭包不含 `goforj/wire` 与 `google/wire`（W1）；`wire_gen.go` 重新生成后 `git diff --exit-code` 为空（W7） <!-- 已实现: TestW1WireIsBuildTimeOnly（源码级+产物级+链接级三层，已变异验证）；W7 两次生成 shasum 一致 -->
+- [x] 5.8 回归单测（红线不回归）：`trace.on.db=false` 时 `App.DB` 仍非 nil（W3，D1 不回归）；Setup 失败路径下 A3 事件序列一字不改（W6）；依赖面核对 3.14 结论仍成立——launchx go.mod 不直接 require `gorm.io/gorm`（W5） <!-- 已实现: W3/W5 断言通过；W6 依赖 internal/pipeline 既有 A3 断言仍全绿（本次未改退出链） -->
+- [x] 5.9 反向断言：`wire` 不承载 presence-based（W4）——若把可选组件有无编进图需 2^10 个注入器，以单测断言「组件层仍按 `Env` 运行时裁决」锁死该边界 <!-- 已实现: TestW4PresenceIsRuntimeAdjudication + TestW4StrictControlsFailurePosture -->
+- [ ] 5.10 验收案例对齐核对：W1–W8 每个编号在 `specs/dependency-injection/spec.md` 的 Scenario 与本文件验证项双向可追溯 <!-- 部分: W1–W7 已双向对齐；W8 随 hubx 移出 -->

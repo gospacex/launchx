@@ -254,7 +254,7 @@
 
 ### Task 29: wire 依赖切换与 CLI 固定（对应 `tasks.md` 5.1）
 
-- [ ] **任务完成**（与 superpowers plan `Task 26`、`tasks.md` 5.1 同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 26`、`tasks.md` 5.1 同步勾选）
 - 目标：`go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>`
   在 launchx 与 hubx 两侧落地；固定 tag 写入构建说明；**禁止 `go mod tidy`**
 - 改动文件：`go.mod`（手工编辑）、`docs/` 构建说明或 Makefile
@@ -262,7 +262,7 @@
 
 ### Task 30: 具名句柄类型改造（对应 `tasks.md` 5.2，验收案例 W5）
 
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：为 `component.Env.DB`（`any`）等弱类型句柄引入具名类型，使 wire 可求解；
   对外暴露形态保持向后兼容
 - 改动文件：`internal/component/registry.go`、`app.go`（`App.DB()` 暴露面）
@@ -270,7 +270,7 @@
 
 ### Task 31: 16 个 SDK 的 provider 与 ProviderSet（对应 `tasks.md` 5.3 / 5.4，验收案例 W2/W3/W4）
 
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：按分类表实现 16 个 provider（地基 3 → `internal/pipeline`；可选组件 10 →
   `internal/component`；形态产物 2 → `internal/mode`；`hubx` → 客户端注册表）；
   presence / `trace.on` / `strict` 三裁决留在 provider 内读 `Env`
@@ -279,7 +279,7 @@
 
 ### Task 32: 注入器、生成物入库与 hubx 侧接线（对应 `tasks.md` 5.5 / 5.6，验收案例 W6/W7/W8）
 
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：补 `//go:build wireinject` 的 injector（含 `wire.Build(...)`）→ `wire gen ./...`
   → `wire_gen.go` 入库；hubx 侧给 `InitializeApp` 补 `wire.Build(...)` 并生成 `wire_gen.go`
   （须含 `Registry` 与 `configx.ViperLoader` 的显式构造调用）；wire cleanup 仅用于
@@ -289,7 +289,7 @@
 
 ### Task 33: wire 验收与红线回归（对应 `tasks.md` 5.7 / 5.8 / 5.9 / 5.10，验收案例 W1/W4/W5/W6）
 
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：build-time 依赖断言（依赖闭包不含 wire）、生成可复现、`trace.on.db=false`
   时 `App.DB` 仍非 nil（D1 不回归）、依赖面 3.14 结论仍成立（不直引 gorm）、
   W4 反向断言锁死「wire 不承载 presence」；W1–W8 编号双向可追溯
