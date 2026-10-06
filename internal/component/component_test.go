@@ -1,6 +1,7 @@
 package component
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -41,7 +42,29 @@ type warnLogger struct {
 }
 
 func (w *warnLogger) Warn(msg string, fields ...logx.Field) {
-	w.warns = append(w.warns, msg+" "+fmt.Sprint(fields))
+	var b strings.Builder
+	b.WriteString(msg)
+	for _, f := range fields {
+		b.WriteString(" " + f.Key + "=" + fieldValue(f))
+	}
+	w.warns = append(w.warns, b.String())
+}
+
+// fieldValue 取单个 logx.Field 的可读值。
+//
+// logx.Field 就是 zap.Field，值分散在 String / Interface / Integer 三个域里，
+// 直接 fmt.Sprint 出来是 "{component 15 0 db <nil>}" 这种结构体字面量：
+// 断言无从区分"哪个字段等于什么"，于是"Warn 含 db"会被 hint 里的
+// "strict.db" 蒙混过关 —— 降级告警到底点名了哪个组件，等于没验。
+func fieldValue(f logx.Field) string {
+	switch {
+	case f.String != "":
+		return f.String
+	case f.Interface != nil:
+		return fmt.Sprint(f.Interface)
+	default:
+		return fmt.Sprint(f.Integer)
+	}
 }
 func (w *warnLogger) Error(msg string, fields ...logx.Field) {}
 func (w *warnLogger) joined() string                         { return strings.Join(w.warns, "\n") }
@@ -281,6 +304,113 @@ xmiddleware:
 	}
 	if !strings.Contains(w.joined(), "超卖") {
 		t.Fatalf("warn must carry consequence, got: %q", w.joined())
+	}
+}
+
+// ===== 3.3 验收案例 D1 / D2 三组断言（plan Task 14）=====
+//
+// 计划里的 MountAll / App.DB / TraceOn() 在真实实现里叫 Mount / Env.DB /
+// TraceOnOf：component 包不回指 launchx 根包（避免 import 环），也没有
+// MountAll 这个入口（挂载顺序由调用方传入）。断言按真实 API 落地。
+
+// errFakeDB 是 fake Builder 注入的固定根因哨兵：用来证明 strict 即退分支
+// 经 degrade 的 %w 包装后仍能被 errors.Is 判定到真正的失败原因。
+//
+// 为什么用 fake 而不是真连一次坏 MySQL：真连的失败原因由驱动决定
+// （dial tcp / no such host / auth 都可能），err.Error() 含 "init db" 这条
+// 尚可断言，"errors.Is 到根因"这条根本无从写起 —— 没有稳定哨兵可判。
+var errFakeDB = errors.New("fake db driver: connection refused")
+
+// withFakeDB 用"必定失败于固定哨兵"的 fake Builder 临时替换真实 db 构造器。
+// 被测对象是 degrade 的裁决分支（降级/即退），与 dbx 驱动无关。
+func withFakeDB(t *testing.T) {
+	t.Helper()
+	real := Lookup("db")
+	if real == nil {
+		t.Fatal("db builder not registered")
+	}
+	Register("db", func(e *Env) error { return degrade(e, "db", ConsequenceDB, errFakeDB) })
+	t.Cleanup(func() { Register("db", real) })
+}
+
+// D2 降级分支：strict 缺省 → Mount 返回 nil、DB 保持 nil、
+// 且必须留下一条点名 component=db 且带后果文案的 Warn（不许静默降级）。
+func TestMountDegradesWhenStrictAbsent(t *testing.T) {
+	withFakeDB(t)
+	env, w := newTestEnv(t, dbYAML) // Strict 全空：strict.db 缺省
+	if err := Mount(env, []string{"db"}); err != nil {
+		t.Fatalf("strict 缺省必须降级（返回 nil error），got: %v", err)
+	}
+	if env.DB != nil {
+		t.Fatal("降级后 DB 必须保持 nil（句柄为零值，不是半初始化对象）")
+	}
+	got := w.joined()
+	if !strings.Contains(got, "component=db") {
+		t.Fatalf("Warn 必须点名 component=db，got: %q", got)
+	}
+	if !strings.Contains(got, ConsequenceDB) {
+		t.Fatalf("Warn 必须带降级后果文案 %q，got: %q", ConsequenceDB, got)
+	}
+	if !strings.Contains(got, "strict.db") {
+		t.Fatalf("Warn 必须给出即退开关提示，got: %q", got)
+	}
+}
+
+// D2 即退分支：strict.db=true → Mount 返回 error（不许返回 nil），
+// 文案含 "init db"，且 %w 包装链可被 errors.Is 判定到根因。
+func TestMountFailsFastWhenStrictTrue(t *testing.T) {
+	withFakeDB(t)
+	env, w := newTestEnv(t, dbYAML)
+	env.Strict["db"] = true
+	err := Mount(env, []string{"db"})
+	if err == nil {
+		t.Fatal("strict.db=true 必须即退：不允许返回 nil")
+	}
+	if !strings.Contains(err.Error(), "init db") {
+		t.Fatalf("error 必须带 \"init db\" 上下文，got: %v", err)
+	}
+	if !errors.Is(err, errFakeDB) {
+		t.Fatalf("error 必须保留 fmt.Errorf 的 %%w 包装链（errors.Is 可判到根因），got: %v", err)
+	}
+	if w.joined() != "" {
+		t.Fatalf("即退分支不该再打降级 Warn（启动会失败，降级文案是误导），got: %q", w.joined())
+	}
+}
+
+// D1 门控：trace.on.mq=false → mq 构造器**照旧被调用**（构造发生）、MQ 非 nil，
+// 只是入链判定为 false。门控关了就不构造是历史 bug（outbox 静默堆积）。
+//
+// 这里在真实构造器外面套一层 spy：只断言"是否被调用 + 看到的门控值"，
+// 产物仍由真实构造器产出（避免为 mqx.Producer 造一整套假实现）。
+func TestTraceGateDoesNotSkipConstruction(t *testing.T) {
+	env, _ := newTestEnv(t, mqYAML)
+	env.TraceOn["mq"] = false // 门控关
+	if env.TraceOnOf("mq") {
+		t.Fatal("前置条件：门控必须处于关闭态")
+	}
+	real := Lookup("mq")
+	if real == nil {
+		t.Fatal("mq builder not registered")
+	}
+	var called, sawTraceOn bool
+	Register("mq", func(e *Env) error {
+		called = true
+		sawTraceOn = traceOn(e, "mq")
+		return real(e)
+	})
+	t.Cleanup(func() { Register("mq", real) })
+
+	if err := Mount(env, []string{"mq"}); err != nil {
+		t.Fatalf("trace.on.mq=false 时 mq 仍必须构造成功，got: %v", err)
+	}
+	if !called {
+		t.Fatal("D1: trace.on.mq=false 只关入链，构造器必须照旧被调用")
+	}
+	if sawTraceOn {
+		t.Fatal("D1: 门控关闭时组件内看到的入链开关必须为 false")
+	}
+	if env.MQ == nil {
+		t.Fatal("D1: trace.on.mq=false 时 App.MQ 必须非 nil（构造发生，仅入链关闭）")
 	}
 }
 
