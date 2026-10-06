@@ -276,7 +276,10 @@ func (s *OrderService) withUserLock(ctx context.Context, userID int64) (func(), 
 		return noop, &c
 	}
 	return func() {
-		if uErr := lk.Unlock(context.Background()); uErr != nil {
+		// 解锁必须用请求 ctx（闭包捕获的外层变量）：这里传过 context.Background()，
+		// lockx 的 release span 因此失去父节点，每次解锁都在 Jaeger 上另起一根
+		// 孤儿单 span trace。解锁发生在请求生命周期内，ctx 没有被取消的风险。
+		if uErr := lk.Unlock(ctx); uErr != nil {
 			// 解锁失败不阻断业务：锁有 TTL，最坏情况是短暂阻塞而非死锁
 			s.logger.WarnContext(ctx, "order: unlock failed (lock will expire by ttl)", logx.Err(uErr))
 		}

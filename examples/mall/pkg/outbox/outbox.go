@@ -158,7 +158,7 @@ func (r *Runner) loop() {
 func (r *Runner) FlushOnce() []uint64 {
 	// 空转轮询用免追踪 ctx：轮询查询没有上游请求，若产 span 会每 3s 另起一根
 	// 孤儿单 span trace（db.query），Jaeger 列表被噪声淹没。只有真拉到待发
-	// 事件时才换回可追踪 ctx，让本轮投递以一个批次根 trace 入链。
+	// 事件时才恢复可追踪 —— 投递与簿记分别用什么 ctx 见下方 txCtx / bookCtx。
 	ctx := orm.WithoutTracing(context.Background())
 	pending, err := r.pending(ctx, r.cfg.BatchLimit)
 	if err != nil {
@@ -168,21 +168,29 @@ func (r *Runner) FlushOnce() []uint64 {
 	if len(pending) == 0 {
 		return nil
 	}
-	ctx = context.Background()
+	// 投递用可追踪 ctx（txCtx）：sendOne 内有 traceparent 时会 Extract 并把
+	// send/kafka.send 挂回原下单链 —— 这是 outbox 与业务 trace 的唯一汇合点。
+	// 簿记回写（markSent / markRetry / abandon）用免追踪 ctx（bookCtx）：它们是
+	// outbox 表的内部状态迁移，不挂任何父 span，放出来只会各自成为根 —— 发送
+	// 成功时是一根孤零零的 db.update，失败重试时更是每轮一根。空转免追踪防的
+	// 是「没事件也产 span」，这里防的是「事件发完了，簿记痕迹在 Jaeger 上成了
+	// 主角」。
+	txCtx := context.Background()
+	bookCtx := orm.WithoutTracing(context.Background())
 	sent, retried := make([]uint64, 0, len(pending)), make([]uint64, 0)
 	var failed []Event
 	for i := range pending {
 		ev := &pending[i]
 		if ev.Payload == "" {
 			// 事件体为空（上游 marshal 失败已记 warn）：直接放弃，不占用重试配额
-			r.logger.WarnContext(ctx, "outbox: empty payload, abandoning", logx.Int("id", int(ev.ID)))
-			if err := r.abandon(ctx, []uint64{ev.ID}); err != nil {
-				r.logger.ErrorContext(ctx, "outbox: abandon empty-payload event failed", logx.Err(err))
+			r.logger.WarnContext(txCtx, "outbox: empty payload, abandoning", logx.Int("id", int(ev.ID)))
+			if err := r.abandon(bookCtx, []uint64{ev.ID}); err != nil {
+				r.logger.ErrorContext(txCtx, "outbox: abandon empty-payload event failed", logx.Err(err))
 			}
 			continue
 		}
-		if err := r.sendOne(ctx, ev); err != nil {
-			r.logger.WarnContext(ctx, "outbox: send failed, will retry",
+		if err := r.sendOne(txCtx, ev); err != nil {
+			r.logger.WarnContext(txCtx, "outbox: send failed, will retry",
 				logx.Int("id", int(ev.ID)), logx.Err(err))
 			retried = append(retried, ev.ID)
 			failed = append(failed, *ev)
@@ -191,24 +199,24 @@ func (r *Runner) FlushOnce() []uint64 {
 		sent = append(sent, ev.ID)
 	}
 	if len(sent) > 0 {
-		if err := r.markSent(ctx, sent); err != nil {
-			r.logger.ErrorContext(ctx, "outbox: mark sent failed", logx.Err(err))
+		if err := r.markSent(bookCtx, sent); err != nil {
+			r.logger.ErrorContext(txCtx, "outbox: mark sent failed", logx.Err(err))
 		}
 	}
 	if len(retried) == 0 {
 		return nil
 	}
-	if err := r.markRetry(ctx, retried); err != nil {
-		r.logger.ErrorContext(ctx, "outbox: mark retry failed", logx.Err(err))
+	if err := r.markRetry(bookCtx, retried); err != nil {
+		r.logger.ErrorContext(txCtx, "outbox: mark retry failed", logx.Err(err))
 		return nil
 	}
 	abandoned := AbandonCandidates(failed, r.cfg.RetryCap)
 	if len(abandoned) > 0 {
-		if err := r.abandon(ctx, abandoned); err != nil {
-			r.logger.ErrorContext(ctx, "outbox: abandon failed", logx.Err(err))
+		if err := r.abandon(bookCtx, abandoned); err != nil {
+			r.logger.ErrorContext(txCtx, "outbox: abandon failed", logx.Err(err))
 			return nil
 		}
-		r.logger.WarnContext(ctx, "outbox: retry cap reached, abandoned for manual reconcile",
+		r.logger.WarnContext(txCtx, "outbox: retry cap reached, abandoned for manual reconcile",
 			logx.Int("count", len(abandoned)))
 	}
 	return abandoned

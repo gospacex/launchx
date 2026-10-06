@@ -296,7 +296,9 @@ func (s *PointsService) withUserLock(ctx context.Context, userID int64) (func(),
 		return noop, &c
 	}
 	return func() {
-		if uErr := lk.Unlock(context.Background()); uErr != nil {
+		// 解锁必须用请求 ctx：传 Background 会让 release span 失去父节点，
+		// 每次解锁在 Jaeger 上另起一根孤儿单 span trace（见 order 域同款注释）。
+		if uErr := lk.Unlock(ctx); uErr != nil {
 			s.logger.WarnContext(ctx, "points: unlock failed (lock will expire by ttl)", logx.Err(uErr))
 		}
 	}, nil

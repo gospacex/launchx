@@ -6,7 +6,24 @@
 --
 -- 用法（本机 compose 里的 MySQL，账号 mall_rw）：
 --   mysql -h127.0.0.1 -P3306 -uroot -p < examples/mall/scripts/schema.sql
+--
+-- 本机没有 mysql 客户端时走容器内执行（compose 的 mysql 服务）：
+--   docker exec -i mysql mysql -uroot -prootpass < examples/mall/scripts/schema.sql
+-- 验证：docker exec mysql mysql -umall_rw -phubx123 -e "SHOW DATABASES"
 -- ============================================================
+
+-- ---------------------------- 应用账号 ----------------------------
+-- 四服的 DSN 一律用 mall_rw（见各 srv-*/config.yaml），不复用 root：
+-- 示例要演示的是"应用只拿到自己库的读写权"，用 root 跑通等于把权限边界
+-- 演示没了。幂等：MySQL 8 没有 CREATE USER IF NOT EXISTS，故先 DROP 再建，
+-- 重跑本脚本不会报 "user already exists"。
+DROP USER IF EXISTS 'mall_rw'@'%';
+CREATE USER 'mall_rw'@'%' IDENTIFIED BY 'hubx123';
+GRANT SELECT, INSERT, UPDATE, DELETE ON product_db.* TO 'mall_rw'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON order_db.*  TO 'mall_rw'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON stock_db.*  TO 'mall_rw'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON points_db.* TO 'mall_rw'@'%';
+FLUSH PRIVILEGES;
 
 -- ---------------------------- 商品域 ----------------------------
 CREATE DATABASE IF NOT EXISTS product_db DEFAULT CHARSET utf8mb4;
@@ -236,6 +253,11 @@ CREATE TABLE IF NOT EXISTS outbox (
 -- ---------------------------- 种子数据（可选） ----------------------------
 USE product_db;
 INSERT IGNORE INTO categories (id, name, parent_id) VALUES (1, '生鲜', 0), (2, '数码', 0), (3, '图书', 0);
+-- 商品种子与 stock_db.stocks 的 product_id 对齐（1 号有库存），否则 GetProduct
+-- 恒 not found —— 演示链路第一步就断在数据上，而不是任何组件上。
+INSERT IGNORE INTO products (id, title, price, status, category_id) VALUES
+  (1, '高山娃娃菜（2颗装）', 990,  1, 1),
+  (2, '赣南脐橙（5斤）',     3990, 1, 1);
 
 USE stock_db;
 INSERT IGNORE INTO stocks (product_id, total, available, reserved) VALUES (1, 1000, 1000, 0);

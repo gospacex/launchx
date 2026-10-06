@@ -74,8 +74,12 @@ xmiddleware:
         brokers:
           - "127.0.0.1:9092"
         enable_trace: true
-        producer:
+        # 键位口径（mqx 现状，实测）：producer 的目标 topic 读的是 consumer.topic，
+        # 配 producer.topic 不生效（发送时 topic 为空串，报 Unknown Topic Or
+        # Partition）。业务 Message 侧不再自带 topic（kafka-go both-specified 红线）。
+        consumer:
           topic: stock.reserved.v1
+        producer:
           batch_size: 100
           batch_timeout: 10ms
           required_acks: -1   # sarama WaitForAll
