@@ -65,8 +65,11 @@ func (o *Order) Publish(ctx context.Context, key string, payload []byte) error {
 	// 注入走 launchx.Inject（传播器由 telemetry 步骤注册），业务侧不裸调 otel 全局。
 	launchx.Inject(ctx, propagation.HeaderCarrier(headers))
 
+	// Topic 刻意留空：producer 由 xmiddleware.mqx 配的目标 topic 构造（writer 自带
+	// topic），kafka-go 不接受 writer 与 message 同时指定 topic
+	// ——2026-10-05 实测报 "Topic must not be specified for both Writer and Message"。
+	// 目标 topic 进 span 属性即可检索，不必写进消息体。
 	msg := &mqx.Message{
-		Topic:   o.topic,
 		Key:     key,
 		Value:   payload,
 		Headers: flatten(headers),

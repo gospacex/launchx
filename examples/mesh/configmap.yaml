@@ -111,7 +111,7 @@ data:
       endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
       on:
         db: true
-        cache: true
+        kv: true
         mq: true
         registry: true
     logx:
@@ -134,14 +134,17 @@ data:
             conn_max_idle_time: 1m
             tracing:
               enabled: true
-      cachex:
+      # ----- kvx：限流计数（与 examples/micro/srv/config.yaml 同源）-----
+      # srv 除限流外不再使用缓存：cachex 无原子 Incr，计数会被并发读-改-写覆盖
+      # 成低估，故整段替换为 kvx。
+      kvx:
         driver: redis
         enable_trace: true
         instances:
           demo-srv:
             addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
             db: 0
-            pool_size: 50
+            pool_size: 30
       mqx:
         driver: kafka
         instances:

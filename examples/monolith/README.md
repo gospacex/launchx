@@ -15,11 +15,18 @@ a.Run()                                       // 3. 起服务并托管退出
 ```
 examples/monolith/
 ├── cmd/main.go                  # 50 行：Bootstrap → OnSetup → Run
-├── app/setup.go                 # 装配层：取 DB/引擎句柄 → 构造三层 → 挂路由
+├── app/setup.go                 # 装配层：取各组件句柄 → 构造分层 → 挂中间件与路由
 │   └── routes.go                # 唯一路由注册源
+├── internal/middleware/         # 业务中间件：鉴权（经缓存查凭据）+ 限流（KV 计数）
 ├── internal/handler/order.go    # HTTP 层：绑参 + 状态码，自开 handler.* span
 ├── internal/service/order.go    # 业务层：校验 + 编排，自开 service.* span
 ├── internal/repository/order.go # 数据层：单表/连表/事务，自开 repository.* span
+├── internal/cache/order.go      # 缓存适配：cache.* span 包住 cachex（下挂 db.redis.*）
+│   └── token.go                 # 令牌存储（同一 cachex 实例，供鉴权中间件查凭据）
+├── internal/ratelimit/counter.go # 限流计数：窗口自增交给 kvx 的原子 Incr
+├── internal/messaging/order.go  # 消息适配：messaging.* span + traceparent 注入消息头
+├── internal/search/order.go     # 检索适配：search.* span 包住 searchx（下挂 db.elasticsearch.*）
+├── internal/docs/order.go       # 文档库适配：docs.* span 包住 mongodbx（下挂 db.mongodb.*）
 ├── internal/model/order.go      # orders / order_items / users 三表模型
 ├── config.yaml                  # 唯一配置源（无任何地址硬编码）
 ├── scripts/bring-up.sh          # 建表 + 授权 + 种子（幂等）
@@ -58,16 +65,23 @@ go run ./cmd
 
 启动日志应出现 `service.mode=monolith`，且**不出现任何注册/deregister 日志**（单体不注册，验收陷阱第 11 条）。
 
-## 3. 四个接口
+## 3. 接口
 
-| 方法 | 路径 | 说明 | T13 落点 |
+每条链路都自带**两个业务中间件 span**（`middleware.RateLimit` 全局、
+`middleware.AuthToken` 仅 `/secure` 分组）——它们都有外部依赖（缓存计数 / 缓存查
+凭据），是验收矩阵里"必须入链"的项；webx 的 recovery / cors 属可豁免项，不埋点。
+
+| 方法 | 路径 | 说明 | 链路上可见的 span |
 |---|---|---|---|
-| POST | `/orders` | 建单：事务写 orders + order_items | 事务两条 INSERT 各自成 span |
-| GET | `/orders?limit=20` | 单表列表 | SELECT |
-| GET | `/orders/:order_no` | 单表单条 | SELECT |
-| GET | `/orders/:order_no/join` | **连表**：orders JOIN users | JOIN 语句单独成 span |
-| PUT | `/orders/:order_no` | 改状态（会回读一次） | UPDATE + SELECT |
-| DELETE | `/orders/:order_no` | 删主子数据 | DELETE × 2 |
+| POST | `/orders` | 建单：事务写 orders + order_items | `db.create` × 2 → `messaging.PublishOrder`+`messaging.kafka.send`、`search.IndexOrder`+`db.elasticsearch.index`、`docs.SaveSnapshot`+`db.mongodb.insert` |
+| GET | `/orders?limit=20` | 单表列表 | `db.query` |
+| GET | `/orders/search?q=` | **检索**（ES） | `search.SearchOrder` + `db.elasticsearch.search` |
+| GET | `/orders/:order_no` | 单表单条，**缓存 read-through** | `cache.GetOrder`+`db.redis.GET`、未命中则 `repository.Get`+`db.query`、回写 `cache.SetOrder`+`db.redis.SET` |
+| GET | `/orders/:order_no/join` | **连表**：orders JOIN users | JOIN 语句单独成 span（`db.query.text` 含 `join`） |
+| GET | `/orders/:order_no/snapshot` | **文档库**：读该单快照 | `docs.FindSnapshot` + `db.mongodb.find_one` |
+| GET | `/secure/orders`（需 `X-Token`） | **鉴权**入口 | `middleware.AuthToken` + `db.redis.GET` |
+| PUT | `/orders/:order_no` | 改状态（会回读一次 + 失效缓存） | `db.update` + `db.query` + `db.redis.DEL` |
+| DELETE | `/orders/:order_no` | 删主子数据（+ 失效缓存） | `db.delete` × 2 |
 
 ```bash
 NO=$(curl -s -XPOST localhost:8080/orders -H 'Content-Type: application/json' \
@@ -79,7 +93,16 @@ curl -s "localhost:8080/orders/$NO/join"       | jq .user_name    # "alice"（JO
 curl -s -XPUT "localhost:8080/orders/$NO" -H 'Content-Type: application/json' \
      -d '{"status":"paid"}'                    | jq .status       # "paid"
 curl -s -XDELETE "localhost:8080/orders/$NO"   | jq .deleted      # true
+
+# 组件链（缓存 / 检索 / 文档库 / 鉴权）
+curl -s "localhost:8080/orders/search?q=e2e"   | jq 'length'      # >= 1（ES 命中）
+curl -s "localhost:8080/orders/$NO/snapshot"   | jq .item         # "e2e"（Mongo 快照）
+curl -s -H 'X-Token: demo-token' "localhost:8080/secure/orders" | jq 'length'
+curl -s "localhost:8080/secure/orders"         # 401（无令牌）
 ```
+
+> 提示：本机有透明代理时，curl 本地服务要加 `--noproxy '*'`，否则拿到的是代理的
+> `upstream connect failed`，看起来像服务挂了。
 
 ## 4. 验收指引
 
@@ -109,7 +132,15 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-monolith&limit=1' > /tmp
 | 不做 | 原因 |
 |---|---|
 | 不注册（无 coordx/consul 段） | 单体形态不注册；出现 deregister 即串档（陷阱 11） |
-| 不用 MQ | 单体形态不需要；微服案例才涉及 outbox→kafka |
+| 不做 outbox 异步补发 | 异步投递会产生无父上下文的孤儿 trace（正是 T5 要抓的噪声）；demo 里同步投递，语义与 outbox 的"落库即事实、投递尽力"一致 |
+| 缓存/检索失败不返回错误 | 它们是加速件，坏了降级到打库；但会在 service span 上留 `degrade.*` 事件，不留痕等于把降级伪装成没数据 |
+
+### 已知环境约束（2026-10-05 实测）
+
+| 组件 | 现状 | 说明 |
+|---|---|---|
+| MQ | 需预建 topic | mqx 的 producer 目标 topic 读的是 `consumer.topic`（`producer.topic` 当前不生效）；且 topic 不会自动创建，缺 topic 时报 `Unknown Topic Or Partition` |
+| 检索 | 需 `legacy_cluster: true` | 本机 compose 的 `elasticsearch` 是 7.6.2，不返回 `X-Elastic-Product` 头，go-elasticsearch v8 会拒绝每一个响应。searchx 的 `legacy_cluster` 开关就是在响应上补齐该头（只补 2xx、不覆盖服务端已有的值）。升级到 ES ≥ 7.14 后应**删掉**这一行 |
 | 代码内不出现 `127.0.0.1` / `localhost` | 网格要复用同一份二进制，地址必须全部配置化（陷阱 14） |
 | 不做进程内 AutoMigrate | 表结构由 `scripts/bring-up.sh` 显式准备，避免隐式依赖 |
 | 不自建 DB 连接 | DB 句柄只能经 `a.DB().(*gorm.DB)` 取 |

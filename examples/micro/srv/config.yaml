@@ -11,7 +11,7 @@
 # ============================================================
 
 service:
-  name: demo-srv              # 服务名 = Jaeger 的 service，也是 dbx/cachex/mqx 的实例名
+  name: demo-srv              # 服务名 = Jaeger 的 service，也是 dbx/kvx/mqx 的实例名
   mode: srv                   # 四档之一：monolith / bff / srv / gateway
   addr: "127.0.0.1:9013"      # rpcx(kitex) 监听地址，沿用 micro_apps 原 srv-order 端口
   self:
@@ -26,7 +26,7 @@ trace:
   endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
   on:
     db: true
-    cache: true
+    kv: true
     mq: true
     registry: true
 
@@ -56,15 +56,20 @@ xmiddleware:
         tracing:
           enabled: true
 
-  # ----- cachex：限流计数器（读不到即放行，fail-open）-----
-  cachex:
+  # ----- kvx：限流计数（原子 Incr；读不到即放行，fail-open）-----
+  #
+  # 这一段原本是 cachex。cachex 没有原子自增，计数只能「读出来 +1 再写回」，
+  # 并发下计数丢失会把「限了却被打穿」伪装成「流量未超」，故迁到 kvx。
+  # demo-srv 除限流外不再使用缓存，所以是**替换**而非追加 —— 留一段配了却
+  # 没人用的组件，等于给自己埋一个「cache span 为什么消失了」的假故障。
+  kvx:
     driver: redis
     enable_trace: true
     instances:
       demo-srv:
         addr: "127.0.0.1:6379"
         db: 0
-        pool_size: 50
+        pool_size: 30
 
   # ----- mqx：outbox 补发用的生产者（topic order.completed.v1）-----
   mqx:

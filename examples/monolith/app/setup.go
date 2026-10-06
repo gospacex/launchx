@@ -17,6 +17,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/gospacex/logx"
+	"github.com/gospacex/traceflag"
 	"github.com/gospacex/webx"
 	"gorm.io/gorm"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/gospacex/launchx/examples/monolith/internal/handler"
 	"github.com/gospacex/launchx/examples/monolith/internal/messaging"
 	"github.com/gospacex/launchx/examples/monolith/internal/middleware"
+	"github.com/gospacex/launchx/examples/monolith/internal/ratelimit"
 	"github.com/gospacex/launchx/examples/monolith/internal/repository"
 	"github.com/gospacex/launchx/examples/monolith/internal/search"
 	"github.com/gospacex/launchx/examples/monolith/internal/service"
@@ -63,25 +65,37 @@ func Setup(a *launchx.App) error {
 
 	repo := repository.New(db, tr)
 
-	// ---------- 缓存（订单 read-through + 限流计数 + 令牌查询）----------
+	// ---------- 缓存（订单 read-through + 令牌查询）----------
 	var orderCache *cache.Order
 	var tokenStore *cache.TokenStore
-	var counter cache.Counter
 	if inst := a.Cache()[name]; inst != nil {
 		ttl := durationOrDefault(cfg.GetString("demo.cache_ttl"), time.Minute)
 		orderCache = cache.NewOrder(inst, ttl, tr)
 		store := cache.NewTokenStore(inst)
 		tokenStore = &store
-		counter = cache.NewCounter(inst)
 	} else {
 		logger.Warn("monolith: cache unavailable, running without read-through cache",
 			logx.String("hint", "check xmiddleware.cachex"))
 	}
 
+	// ---------- KV（限流计数，原子自增）----------
+	// 计数不与缓存共用句柄：cachex 没有 Incr，计数只能读-改-写，并发下会系统性
+	// 低估（详见 internal/ratelimit 包注释）。这里缺失的表现是**不限流**而非报错，
+	// 属于"看不见的失效"，故必须在装配期显式留痕。
+	var counter ratelimit.Counter
+	if inst := a.KV()[name]; inst != nil {
+		counter = ratelimit.NewCounter(inst)
+	} else {
+		logger.Warn("monolith: kv unavailable, rate limiter is disabled (fail-open)",
+			logx.String("hint", "check xmiddleware.kvx"))
+	}
+
 	// ---------- 消息（下单事件投递）----------
 	var orderEvents *messaging.Order
+	// 注意键是 consumer.topic：producer 的目标 topic 在 mqx 里就是从这个键出来的，
+	// producer.topic 看似更贴切但当前不生效（详见 config.yaml 该段的注释）。
 	if p := a.MQ(); p != nil {
-		orderEvents = messaging.NewOrder(p, cfg.GetString("xmiddleware.mqx.instances."+name+".producer.topic"), tr)
+		orderEvents = messaging.NewOrder(p, cfg.GetString("xmiddleware.mqx.instances."+name+".consumer.topic"), tr)
 	} else {
 		logger.Warn("monolith: mq unavailable, order events are not published",
 			logx.String("hint", "check xmiddleware.mqx"))
@@ -123,7 +137,16 @@ func Setup(a *launchx.App) error {
 		token := cfg.GetString("demo.auth_token")
 		// 播种演示令牌：让鉴权链路上的那次 cache 查询真的有东西可查。
 		// 生产里这活属于签发服务（含过期轮换），demo 里简化成启动即写一条。
-		if err := tokenStore.GrantToken(context.Background(), token, demoUserID, time.Hour); err != nil {
+		//
+		// 播种期间临时关掉 cachex 的埋点：这里没有请求上下文，留下的 SET span 会
+		// 成为一根孤儿单 span trace —— 正是 Jaeger 里最容易被读成"链路断了"的噪声。
+		// 关的是组件级开关，播完立刻还原为原值（不是写死 true，避免把"全局关埋点"
+		// 的部署悄悄打开）。
+		before := traceflag.EnabledFor("cachex")
+		traceflag.SetComponent("cachex", false)
+		err := tokenStore.GrantToken(context.Background(), token, demoUserID, time.Hour)
+		traceflag.SetComponent("cachex", before)
+		if err != nil {
 			logger.Warn("monolith: seed demo token failed", logx.Err(err))
 		}
 		tokMW := middleware.NewToken(tokenStore.Resolve, tr)
@@ -133,7 +156,9 @@ func Setup(a *launchx.App) error {
 	// ---------- 业务中间件：限流（全局）----------
 	// 有外部依赖的中间件必须在每条链上都出现 —— 挂全局是为了让每个 span 树
 	// 都能看到它，而不是只在个别端点上"演示一次"。
-	if cacheInst := a.Cache()[name]; cacheInst != nil {
+	// 门控换成 KV 就绪与否（不再是缓存可用）：计数数字段的实际依赖变了，
+	// 跟着旧门控走会出现"缓存挂了但计数其实还能用"的误判。
+	if counter.Ready() {
 		rl := middleware.NewRateLimit(counter, cfg.GetInt64("demo.rate_limit_per_min"), time.Minute, tr)
 		engine.Engine.Use(rl.Handle)
 	}

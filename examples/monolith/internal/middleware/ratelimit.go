@@ -13,11 +13,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Counter 窗口计数器（由缓存侧的实现注入）。
+// Counter 窗口计数器（由 internal/ratelimit 注入 kvx 实现）。
 //
 // 之所以用固定窗口而不是滑动窗口 / 令牌桶：限流是本 demo 的「有外部依赖的
 // 中间件」样本，策略精度不是重点，重点是可观测 —— 一次计数必须在链路上留下
-// 一次 cache 调用，否则这条链上就少了一个断口。
+// 一次 KV 调用（db.kvx.incr span），否则这条链上就少了一个断口。
 type Counter interface {
 	// Incr 对 key 自增并返回本窗口当前值；ttl 为窗口长度。
 	Incr(ctx context.Context, key string, ttl time.Duration) (int64, error)

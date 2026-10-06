@@ -29,6 +29,7 @@ trace:
   on:
     db: true
     cache: true
+    kv: true
     mq: true
     search: true
     mongodb: true
@@ -70,8 +71,9 @@ xmiddleware:
         tracing:
           enabled: true
 
-  # ----- cachex：订单缓存 + 鉴权令牌 + 限流计数 -----
-  # 用途三合一，每种用途都会各产一个 span，Jaeger 上按 operationName 可区分。
+  # ----- cachex：订单缓存 + 鉴权令牌 -----
+  # 限流计数已迁到下面的 kvx（需要原子自增），这里只留"可失效"的两类用法。
+  # 每种用途都会各产一个 span，Jaeger 上按 operationName 可区分。
   cachex:
     driver: redis
     enable_trace: true
@@ -81,7 +83,30 @@ xmiddleware:
         db: 0
         pool_size: 50
 
+  # ----- kvx：限流计数（单 IP 固定窗口，见 demo.rate_limit_per_min）-----
+  #
+  # 为什么不沿用 cachex：cachex.Cache 没有 Incr，计数只能 Get→+1→Set，
+  # 并发下两个请求读到同一旧值、写回同一新值（lost update），计数系统性低估
+  # —— 表现为"限流配了却照样被打穿"，且 Jaeger 上一切正常，最难自查。
+  # kvx.KVStore 的 Incr 走 Redis 原子自增，语义正对。
+  #
+  # 与 cachex 共用同一个 redis，但句柄分开：缓存被逐出是可接受的（回源即可），
+  # 计数被逐出等于限流静默失效，混用一个句柄就分不清这两种后果。
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      demo-monolith:
+        addr: "127.0.0.1:6379"
+        db: 1
+        pool_size: 30
+
   # ----- mqx：下单事件投递（topic order.completed.v1）-----
+  # ⚠️ 键位口径（mqx 现状，2026-10-05 实测）：producer 的目标 topic **不读
+  # producer.topic**，FillDefaults 只把 consumer.topic（缺省 default-topic）填给
+  # writer。再加一层 msg.Topic 会撞上 kafka-go 的
+  # "Topic must not be specified for both Writer and Message"。
+  # 故这里按 SDK 实际生效的键配 consumer.topic，业务侧 Message 不再带 topic。
   mqx:
     driver: kafka
     instances:
@@ -89,19 +114,24 @@ xmiddleware:
         brokers:
           - "127.0.0.1:9092"   # 本机 compose 现行端口（**不**用 srv-order 旧端口 19093）
         enable_trace: true
-        producer:
+        consumer:
           topic: order.completed.v1
+        producer:
           batch_size: 100
           batch_timeout: 10ms
           # acks=all：sarama RequiredAcks -1 = WaitForAll
           required_acks: -1
 
   # ----- searchx：订单检索（ES 索引见 demo.order_index）-----
+  # legacy_cluster: 本机 compose 的 ES 是 7.6.2，不返回 X-Elastic-Product 头，
+  # 官方 v8 客户端会拒绝每一个响应。打开后驱动在响应上补齐该头。
+  # 升级到 7.14+ 后应删掉这一行。
   searchx:
     driver: elasticsearch
     address:
       - "http://127.0.0.1:9200"
     enable_trace: true
+    legacy_cluster: true
 
   # ----- mongodbx：订单快照（集合见 demo.snapshot_collection）-----
   # 注意：mongodbx 没有实例级 enable_trace，Config 字段也没有 mapstructure tag，
