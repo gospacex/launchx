@@ -22,10 +22,10 @@ import (
 	"strconv"
 	"time"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/launchx"
 	"github.com/gospacex/logx"
 
 	orderpb "github.com/gospacex/launchx/examples/micro/srv/pkg/kitex_gen/order"
@@ -164,14 +164,17 @@ func (s *OrderService) CreateOrder(ctx context.Context, req *orderpb.CreateOrder
 }
 
 // traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
-// 仅当调用链开（traceOn）时经 otel 全局传播器注入（launchx telemetry 步骤注册
+// 仅当调用链开（traceOn）时经 launchx 的传播入口注入（telemetry 步骤注册
 // Composite(TraceContext, Baggage)；无活动 span 时为空串）。
+//
+// 走 launchx.Inject 而不是裸调 otel 全局：传播器由 telemetry 步骤注册，
+// 库侧入口是唯一被承认的取用路径，业务层不该直接依赖 otel 全局单例。
 func (s *OrderService) traceparentOf(ctx context.Context) string {
 	if !s.traceOn {
 		return ""
 	}
 	carrier := propagation.MapCarrier(map[string]string{})
-	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	launchx.Inject(ctx, carrier)
 	return carrier.Get(events.TraceHeaderKey)
 }
 

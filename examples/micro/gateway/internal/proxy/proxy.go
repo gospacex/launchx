@@ -2,6 +2,15 @@
 //
 // 本包不感知形态（不出现任何形态取值），也不自建注册中心客户端 —— 发现句柄
 // 由装配层从 App.Registry() 取来后注入。
+//
+// 出向请求由 otelhttp.Transport 包一层：它产一个标准的 HTTP CLIENT span
+// （http.method / http.url / http.status_code 齐语义），是转发链上唯一能回答
+// 「这一次出向到底花了多久、成功没有」的位置 —— 自造的 gateway.proxy.<route>
+// span 只能证明"网关收到了请求"，证明不了"上游那段"的情况。
+//
+// 版本取 v0.70.0：它早已由 grpc-gateway 间接带入现有依赖图（go mod graph 可查），
+// 且其 otel 下限是 v1.45.0（当前图 v1.46.0），因此**不需要升级任一 otel 组件**，
+// 拉它进来不会连带抬升任何既有依赖。
 package proxy
 
 import (
@@ -19,6 +28,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/gospacex/coordx"
 	"github.com/gospacex/launchx"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -108,16 +118,33 @@ type Proxy struct {
 	tracer   trace.Tracer
 }
 
-// New 构造转发器。tracer 为空时回落到 otel 全局（缺省即 noop）。
-func New(routes routing.Table, resolver *Resolver, tracer trace.Tracer) *Proxy {
-	if tracer == nil {
-		tracer = otel.Tracer(fallbackTracerName)
+// New 构造转发器。
+//
+// tp 是 launchx 装配好的 provider（App.Tracer().TracerProvider()）：otelhttp 的
+// CLIENT span 与自造的转发 span 必须同出一个 provider，否则前者落到全局 noop，
+// Jaeger 上只有 gateway.proxy.<route> 一根独苗。tp 为 nil 时回落到 otel 全局
+// （缺省即 noop）—— 埋点缺失可以降级，不能让转发本身起不来。
+func New(routes routing.Table, resolver *Resolver, tp trace.TracerProvider) *Proxy {
+	if tp == nil {
+		tp = otel.GetTracerProvider()
 	}
 	return &Proxy{
 		routes:   routes,
 		resolver: resolver,
-		client:   &http.Client{Timeout: defaultTimeout},
-		tracer:   tracer,
+		client: &http.Client{
+			Timeout: defaultTimeout,
+			// otelhttp 包的是 http.DefaultTransport，而不是自建裸 TCP transport：
+			// 连接复用、空闲连接回收、代理环境变量这些都留给标准实现，这一层
+			// 只叠加观测职责 —— 顺手自建 transport 会悄悄丢掉这些行为。
+			Transport: otelhttp.NewTransport(http.DefaultTransport,
+				otelhttp.WithTracerProvider(tp),
+				// 传播器必须与库侧同源：无论最终由谁写入 traceparent，写进去的
+				// 字段集合都得和 gateway → bff / srv 的其它出向一致，
+				// 否则下游会出现"有的请求能续上、有的续不上"的偶发断链。
+				otelhttp.WithPropagators(launchx.Propagator()),
+			),
+		},
+		tracer: tp.Tracer(fallbackTracerName),
 	}
 }
 
@@ -182,6 +209,11 @@ func (p *Proxy) forward(ctx context.Context, c *app.RequestContext, path, target
 	// 走 launchx.Inject 而非裸 otel 调用：注入入口统一在库侧，
 	// 传播器由 telemetry 步骤注册（Composite{TraceContext, Baggage}），
 	// 库侧换实现时本处无需改动。
+	//
+	// 与 otelhttp.Transport 的注入是**重复而非冲突**：transport 内部也用同一个
+	// propagator（见 New）注入同名字段，值是同一个 span context，写两遍结果一致。
+	// 仍保留这行显式调用，是为了让「跨进程续链发生在哪里」在代码里可读，不必依赖
+	// transport 的内部实现 —— 若哪天换掉 transport，续链不会跟着悄悄消失。
 	launchx.Inject(ctx, propagation.HeaderCarrier(req.Header))
 
 	resp, err := p.client.Do(req)

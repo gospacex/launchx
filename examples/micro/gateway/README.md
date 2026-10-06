@@ -106,9 +106,21 @@ span 层级（`gateway.proxy.*` 是 webx 入口根 span 的**子** span，不另
 ```
 GET /api/order/1001              (SERVER, webx 的 otel 中间件开的根 span)
 └── gateway.proxy.api            转发 span，internal/proxy/proxy.go
-    ↓ traceparent 经 HTTP 头注入
-    demo-bff  GET /order/1001  →  handler.GetOrder → downstream... → client.demo-srv...
+    └── HTTP GET                 出向 CLIENT span，otelhttp 包 http.Client 产出
+        ↓ traceparent 经 HTTP 头注入
+        demo-bff  GET /order/1001  →  handler.GetOrder → downstream... → client.demo-srv...
 ```
+
+出向那一层由 `otelhttp.NewTransport` 产出（`app/setup.go` 把 provider 交给
+`proxy.New`，`proxy` 用它包 `http.DefaultTransport`）：它带来带 HTTP 语义属性的
+CLIENT span（`http.method` / `http.url` / `http.status_code`），是整条链上唯一能
+回答「转出这一跳花了多久、成没成」的位置 —— 只有 `gateway.proxy.*` 时，
+Jaeger 上能看见"网关收到了请求"，看不见"上游那段到底怎样"。
+
+otelhttp 内部也会注入 traceparent（用同一份 `launchx.Propagator()`），与上面那行
+显式 `launchx.Inject` 是**重复而非冲突**：写的是同名字段、同一个 span context，
+结果一致。两处都保留是刻意的 —— 显式那行让"续链发生在哪里"在代码里可读，
+不必依赖 transport 的内部实现。
 
 ## 4. 运行
 

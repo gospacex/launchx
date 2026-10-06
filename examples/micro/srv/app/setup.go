@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/kitex/server"
+	"github.com/gospacex/logx"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx"
@@ -18,6 +19,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/srv/internal/repository"
 	srvrpc "github.com/gospacex/launchx/examples/micro/srv/internal/rpc"
 	"github.com/gospacex/launchx/examples/micro/srv/internal/service"
+	"github.com/gospacex/launchx/examples/micro/srv/internal/tracex"
 	orderrpc "github.com/gospacex/launchx/examples/micro/srv/pkg/kitex_gen/order/order"
 )
 
@@ -51,6 +53,14 @@ func Setup(a *launchx.App) error {
 
 	name := a.Config().GetString("service.name")
 	logger := a.Logger()
+
+	// 业务埋点的 provider 由装配层交接，业务分层因此不必去摸 otel 全局单例
+	// （分层边界要求它不认识框架）。telemetry 未启用时 provider 为 nil，
+	// tracex 会回落到 otel 全局（no-op），行为与之前一致。
+	if tp := a.Tracer(); tp != nil {
+		tracex.UseProvider(tp.TracerProvider())
+	}
+
 	repo := repository.NewOrderRepository(db)
 
 	// MQ 生产者经 App.MQ() 取。未装配（或降级成 nil）时 runner 会显式告警而不
@@ -67,10 +77,17 @@ func Setup(a *launchx.App) error {
 	}
 	svc := service.NewOrderService(repo, runner, nil, a.Config().GetBool("trace.enabled"), logger)
 
-	// 限流器只在缓存组件可用时启用（cache 为 nil 时 Allow 恒 true：fail-open）。
+	// 限流器只在 KV 组件可用时启用（kv 为 nil 时 Allow 恒 true：fail-open）。
+	// 计数走 kvx 而不是 cachex：自保护计数需要原子自增，cachex 只有 Get/Set，
+	// 并发下 counting is lost-updated（详见 middleware 包注释）。
 	var limiter *middleware.RateLimiter
-	if inst := a.Cache()[name]; inst != nil {
+	if inst := a.KV()[name]; inst != nil {
 		limiter = middleware.NewRateLimiter(inst, "rate:"+name, rateLimitPerMinute, rateLimitWindow)
+	} else if logger != nil {
+		// 门控为 nil 不报错，但必须留痕：静默不限流会把「限流组件没接上」
+		// 伪装成「流量没超」，事后无从分辨。
+		logger.Warn("srv: kv unavailable, rate limiter is disabled (fail-open)",
+			logx.String("hint", "check xmiddleware.kvx"))
 	}
 
 	a.SetRPCServer(orderrpc.NewServer(&srvrpc.Server{Svc: svc, Limiter: limiter}, opts...))

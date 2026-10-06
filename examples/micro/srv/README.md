@@ -16,12 +16,12 @@ a.Run()                                       // 3. 起 RPC 服务并托管退�
 ```
 examples/micro/srv/
 ├── cmd/main.go                   # 49 行：Bootstrap → OnSetup → Run
-├── app/setup.go                  # 装配层：取 DB/Cache/MQ 句柄 → 三层 → SetRPCServer
+├── app/setup.go                  # 装配层：取 DB/KV/MQ 句柄 → 三层 → SetRPCServer
 ├── internal/rpc/order.go         # RPC 桩：限流门控 + 分层 span（tracex.Start）
 ├── internal/service/order.go     # 业务层：校验 + 编排 + outbox 事件体
 │   └── outbox.go                 # 事务发件箱补发器（3s 轮询、重试上限转放弃）
 ├── internal/repository/order.go  # 数据层：JOIN/事务/outbox 状态迁移
-├── internal/middleware/ratelimit.go  # cachex 固定窗口限流（fail-open）
+├── internal/middleware/ratelimit.go  # kvx 固定窗口限流（原子 Incr + fail-open）
 ├── internal/tracex/tracex.go     # 极小埋点包（替换 micro_apps/infra/telemetry）
 ├── pkg/kitex_gen/                # kitex 生成桩（order/product/pay/user/coupon）
 ├── pkg/{codes,events}/           # 跨服务错误码与事件体（纯数据）

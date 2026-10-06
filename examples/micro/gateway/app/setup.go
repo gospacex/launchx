@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/gospacex/webx"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/launchx/examples/micro/gateway/internal/proxy"
@@ -44,8 +45,11 @@ func Setup(a *launchx.App) error {
 	}
 
 	// 发现句柄只能经 App.Registry() 取（demo 不自建注册中心客户端）。
-	// 句柄若不含 Discovery（coordx 的 consul Register 实现当前只有
-	// Register/Deregister），断言失败即走配置直连兜底。
+	//
+	// App.Registry() 返回的是 launchx 的包装句柄（registryHandle），它同时实现了
+	// Register 与 Discovery —— 底层 consul 驱动把注册/发现拆成了两个对象，但
+	// launchx 在 App 层把它们合成了一个句柄，故这里断言能成功。
+	// 只有注册中心未装配（段缺失或降级）时才为 nil，那时走配置直连兜底。
 	var finder proxy.Finder
 	if reg := a.Registry(); reg != nil {
 		finder, _ = reg.(proxy.Finder)
@@ -54,7 +58,15 @@ func Setup(a *launchx.App) error {
 		return cfg.GetString(upstreamKeyPrefix + upstream)
 	})
 
-	p := proxy.New(table, resolver, a.Tracer().TracerProvider().Tracer(tracerName))
+	// provider 而不是某个 tracer：出向要同时产两种 span —— 转发 span（业务自造）
+	// 与 HTTP CLIENT span（otelhttp 包 http.Client 产出），两者必须同出一个 provider，
+	// 否则 CLIENT span 会掉进全局 noop，链路上只剩一根"网关收到请求"的孤证。
+	// 未启用 telemetry 时 App.Tracer() 为 nil，proxy.New 内部回落到 otel 全局。
+	var tp trace.TracerProvider
+	if tr := a.Tracer(); tr != nil {
+		tp = tr.TracerProvider()
+	}
+	p := proxy.New(table, resolver, tp)
 	for _, r := range table.Routes() {
 		// hertz 的通配参数写作 *p；一条路由注册一个通配，命中后由
 		// proxy.Handle 按路径再匹配一次（注册与匹配共用同一张表）。

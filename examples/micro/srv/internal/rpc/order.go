@@ -6,7 +6,7 @@
 //   - 身份校验在 handler 内读 req.GetUserId()（kitex 无 metadata 透传约定，
 //     批 2 已核实）；业务错误以 Response.Code/Message 表达（pkg/codes），
 //     网络/内部错误走 Go error（kitex 错误体），两套不混用
-//   - 限流由 middleware.RateLimiter 在入口完成（cachex 门控、fail-open）
+//   - 限流由 middleware.RateLimiter 在入口完成（kvx 原子自增，门控关闭/fail-open）
 //
 // 装配（app/setup.go）：server 选项由 launchx 的 srv 档装配产出（地址取
 // config.yaml 的 service.addr），本包只出 impl，不碰地址：

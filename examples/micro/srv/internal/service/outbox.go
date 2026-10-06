@@ -17,10 +17,10 @@ import (
 	"time"
 
 	"github.com/gospacex/dbx/orm"
+	"github.com/gospacex/launchx"
 	"github.com/gospacex/logx"
 	"github.com/gospacex/mqx"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -214,8 +214,11 @@ func (r *OutboxRunner) sendOne(ctx context.Context, ev *repository.OutboxEvent) 
 	if parsed, err := events.UnmarshalOrderCompleted([]byte(ev.Payload)); err == nil && parsed.OrderID > 0 {
 		key = fmt.Sprintf("%d", parsed.OrderID)
 	}
+	// Topic 刻意留空：producer 由 xmiddleware.mqx 配的目标 topic 构造（writer 自带
+	// topic），kafka-go 会拒绝 writer 与 message 同时带 topic
+	// ——2026-10-05 实测报 "Topic must not be specified for both Writer and Message"。
+	// 目标 topic 只作为 span 属性携带（下面 SetAttributes），不再写进消息体。
 	msg := &mqx.Message{
-		Topic:   ev.Topic,
 		Key:     key,
 		Value:   []byte(ev.Payload),
 		Headers: map[string]string{},
@@ -227,7 +230,7 @@ func (r *OutboxRunner) sendOne(ctx context.Context, ev *repository.OutboxEvent) 
 	// 下单链路 ctx，send span 挂回原 trace（send/receive 同 trace 的断言锚点）；
 	// mq 关时（traceparent 必为空串）退化为无 span 的裸发送。
 	if r.traceOn && ev.Traceparent != "" {
-		ctx = otel.GetTextMapPropagator().Extract(ctx,
+		ctx = launchx.Extract(ctx,
 			propagation.MapCarrier{events.TraceHeaderKey: ev.Traceparent})
 		var span trace.Span
 		ctx, span = tracex.Start(ctx, "messaging", "outbox", "send")

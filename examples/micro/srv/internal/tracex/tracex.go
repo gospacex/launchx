@@ -12,6 +12,7 @@ package tracex
 
 import (
 	"context"
+	"sync"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
@@ -28,11 +29,36 @@ func Start(ctx context.Context, layer, entity, op string) (context.Context, trac
 	return Tracer().Start(ctx, layer+"."+entity+"."+op)
 }
 
+// provider 由装配层注入的 launchx provider；为零值时回落 otel 全局。
+//
+// 为什么要这层间接：业务分层拿不到 *launchx.App（分层边界要求它不认识框架），
+// 而"经 launchx 取句柄"又要求 tracer 来源是装配好的 provider 而不是全局单例。
+// 由装配层在 Setup 里调 UseProvider 交接，两边都成立。
+var (
+	providerMu sync.RWMutex
+	provider   trace.TracerProvider
+)
+
+// UseProvider 由 app.Setup 调用，把 launchx 装配好的 provider 交给本包。
+// 传 nil 表示回落到全局（例如 telemetry 未启用）。
+func UseProvider(tp trace.TracerProvider) {
+	providerMu.Lock()
+	provider = tp
+	providerMu.Unlock()
+}
+
 // Tracer 返回本进程的业务 tracer。
 //
-// 每次都向全局 TracerProvider 取，不缓存成包级变量：otel 的全局 provider 是
-// 委托实现，测试里后注册的 provider 也能被先取到的 tracer 转发到
-// （rpc_span_test.go 与 outbox_test.go 正是靠这一点注入内存 exporter）。
+// 优先用装配层注入的 provider；未注入时向全局 TracerProvider 取，且不缓存成
+// 包级变量：otel 的全局 provider 是委托实现，测试里后注册的 provider 也能被
+// 先取到的 tracer 转发到（rpc_span_test.go 与 outbox_test.go 正是靠这一点注入
+// 内存 exporter）。
 func Tracer() trace.Tracer {
-	return otel.GetTracerProvider().Tracer(tracerName)
+	providerMu.RLock()
+	tp := provider
+	providerMu.RUnlock()
+	if tp == nil {
+		return otel.GetTracerProvider().Tracer(tracerName)
+	}
+	return tp.Tracer(tracerName)
 }
