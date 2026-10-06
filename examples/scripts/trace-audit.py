@@ -11,7 +11,9 @@
   R1 根 span 唯一（多根 = 断链，零根 = 孤儿）
   R2 分层完整：handler.* / service.* / repository.* 各 ≥ 1
   R3 树深 ≥ 3
-  R4 每个 db.* span 的 db.query.text 非空（长度 ≥ 8、不含 placeholder）——防"空壳 span"
+  R4 每个 **SQL** span（db.query / db.create / db.update / db.delete）的
+     db.query.text 非空（长度 ≥ 8、不含 placeholder）——防"空壳 span"。
+     （db.redis.* / db.kvx.* 是 redis 命令，没有 SQL 文本，不参与本判据）
   R5 db.* span 不直接挂根（须经 repository/service）
   R6 入链矩阵：出现 JOIN 字样的 SQL span；四类 CRUD（select/insert/update/delete）齐全
      （跨 trace 统计；单条 trace 不要求四类齐）
@@ -222,14 +224,21 @@ def audit_trace(trace, mesh_ns=None):
     if max_depth < 3:
         fails.append(f"R3 树深应 >= 3，实际 {max_depth}")
     # R4 / R5
+    #
+    # R4 只裁决**带 SQL 文本**的那几类（dbx 的 gorm 回调产出 db.query/create/update/
+    # delete）。db.redis.* / db.kvx.* 是 redis 命令，压根没有 SQL 文本 —— 拿它判
+    # 「空壳 span」会把每个用到缓存/kv 的 trace 全判 FAIL，判据失真比漏判更糟
+    # （微服形态必踩：限流计数走 kvx、读路径几乎都先打 cachex）。
+    sql_ops = {"db.query", "db.create", "db.update", "db.delete", "db.exec"}
     sql_spans = []
     for s in spans:
         t = span_tags(s)
         text = t.get("db.query.text") or t.get("db.statement") or ""
         if s["operationName"].startswith("db."):
-            if len(text) < 8 or re.search(r"(?i)placeholder|\?\?\?", text):
-                fails.append(f"R4 {s['operationName']} 的 SQL 文本为空/占位：{text!r}")
-            sql_spans.append(text)
+            if s["operationName"] in sql_ops:
+                if len(text) < 8 or re.search(r"(?i)placeholder|\?\?\?", text):
+                    fails.append(f"R4 {s['operationName']} 的 SQL 文本为空/占位：{text!r}")
+                sql_spans.append(text)
             pid = parent_id(s)
             if pid is None or pid == root["spanID"]:
                 fails.append(f"R5 {s['operationName']} 直接挂在根下（应经 repository）")

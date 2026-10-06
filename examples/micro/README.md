@@ -46,6 +46,9 @@ service 不认识 pb（pb 加字段不会渗进业务规则），handler 不做�
 
 ## 3. 全链路形态
 
+> 下面这棵树的**实测版**（含 traceID、span 数、各路径对照与补偿路径）在
+> `docs/verify-chain.md`；一键复跑：`bash scripts/chain.sh`。
+
 ```
 curl /api/order/:id
 └── demo-gateway  GET /api/order/:id           (SERVER, webx otel 中间件开根 span)
