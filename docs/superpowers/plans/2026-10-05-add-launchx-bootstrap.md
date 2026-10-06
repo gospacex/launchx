@@ -1537,8 +1537,99 @@ git add examples/mesh/ && git commit -m "test(mesh): 网格形态端到端链路
 
 ---
 
+### Task 26: wire 依赖切换、具名句柄与 16 个 SDK 入图（对应 `tasks.md` 5.1–5.6）
+
+> **trace:** plan-ready.md → `### Task 29: wire 依赖切换与 CLI 固定` / `### Task 30: 具名句柄类型改造` / `### Task 31: 16 个 SDK 的 provider 与 ProviderSet` / `### Task 32: 注入器、生成物入库与 hubx 侧接线` | tasks.md → `- [ ] 5.1 依赖切换…（W1）` / `- [ ] 5.2 具名句柄类型改造（W5）` / `- [ ] 5.3 provider 与 ProviderSet（W2）` / `- [ ] 5.4 运行时裁决留在 provider 内（W3/W4）` / `- [ ] 5.5 注入器与生成（W6/W7）` / `- [ ] 5.6 hubx 侧接线（W8）`
+> **sync:** 本 Task 为 2026-10-06 amend 追加，plan-ready.md 与 tasks.md 已同步新增对应条目
+
+- [ ] **步骤 26.1：依赖切换（W1）**
+
+以 `go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<固定 tag>` 在 launchx 与 hubx 两侧落地；CLI 用 `go install github.com/goforj/wire/cmd/wire@<同 tag>`，版本写入构建说明。**MUST NOT 执行 `go mod tidy`** —— 本仓 go.mod 与 replace 块手工维护，tidy 会重排并可能丢弃本地 replace。
+
+```bash
+go mod edit -replace=github.com/google/wire=github.com/goforj/wire@v0.7.0
+```
+
+- [ ] **步骤 26.2：具名句柄类型改造（W5）**
+
+`internal/component/registry.go` 的 `Env.DB` 现为 `any`（刻意不直引 gorm）。wire 按 type identity 匹配且要求 provider 返回具体类型，`any` 无法入图。引入具名句柄类型（如 `type DBHandle struct{ ... }`）承载原值，对外暴露形态保持向后兼容。
+
+约束：改造后 `launchx/go.mod` **仍不直接 require `gorm.io/gorm`**（3.14 依赖面核对结论不得被推翻）。
+
+- [ ] **步骤 26.3：16 个 SDK 的 provider 与 ProviderSet（W2）**
+
+分类归属（MUST NOT 混用）：
+
+| 类别 | SDK | 装配位 | 启用语义 |
+|---|---|---|---|
+| 地基 | `configx`、`logx`、`otelx` | `internal/pipeline` 步骤 1–3 | 恒构造，失败即退 |
+| 可选组件 | `dbx`、`cachex`、`mqx`、`coordx`、`searchx`、`mongodbx`、`kvx`、`lockx`、`objectx`、`vectorx` | `internal/component` | presence-based |
+| 形态产物 | `rpcx`、`webx` | `internal/mode` 四档分支 | 由 `service.mode` 决定 |
+| 客户端注册表 | `hubx` | 顶层 | 见步骤 26.5 |
+
+- [ ] **步骤 26.4：运行时裁决留在 provider 内（W3/W4）**
+
+presence-based 启用、`trace.on.<name>` 只控入链不控构造、`strict.<name>` 失败姿态 —— 三条 MUST 仍在 provider 内读 `Env.Cfg` / `Env.TraceOnOf` / `Env.StrictOf` 裁决。provider 允许返回零值 + `nil` error 表示未构造/已降级。
+
+**禁止**把 presence 编进图：10 个可选组件需要 2^10 个注入器，组合爆炸。
+
+- [ ] **步骤 26.5：注入器、生成物入库与 hubx 侧接线（W6/W7/W8）**
+
+补 `//go:build wireinject` 的 injector（含 `wire.Build(...)`）→ `wire gen ./...` → `wire_gen.go` 入库。
+
+hubx 侧现状（实测）：`hubx/wire.go` 已有 `ProviderSet`，但 `InitializeApp` **未调用 `wire.Build(...)`**（不是合法 injector），且全仓无 `wire_gen.go`。本次补 `wire.Build(...)` 使其真正接线，生成物须含对 `Registry` 与 `configx.ViperLoader` 的显式构造调用。
+
+wire cleanup 仅用于「构造中途失败时回滚本次已建资源」，**不取代 `Env.AddStop` 退出链**（A3 事件序列是断言唯一权威）。
+
+```bash
+wire gen ./...
+git diff --exit-code   # 须为空：生成物与入库版本一致
+```
+
+- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready.md Task 29–32、tasks.md 5.1–5.6 同步）
+
+---
+
+### Task 27: wire 验收与红线回归（对应 `tasks.md` 5.7–5.10）
+
+> **trace:** plan-ready.md → `### Task 33: wire 验收与红线回归（对应 tasks.md 5.7 / 5.8 / 5.9 / 5.10，验收案例 W1/W4/W5/W6）` | tasks.md → `- [ ] 5.7 单测：build-time 依赖断言（W1/W7）` / `- [ ] 5.8 回归单测（红线不回归，W3/W6/W5）` / `- [ ] 5.9 反向断言（W4）` / `- [ ] 5.10 验收案例对齐核对`
+> **sync:** 本 Task 为 2026-10-06 amend 追加，plan-ready.md 与 tasks.md 已同步新增对应条目
+
+- [ ] **步骤 27.1：W1 build-time 依赖断言**
+
+不带 `wireinject` 标签执行 `go build ./...`，断言依赖闭包（`go list -deps ./...`）不含 `github.com/goforj/wire` 与 `github.com/google/wire`。
+
+- [ ] **步骤 27.2：W7 生成可复现**
+
+干净工作区按固定版本 CLI 执行 `wire gen ./...`，断言 `git diff --exit-code` 为空。
+
+- [ ] **步骤 27.3：W3 / W6 / W5 红线回归**
+
+- `trace.on.db: false` 时 `App.DB` 仍非 nil、业务读写正常（仅无 `db.query` span）—— D1 不回归；
+- Setup 失败路径下 A3 事件序列一字不改（server → 组件 Stop → deregister → tracing.Shutdown → logger.Close）；
+- 依赖面 3.14 结论仍成立：launchx go.mod 不直接 require `gorm.io/gorm`。
+
+- [ ] **步骤 27.4：W4 反向断言**
+
+单测断言「组件层仍按 `Env` 运行时裁决」—— 锁死「wire 不承载 presence-based」边界，防止后来者把条件装配搬进图。
+
+- [ ] **步骤 27.5：W1–W8 编号对齐核对**
+
+`specs/dependency-injection/spec.md` 的 Scenario 与 `tasks.md` 第 5 节双向可追溯；`openspec validate add-launchx-bootstrap --strict` 通过。
+
+- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready.md Task 33、tasks.md 5.7–5.10 同步）
+
+---
+
 ## 自检（writing-plans Self-Review）
 
 1. **规格覆盖**：1.1→T1、1.2→T2、1.3→T3、1.4→T4、1.5→T5、1.6→T6、1.7→T7、2.1→T8、2.2→T9、2.3→T10、2.4→T11、3.1→T12、3.2→T13、3.3→T14、3.4→T15、3.5→T16、3.6→T17、3.7→T18、3.9→T19、2.6→T20；1.8/2.5/3.8/3.11–3.13/3.10(后置部分)→T21 占位。无遗漏。
 2. **占位符扫描**：唯一有意占位为 T21（后置项，spec 明确本轮不做，正文仅锁定插入点与规格引用，无 TBD/TODO 型实现占位）；T1 步骤 1.1.4 给出 import 循环的两种解法，非占位。
+3a. **2026-10-06 amend 追加（Task 26/27，W1–W8）**：新增 capability `dependency-injection`，
+对应 `tasks.md` 第 5 节 5.1–5.10 与 plan-ready.md Task 29–33。三条实测前提已写入
+design.md Decisions（goforj/wire 为编译期分支且 hubx 侧未接线；wire 按 type identity
+匹配故 `Env.DB any` 须包具名类型；wire 不承载 presence/trace/strict 运行时裁决）。
+类型一致性：provider 输出类型与具名句柄类型命名须在 Task 26 内部自洽，
+`App.DB()` 对外暴露形态保持向后兼容 —— 若断言方式变化须在同一次变更给出迁移路径。
+无占位符：Task 26 的步骤均给出具体命令或具体约束，无 TBD/TODO 型实现占位。
 3. **类型一致性**：`App` 字段名（DB/Cache/MQ/Registry/Server/RPCServer）在 T1/T4/T6 一致；`Registry.Target(agentAddr, serviceID)` 签名在 T4（移植自 micro_apps/infra/consul/registry.go:148）与 T5/T9/T10 一致；`RPCClientOptions(service)` 工厂 T5 产出、T10 消费；事件名（telemetry.init/component.*/registry.deregister/tracing.flush/logger.close）在 T6/T7/T13 一致。

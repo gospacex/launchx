@@ -61,3 +61,20 @@
 - [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）
 - [ ] 4.12 调用链完整性（验收案例 T13）：(a) 分层完整——根 span 为路由入口、树深 ≥3、handler/service/repository 各层至少 1 span；(b) 中间件入链矩阵逐行核对，具备外部依赖的中间件全部有 span，豁免项写明理由，未列入矩阵视为缺失；(c) CRUD 与连表逐条入链——`db.query.text` 非空 span 数 == 实际执行 SQL 条数、JOIN 语句 text 含 join、INSERT/SELECT/UPDATE/DELETE 四类各至少一条；(d) 反向断言——关闭任一埋点（如 `trace.on.db=false`）后完整性检查 MUST 失败
 - [ ] 4.11 证据落盘（网格）：`examples/mesh/docs/verify.md` 记录 trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始响应片段 / `hubx.trace` OFF-ON 对比 / minikube-kubectl-istioctl-Istio 版本（验收案例 T12）
+
+## 5. Dependency Injection（goforj/wire，验收案例 W1–W8）
+
+前置：Go ≥ 1.25（launchx `go 1.27.1` / hubx `go 1.26.2`，均满足）；`wire` CLI
+`go install github.com/goforj/wire/cmd/wire@<固定 tag>`（MUST 固定版本，不用 `@latest`）。
+硬纪律：**MUST NOT 执行 `go mod tidy`**（go.mod 与 replace 块手工维护）。
+
+- [ ] 5.1 依赖切换：launchx 与 hubx 的 go.mod 以 `go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>` 迁到维护分支（既有 wire 代码无需改动）；若 launchx 侧为新增，则手工补 require + replace，禁止 tidy（对应验收案例 W1）
+- [ ] 5.2 具名句柄类型改造（**本次最大成本点**）：为 `component.Env` 中弱类型句柄（至少 `DB any`）引入具名类型，使 wire 可按 type identity 求解；对外暴露形态保持向后兼容（对应验收案例 W5）
+- [ ] 5.3 实现 16 个 SDK 的 provider 与 ProviderSet：`cachex / configx / coordx / dbx / hubx / kvx / lockx / logx / mongodbx / mqx / objectx / otelx / rpcx / searchx / vectorx / webx`；按分类表归属（地基 3 → `internal/pipeline`；可选组件 10 → `internal/component`；形态产物 2 → `internal/mode`；`hubx` → 客户端注册表）；`objectx` / `vectorx` 登记在册但 presence-based 未命中即零值（对应验收案例 W2）
+- [ ] 5.4 运行时裁决留在 provider 内：presence-based 启用、`trace.on.<name>` 只控入链不控构造、`strict.<name>` 失败姿态三者 MUST 仍在 provider 内读 `Env` 裁决；provider 允许返回零值 + `nil` error 表示未构造/已降级（对应验收案例 W3/W4）
+- [ ] 5.5 注入器与生成：补 `//go:build wireinject` 的 injector（含 `wire.Build(...)`），执行 `wire gen ./...` 产出 `wire_gen.go` 并入库；wire cleanup 仅用于构造中途失败回滚，MUST NOT 取代 `Env.AddStop` 退出链（对应验收案例 W6/W7）
+- [ ] 5.6 hubx 侧接线：给 `hubx/wire.go` 的 `InitializeApp` 补 `wire.Build(...)`（现为未接线的占位）并生成 `wire_gen.go`，其中须含对 `Registry` 与 `configx.ViperLoader` 的显式构造调用（对应验收案例 W8）
+- [ ] 5.7 单测：build-time 依赖断言——不带 `wireinject` 标签构建后依赖闭包不含 `goforj/wire` 与 `google/wire`（W1）；`wire_gen.go` 重新生成后 `git diff --exit-code` 为空（W7）
+- [ ] 5.8 回归单测（红线不回归）：`trace.on.db=false` 时 `App.DB` 仍非 nil（W3，D1 不回归）；Setup 失败路径下 A3 事件序列一字不改（W6）；依赖面核对 3.14 结论仍成立——launchx go.mod 不直接 require `gorm.io/gorm`（W5）
+- [ ] 5.9 反向断言：`wire` 不承载 presence-based（W4）——若把可选组件有无编进图需 2^10 个注入器，以单测断言「组件层仍按 `Env` 运行时裁决」锁死该边界
+- [ ] 5.10 验收案例对齐核对：W1–W8 每个编号在 `specs/dependency-injection/spec.md` 的 Scenario 与本文件验证项双向可追溯

@@ -228,3 +228,70 @@
 - 目标：核对 A1–E5 每个编号在 `specs/*/spec.md` Scenario 名称与 `tasks.md` 验证项双向可追溯；`openspec validate add-launchx-bootstrap --strict` 通过；`go build ./... && go test ./...` 全绿作最终回归
 - 改动文件：无（核对 + 可能的文档微调仅限 `openspec/changes/**`）
 - 验证方式：核对清单打勾 + validate 通过 + 全量测试绿
+
+## Amendments
+
+### 2026-10-06: 用 goforj/wire 完成 16 个 hubx SDK 的统一注册
+
+- 原因：用户要求 launchx 使用 `https://github.com/goforj/wire` 完成
+  `cachex / configx / coordx / dbx / hubx / kvx / lockx / logx / mongodbx / mqx /
+  objectx / otelx / rpcx / searchx / vectorx / webx` 共 16 个 SDK 的注册
+- 影响规格：新增 capability `specs/dependency-injection/spec.md`（W1–W8）
+- 影响任务：`tasks.md` 新增第 5 节 5.1–5.10
+- 影响设计：`design.md` 新增 4 条 Decision（选型 / 运行时裁决边界 / 具名句柄 /
+  退出语义）、6 条 Risk、4 条 Open Question；Non-Goals「脚手架/代码生成」补边界澄清
+- 三个实测前提（非推测）：
+  1. goforj/wire 是 google/wire 的维护分支，**编译期代码生成**、运行时零依赖、要求 Go ≥ 1.25
+     （launchx `go 1.27.1` / hubx `go 1.26.2`，均满足）；迁移靠 `go mod edit -replace`
+  2. **hubx 模块已在用 wire 但未接线**：`wire.go` 的 `InitializeApp` 没有 `wire.Build(...)`，
+     全仓无 `wire_gen.go` → 本次对 hubx 侧是「换分支 + 真正接线」
+  3. wire 按 **type identity** 匹配、provider 须返回具体类型，而 `component.Env.DB` 是
+     刻意的 `any` → **必须引入具名句柄类型**，这是本次最大成本点
+- 硬纪律：`go mod tidy` **禁止执行**（go.mod 与 replace 块手工维护）；`wire` CLI 版本
+  MUST 固定到具体 tag，不用 `@latest`
+
+## 追加实现步骤
+
+### Task 29: wire 依赖切换与 CLI 固定（对应 `tasks.md` 5.1）
+
+- [ ] **任务完成**（与 superpowers plan `Task 26`、`tasks.md` 5.1 同步勾选）
+- 目标：`go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>`
+  在 launchx 与 hubx 两侧落地；固定 tag 写入构建说明；**禁止 `go mod tidy`**
+- 改动文件：`go.mod`（手工编辑）、`docs/` 构建说明或 Makefile
+- 验证方式：`go build ./...` 全绿且 go.mod diff 仅含预期行
+
+### Task 30: 具名句柄类型改造（对应 `tasks.md` 5.2，验收案例 W5）
+
+- [ ] **任务完成**
+- 目标：为 `component.Env.DB`（`any`）等弱类型句柄引入具名类型，使 wire 可求解；
+  对外暴露形态保持向后兼容
+- 改动文件：`internal/component/registry.go`、`app.go`（`App.DB()` 暴露面）
+- 验证方式：`go build ./...` + 既有组件单测全绿（无调用方断言方式变化）
+
+### Task 31: 16 个 SDK 的 provider 与 ProviderSet（对应 `tasks.md` 5.3 / 5.4，验收案例 W2/W3/W4）
+
+- [ ] **任务完成**
+- 目标：按分类表实现 16 个 provider（地基 3 → `internal/pipeline`；可选组件 10 →
+  `internal/component`；形态产物 2 → `internal/mode`；`hubx` → 客户端注册表）；
+  presence / `trace.on` / `strict` 三裁决留在 provider 内读 `Env`
+- 改动文件：`internal/component/*`、`internal/mode/*`、`internal/pipeline/*`、新增 provider 文件
+- 验证方式：`wire gen ./...` 无 "no provider for" 报错
+
+### Task 32: 注入器、生成物入库与 hubx 侧接线（对应 `tasks.md` 5.5 / 5.6，验收案例 W6/W7/W8）
+
+- [ ] **任务完成**
+- 目标：补 `//go:build wireinject` 的 injector（含 `wire.Build(...)`）→ `wire gen ./...`
+  → `wire_gen.go` 入库；hubx 侧给 `InitializeApp` 补 `wire.Build(...)` 并生成 `wire_gen.go`
+  （须含 `Registry` 与 `configx.ViperLoader` 的显式构造调用）；wire cleanup 仅用于
+  构造中途失败回滚，不取代 `Env.AddStop` 退出链
+- 改动文件：新增 `wire.go` / `wire_gen.go`（两侧）
+- 验证方式：`wire gen ./...` 后 `git diff --exit-code` 为空；A3 退出序列断言全绿
+
+### Task 33: wire 验收与红线回归（对应 `tasks.md` 5.7 / 5.8 / 5.9 / 5.10，验收案例 W1/W4/W5/W6）
+
+- [ ] **任务完成**
+- 目标：build-time 依赖断言（依赖闭包不含 wire）、生成可复现、`trace.on.db=false`
+  时 `App.DB` 仍非 nil（D1 不回归）、依赖面 3.14 结论仍成立（不直引 gorm）、
+  W4 反向断言锁死「wire 不承载 presence」；W1–W8 编号双向可追溯
+- 改动文件：`wire_test.go`（新增）或既有 `component` 单测
+- 验证方式：`go test ./... -run Wire` 全绿 + `openspec validate add-launchx-bootstrap --strict` 通过

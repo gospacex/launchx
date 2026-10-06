@@ -94,3 +94,38 @@ launchx 目标：把基础设施初始化固化成引导库，各项目 `launchx
 4. **gateway → bff 的出向注入是 SDK 真空**：`webx/middleware/otel.go` **只有 Extract 没有 Inject**（入站读 `traceparent`/`tracestate`/`baggage` 三头），全 hubx 无出向注入 helper。已验证写法是 `micro_apps/apps/gateway/internal/proxy/proxy.go:134` 的 `otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(outReq.Header))`。launchx 只导出极小 `Inject` 薄封装（不含转发逻辑），由 `examples/micro/gateway` 调用；bff → srv 的 RPC 续链由 `hubx/rpcx` 的 kitex obs-opentelemetry 套件承担。
 5. **观测端与底座（实测环境）**：Docker Desktop 在跑（daemon v29.7.2），CLI 在 `/Applications/Docker.app/Contents/Resources/bin/docker`、**不在 PATH**。`jaeger` 容器存在但已停止（镜像 `jaegertracing/all-in-one:1.63.0`，16686 / 4317 / 4318，`COLLECTOR_OTLP_ENABLED=true`）；otelx 走 OTLP/HTTP `otlptracehttp`（默认 `localhost:4318`），与 Jaeger 原生 OTLP 接收对齐，无需 collector 中转。需启动 `jaeger` / `mysql` / `kafka`，**新建 `elasticsearch`**（本机无该容器，镜像 `elasticsearch:7.6.2` 本地已有）；`consul` / `postgres` / `mongo1-3` / `keydb` / `memcached` / `rabbitmq` / `nsq` / `rocketmq` / `etcd` 已在跑。所有镜像均在本地，无需联网拉取。底座脚本 `examples/scripts/bring-up-trace.sh` 为第 4 节验收的前置（tasks 0.3）。
 6. **网格按同构处理，不拉回本轮**：验收标准中「服务网格类似」按 C4 原裁决落地——网格与微服共用完全相同的 Go 侧路径，无专属 trace 分支（T8 代码断言）；其真实部署（`examples/mesh` 清单 + minikube/Istio）仍为本轮后置。
+
+### 2026-10-06: 用 goforj/wire 完成 16 个 hubx SDK 的统一注册（第 7 个 capability）
+
+用户要求：launchx 使用 `https://github.com/goforj/wire` 完成下列 SDK 的注册 ——
+`cachex / configx / coordx / dbx / hubx / kvx / lockx / logx / mongodbx / mqx /
+objectx / otelx / rpcx / searchx / vectorx / webx`（16 个）。据此新增 capability
+`dependency-injection` 与验收案例 W1–W8、`tasks.md` 第 5 节。
+
+调研所得的三个事实（决定了本次的设计边界，均非推测）：
+
+1. **goforj/wire 是 google/wire 的维护分支，编译期代码生成**，无运行时容器、无反射；
+   要求 Go ≥ 1.25（launchx `go 1.27.1`、`hubx` `go 1.26.2`，均满足）；既有
+   `google/wire` 代码**无需改动**即可迁移（官方兼容声明），手段是
+   `go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>`。
+2. **`hubx` 模块已经在用 wire，但只画了一半**：其 `wire.go` 有 `ProviderSet`，
+   但 `InitializeApp` **未调用 `wire.Build(...)`**（不是合法 injector），且全仓
+   **无 `wire_gen.go`**（从未生成过）。故本次对 hubx 侧是「换分支 + 真正接线」，
+   不是从零引入。
+3. **wire 按 type identity 匹配、provider 须返回具体类型**，而 launchx 的
+   `component.Env.DB` 是刻意的 `any`（库不直引 gorm）——**弱类型字段无法直接入图**，
+   必须引入具名句柄类型。这是本次最大的实现成本点。
+
+因此本次修订的**核心边界**是：wire 只接管「依赖求解与构造顺序」，
+**presence-based 启用 / `trace.on` 入链门控 / `strict` 失败姿态这三条运行时裁决
+仍留在 provider 内部**，D1/D2/A3 既有红线与断言一律不回归。详见
+`design.md`「Decision: wire 只接管依赖求解，不接管运行时裁决」。
+
+同时修订两条既往约束（不改语义，只补边界）：
+
+- **Non-Goals「脚手架 / 代码生成」**：该条针对的是「launchx 为业务项目生成脚手架」，
+  仍成立；新增的是「launchx **自身构建期**用 wire 生成装配代码」，二者不同层，
+  不冲突。已在 design.md Non-Goals 中显式区分。
+- **依赖选型「有 SDK 但本轮不接：`objectx` / `vectorx`（YAGNI）」**：改为
+  「登记在册但默认不构造」——provider 存在、presence-based 未命中即零值，
+  使「注册面完整」与「不为无调用方付构造成本」同时成立。

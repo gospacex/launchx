@@ -14,6 +14,10 @@ hubx 生态三种形态（webx 单体、micro_apps 微服务、service_mesh 网�
   - examples/ 三 demo 自包含可复现，验收案例逐条标注
 - Non-Goals:
   - 脚手架 / 代码生成、`launchx check` 目录校验
+    - **边界澄清（2026-10-06 amend）**：本条针对的是「launchx 为**业务项目**生成
+      脚手架或代码」，仍然成立且不变。launchx **自身构建期**使用 `goforj/wire`
+      生成装配代码（`wire_gen.go`）属另一层：它生成的是 launchx 自己的初始化代码，
+      不产出任何业务侧模板、不提供命令行脚手架。二者不冲突，本条不因引入 wire 而失效。
   - 直接 require hertz / go-redis / kafka-go / consul-api / gorm 等三方客户端 —— 一律经对应 `*x` SDK 间接引入（依赖选型 Decision）
   - 为 hubx 已有 SDK 覆盖的能力另建封装；`micro_apps/pkg/rpcx` 与 `gospacex/rpcx` 向新建的 `hubx/rpcx` 收敛不在本轮（回补时开新 change）
   - etcd 等除 nacos 外的远端配置源实现
@@ -95,6 +99,56 @@ hubx 生态三种形态（webx 单体、micro_apps 微服务、service_mesh 网�
   - otelx 走 OTLP/HTTP（`otlptracehttp`，默认端点 `localhost:4318`），与 Jaeger 原生 OTLP 接收对齐，无需 collector 中转
   - 底座状态：`consul`/`postgres`/`mongo1-3`/`keydb`/`memcached`/`rabbitmq`/`nsq`/`rocketmq`/`etcd` 在跑；`jaeger`/`mysql`/`kafka` **已停止需启动**；**无 Elasticsearch 容器**（镜像 `elasticsearch:7.6.2` 本地已有，需新建）
   - 所有镜像均在本地（镜像源为 `swr.cn-north-4.myhuaweicloud.com` 与 `hub.rat.dev` 的已拉取副本），无需联网拉取
+- **Decision: 采用 `goforj/wire` 完成 16 个 hubx SDK 的依赖注册（2026-10-06 amend）**
+  - 背景：用户要求 launchx 用 `https://github.com/goforj/wire` 完成 `cachex /
+    configx / coordx / dbx / hubx / kvx / lockx / logx / mongodbx / mqx / objectx /
+    otelx / rpcx / searchx / vectorx / webx` 共 16 个 SDK 的注册
+  - 选型依据（实测）：goforj/wire 是 `google/wire` 的维护分支，**编译期代码生成**，
+    无运行时容器、无反射；`wire_gen.go` 不 import wire，运行时零依赖；要求 Go ≥ 1.25，
+    launchx `go 1.27.1` / hubx `go 1.26.2` 均满足
+  - 迁移手段：`go mod edit -replace=github.com/google/wire=github.com/goforj/wire@<tag>`
+    —— 官方声明既有 wire 代码无需改动。**MUST NOT 执行 `go mod tidy`**（本仓既有纪律：
+    go.mod 与 replace 块手工维护）
+  - **实测现状（决定本次是"接线"而非"新建"）**：`hubx` 模块已 require
+    `github.com/google/wire v0.7.0`（原项目已停维护），其 `wire.go` 有 `ProviderSet`，
+    但 `InitializeApp` **未调用 `wire.Build(...)`**（不是合法 injector），且全仓
+    `find . -name wire_gen.go` **零命中** —— 从未生成过。故 hubx 侧要做的是换分支 + 真正接线
+  - Alternatives:
+    - 运行时反射容器（dig / facebookgo/inject）—— 与 wire「无反射、可读、可调试」的
+      定位相反，且引入运行期不确定性，A2 启动顺序断言难以逐点验证
+    - 继续手写装配（现状）—— 16 个 SDK 的构造顺序靠人维护，`component.Mount` 的
+      order 切片与实际依赖易漂移，漏配只在运行时才暴露
+    - 停在 `google/wire` 不动 —— 上游已停止维护
+- **Decision: wire 只接管依赖求解，不接管运行时裁决（本次核心边界）**
+  - wire 生成的是**固定顺序、无分支**的初始化代码，而 launchx 的组件层有三条
+    **运行时**语义，二者不可混：
+    1. presence-based 启用（配了 yaml 段才构造）
+    2. `trace.on.<name>` 只控入链、不控构造（D1 红线）
+    3. `strict.<name>` 决定失败是降级还是返回 error（D2 红线）
+  - 落地：三条裁决**保留在 provider 内部**（读 `Env.Cfg` / `Env.TraceOnOf` /
+    `Env.StrictOf`）；provider 允许返回零值 + `nil` error 表示「未构造 / 已降级」，
+    wire 对此不作干预
+  - 反向边界：若试图把 presence 编进图（多注入器变体），10 个可选组件需要 2^10 个
+    注入器 —— 组合爆炸，MUST NOT 采用（W4 反向断言锁死）
+  - Alternatives: 用 wire 表达条件装配 —— 见上，不可行；把运行时裁决外包给 wire 的
+    cleanup / provider set 变体 —— 会让 D1/D2 的既有断言失去落点
+- **Decision: 弱类型句柄须包具名类型才能入图（最大的实现成本点）**
+  - 实测：`component.Env.DB` 是 `any`（刻意 —— 库不直引 gorm，保持「业务经 launchx
+    取句柄、不直引驱动」的依赖面）
+  - 冲突：wire 按 **type identity** 匹配，且要求 provider 返回**具体类型**
+    （接口须经 `wire.Bind` 显式绑定）；`any` 作为输出类型既无法区分多个弱类型产物，
+    也不符合 wire 的 provider 规约
+  - 落地：为弱类型句柄引入具名类型（如 `type DBHandle struct{ ... }`），对外暴露形态
+    保持向后兼容；MUST NOT 因此让 launchx go.mod 直接 require `gorm.io/gorm`
+    （否则 3.14 依赖面核对结论被推翻）
+- **Decision: 退出语义仍由 launchx 显式退出链独占，不交给 wire cleanup**
+  - wire provider 可返回 `func()` cleanup，且**保证先于自身依赖的 cleanup**（LIFO，
+    与反序退出链同向）—— 方向一致，但不能取代现有机制
+  - 理由：`Env.AddStop` + 事件记录器是 **A3 断言的唯一权威**，退出序列必须可被单测
+    逐点断言；交给 wire cleanup 后该断言失去落点
+  - 落地：wire cleanup 仅用于「构造中途失败时回滚本次已建资源」这一窄场景；
+    A3 事件序列（server → 组件 Stop → deregister → tracing.Shutdown → logger.Close）
+    一字不改
 
 ## 定位（2026-10-05 修订）
 
@@ -115,6 +169,16 @@ launchx 是 hubx 通用 bootstrap 基建库：业务侧 = 一份 yaml + 分层�
 - [尾部数据层 span 缺失] → 退出序列的 `tracing.Shutdown`（15s 上限）必须早于 `logger.Close`；批量导出器（Batcher 512/5s）缓冲未冲刷即退出会静默丢 span，Jaeger 侧表现为最后一个 span 不见但不报错。T9 显式断言尾部节点不缺失
 - [ES 底座缺失导致 T4 无法验收] → 本机无 Elasticsearch 容器，需以 `elasticsearch:7.6.2` 本地镜像新建（9200/9300）；若该镜像起不来，`search` 组件的装配契约仍以单测覆盖，T4 的 ES 部分降级为人工验证项并在 close 时标注
 - [docker CLI 不在 PATH] → 本机 CLI 位于 `/Applications/Docker.app/Contents/Resources/bin/docker`（daemon v29.7.2 运行中），验收脚本 MUST 用绝对路径或先导出 PATH，MUST NOT 假定 `docker` 可直接调用
+- [wire 引入构建期步骤，`wire_gen.go` 与源码可能漂移] → `wire_gen.go` 入库 + CLI 版本固定 + W7 断言「重新生成 diff 为空」；手工编辑生成物一律禁止
+- [provider 返回零值表示「未构造」，与 wire「图必须有产出」的直觉相悖] → 这是有意设计：
+  wire 只保证「调用顺序与图完整」，不保证「每个句柄非空」。降级态判定仍由调用方判 nil
+  （与现状一致），并在 spec 中显式写明，避免后来者误以为 provider 成功即句柄可用
+- [具名句柄类型改造面可能外溢到 `App.DB()` 等公开 API] → 对外暴露形态 MUST 保持向后
+  兼容；若断言方式变化，必须在同一次变更中给出迁移路径，不得静默改签名
+- [hubx 与 launchx 各有一层注册面，职责可能重叠] → 见 Open Questions；本次明确
+  launchx 是装配入口，hubx 的 `package registry` 定位为 client provider 目录
+- [`objectx` / `vectorx` 登记在册但无调用方，易被误读为「已支持」] → spec 中写明
+  「presence-based 未命中即零值」，README 注明二者暂无 demo 覆盖
 
 ## Migration Plan
 
@@ -131,3 +195,6 @@ launchx 是 hubx 通用 bootstrap 基建库：业务侧 = 一份 yaml + 分层�
 - Elasticsearch 版本：本地镜像为 `7.6.2`，`searchx/elasticsearch` 的客户端版本兼容性需实跑确认；不兼容时开新 change 处理 SDK 侧，不在本轮阻塞
 - 后置项（`examples/mesh` 清单、`debug` 伪组件与 O1–O3、nacos 真机集成重验、trace 开关 OFF/ON 对比、`micro_apps/pkg/rpcx` 与 `gospacex/rpcx` 向 `hubx/rpcx` 收敛）的回补时机：待本轮 `tasks.md` 0.1–3.9 条目验收通过后另开 change 决定，不在本轮排期
 - `hubx/rpcx` 是否需要承载 gRPC / 直连（direct）等非 kitex 传输：`micro_apps/pkg/rpcx` 只做 kitex，`gospacex/rpcx` 另有 `grpc`/`direct_client`；本轮新建版本只实现 kitex，其余按需开新 change
+- **`hubx`（`package registry`）与 launchx `internal/component` 是两层注册面，边界如何切**（2026-10-06 新增）：实测 `hubx` 是「各中间件 client 的统一注册表」（`ClientProvider` / `Build` / `HealthCheck` / `Close`），launchx 组件层是「按 yaml 装配并裁决失败姿态」。本次按「launchx 是唯一装配入口、hubx 作 client provider 目录」落地；若业务侧需要直接用 hubx 注册表，需另开 change 明确二者分工
+- **16 个 SDK 是否全部要在 launchx 侧生成句柄**：`rpcx` / `webx` 由 `internal/mode` 按档产出，`configx` / `logx` / `otelx` 是地基恒构造 —— 三者都不是 presence-based 组件。本次按分类表落地；若后续要统一成「全部经组件层」，需另开 change 重构骨架步骤
+- **`goforj/wire` 的 tag 版本**：`@latest` 会漂移，入库前 MUST 固定到具体 tag 并写入构建说明（否则 W7「重新生成 diff 为空」不可复现）
