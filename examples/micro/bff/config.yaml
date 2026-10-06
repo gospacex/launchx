@@ -2,7 +2,7 @@
 # 微服 demo（bff 档）配置
 #
 # 端口 / 注册中心地址 / 下游目标一律来自本文件，业务 Go 代码不出现任何硬编码
-# 地址（同一份二进制与配置副本才能被网格直接复用，验收陷阱 14）。
+# 地址（换部署形态只改本文件与进程启动参数，不重新编译）。
 #
 # 本档注册进 consul 由 launchx 按 mode 自己做（地址取 service.self.addr →
 # service.addr），demo 侧不调 Register / Deregister。
@@ -15,12 +15,16 @@ service:
   self:
     # 注册进 consul 的自身地址。launchx 按 service.self.addr → service.addr
     # 顺序取第一个非空值；值支持 ${ENV}（configsrc 对 GetString 施加
-    # os.ExpandEnv），网格形态设该 env 即可，未设置则自动回落到上面的 addr。
+    # os.ExpandEnv），容器/多网卡环境设该 env 覆盖即可，未设置则回落上面的 addr。
     addr: "${DEMO_BFF_SELF_ADDR}"
   upstream:
     # 注册中心不可用时的直连兜底目标：launchx 读 service.upstream.<被调服务名>。
-    # 注册中心配了就走发现、本值不生效，故留空 —— 上游地址只留一个来源。
-    demo-srv: ""
+    # 注册中心配了就走发现、本值不生效；留空则无兜底，故这里给出四服端口，
+    # 便于不启 consul 时也能把整条链路跑通（与 srv-*/config.yaml 的 addr 一致）。
+    demo-product: "127.0.0.1:9021"
+    demo-stock:   "127.0.0.1:9023"
+    demo-order:   "127.0.0.1:9022"
+    demo-points:  "127.0.0.1:9024"
 
 webx:
   addr: "127.0.0.1:8081"
@@ -53,10 +57,11 @@ xmiddleware:
 
   # ----- coordx：注册中心 -----
   # bff 的两个用途都落在这里：把自己注册进注册中心供 gateway 发现（由 launchx
-  # 按 mode 做），以及 App.RPCClientOptions 里的 coordx resolver（发现 demo-srv）。
+  # 按 mode 做），以及 App.RPCClientOptions 里的 coordx resolver
+  #（发现四个下游域服 demo-product / demo-stock / demo-order / demo-points）。
   coordx:
     driver: consul
     addr: "127.0.0.1:8500"
     enable_trace: true
 
-  # bff 不建数据层：无 sqlx / cachex / mqx 段。订单数据的唯一入口是下游 demo-srv。
+  # bff 不建数据层：无 sqlx / cachex / mqx 段。业务数据的唯一入口是下游四个域服。

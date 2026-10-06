@@ -31,16 +31,30 @@ examples/micro/bff/
 
 ## 2. 三层 span 是怎么落的
 
+单域读（GET /order/:id）：
+
 ```
-GET /order/:id                    (SERVER, webx 的 otel 中间件开的根 span)
-└── handler.GetOrder              handler 层，internal/handler/order.go
-    └── downstream.Order.GetOrder 业务层，internal/downstream/client.go
-        └── client.demo-srv.GetOrder
+GET /order/:id                     (SERVER, webx 的 otel 中间件开的根 span)
+└── handler.GetOrder               handler 层，internal/handler/mall.go
+    └── downstream.order.GetOrder  业务层，internal/downstream/clients.go
+        └── client.demo-order.GetOrder
             ↓ traceparent 经 kitex 元数据注入
-            demo-srv  service.order.GetOrder → db.query
+            demo-order  service.order.GetOrder → db.query
 ```
 
-`client.demo-srv.GetOrder` 由 rpcx 的 `ClientSpanMiddleware` 产出（经
+复合下单（POST /order，一次请求串起四服，全链路验收看这一条）：
+
+```
+POST /order                        (SERVER)
+└── handler.PlaceOrder
+    ├── downstream.product.GetProduct → client.demo-product.GetProduct → demo-product
+    ├── downstream.stock.ReserveStock → client.demo-stock.ReserveStock → demo-stock
+    ├── downstream.order.CreateOrder  → client.demo-order.CreateOrder  → demo-order
+    └── downstream.points.Earn        → client.demo-points.Earn        → demo-points
+    （失败补偿）handler.ReleaseStock.compensate → client.demo-stock.ReleaseStock
+```
+
+`client.<服>.<方法>` 由 rpcx 的 `ClientSpanMiddleware` 产出（经
 `App.RPCClientOptions` 带下来的选项挂上），**本 demo 不再在它外面包一层 span**
 ——包了父子链就退化成两段，T6 的三段断言会挂。
 
@@ -53,9 +67,17 @@ GET /order/:id                    (SERVER, webx 的 otel 中间件开的根 span
 /Applications/Docker.app/Contents/Resources/bin/docker compose \
   -f /Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml up -d consul jaeger
 
-# 2) 起下游：必须在 bff 之前就绪（bff 启动时不校验下游存活，首次调用才发现）
-cd examples/micro/srv && export HUBX_DB_PW=hubx123 && go run ./cmd
+# 2) 起下游四服：必须在 bff 之前就绪（bff 启动时不校验下游存活，首次调用才发现）
+export HUBX_DB_PW=hubx123
+for d in product order stock points; do
+  (cd examples/micro/srv-$d && go run ./cmd &)
+done
+# 端口：demo-product 9021 / demo-order 9022 / demo-stock 9023 / demo-points 9024
 ```
+
+> 四条域链路走的就是上面这四个 `srv-*`（demo-product / demo-order /
+> demo-stock / demo-points）。拆分前的单域样例 `examples/micro/srv`
+> （demo-srv，:9013）已随四域拆分移除。
 
 ### 启动
 
@@ -77,12 +99,16 @@ consul 不在时按 A3 降级：一条 `register failed, running unregistered` �
 > 是具体地址 `127.0.0.1:8081`，两者可以共存，但若本机还有别的服务也抢这个端口，
 > 先在 `config.yaml` 里换掉 `webx.addr`。
 
-## 4. 两个接口
+## 4. 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/ping` | 自响应 `{"service":"bff"}`，**不触达下游**（下游挂掉时仍须 200） |
-| GET | `/order/:id?user_id=N` | 经下游 `demo-srv` 的 `GetOrder` 取订单 + 明细 |
+| GET | `/ping` | 自响应 `{"service":"demo-bff"}`，**不触达下游**（下游挂掉时仍须 200） |
+| GET | `/product/:id?user_id=N` | 商品域 `demo-product` → `GetProduct` |
+| GET | `/stock/:product_id` | 库存域 `demo-stock` → `GetStock` |
+| GET | `/order/:id?user_id=N` | 订单域 `demo-order` → `GetOrder` |
+| GET | `/points/:user_id` | 积分域 `demo-points` → `GetAccount` |
+| POST | `/order` | **复合下单**：商品 → 库存预占 → 建单 → 积分入账，失败补偿释放预占 |
 
 `user_id` 是可选查询参数（下游按它做归属校验，缺省 0）。
 
@@ -123,7 +149,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx
 # ① main.go ≤ 50 行
 wc -l examples/micro/bff/cmd/main.go                       # 49
 
-# ② 地址全部配置化（陷阱 14：网格要复用同一份二进制）
+# ② 地址全部配置化（换部署形态只改配置，不重新编译）
 grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/bff/   # 必须为空
 
 # ③ 不自建客户端：下游 RPC 客户端只能用 launchx 给的选项构造
@@ -134,7 +160,9 @@ grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewC
 grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)' --include=*.go examples/micro/bff/internal/   # 必须为空
 
 # ⑤ 下游发现生效 + 三段链路（完整链路在 Task 19 跑，本 Task 只要求编译通过 + 可启动）
-curl -s 'http://127.0.0.1:8500/v1/health/service/demo-srv?passing=1' | jq 'length'   # ≥ 1
+for s in demo-product demo-stock demo-order demo-points; do
+  printf '%s ' "$s"; curl -s "http://127.0.0.1:8500/v1/health/service/$s?passing=1" | jq 'length'   # ≥ 1
+done
 curl -s 'http://127.0.0.1:8500/v1/health/service/demo-bff?passing=1' | jq 'length'   # ≥ 1
 ```
 
@@ -148,7 +176,7 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-bff&limit=1' > /tmp/bff-
 
 ```bash
 # config.yaml 里把 trace.enabled 改成 false，重启后重跑分层检查：
-# handler.* / downstream.* / client.demo-srv.* 三层 span 必须全消失。
+# handler.* / downstream.* / client.demo-{product,stock,order,points}.* 三层 span 必须全消失。
 # 改之前之后都通过，说明完整性检查是空壳。
 ```
 
@@ -159,14 +187,14 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-bff&limit=1' > /tmp/bff-
 | 不注册（代码里没有 `Register`/`Deregister`） | bff 档的注册由 launchx 按 mode 自己做，demo 侧不重复盖一层 |
 | 不自建 consul / redis / kafka / gorm 客户端 | 句柄与选项一律经 `a.Engine()` / `a.RPCClientOptions()` 取 |
 | 不覆盖 rpcx 产出的 client span | 再包一层 span 会把三段父子链压成两段（T6 判据） |
-| 不在代码里写 `127.0.0.1` | 网格要复用同一份二进制，地址必须全部配置化（陷阱 14） |
-| 不建数据层（无 sqlx/mqx 段） | BFF 不做数据落地，订单数据的唯一入口是下游 demo-srv |
-| 不复制第二份 kitex_gen | 直接 import `examples/micro/srv/pkg/kitex_gen`（同 module） |
+| 不在代码里写 `127.0.0.1` | 换部署形态只改配置，地址必须全部配置化 |
+| 不建数据层（无 sqlx/mqx 段） | BFF 不做数据落地，订单数据的唯一入口是下游四个域服 |
+| 不复制第二份 kitex_gen | 直接 import `examples/micro/pkg/kitex_gen`（同 module，四域共用） |
 | 不写死 `/ping` 回显的形态名 | 取 `App.Mode()`，业务分层里不出现形态字面量（C4） |
 
-## 7. 与网关 / 网格的关系
+## 7. 形态无关
 
 `internal/**` 内**不含任何形态分支**（见 §5 第 ④ 条 grep）。换形态只改
-`config.yaml` 的 `service.mode`；网格形态复用**同一份二进制**，差异只在
-配置副本（`service.self.addr` 取 `${DEMO_BFF_SELF_ADDR}`，未设则回落
-`service.addr`）与部署清单。
+`config.yaml` 的 `service.mode`；换部署方式（宿主进程 / 容器 / 集群）都不需要
+重新编译 —— 注册地址可由 `service.self.addr`（`${DEMO_BFF_SELF_ADDR}`，
+未设则回落 `service.addr`）覆盖，代码侧无感知。

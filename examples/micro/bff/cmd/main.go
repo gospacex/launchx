@@ -1,4 +1,4 @@
-// Package main 微服 demo（bff 档）入口：Bootstrap → OnSetup → Run。
+// Package main micro 聚合层（bff 档）入口：Bootstrap → OnSetup → Run。
 //
 // 业务装配全在 app.Setup 里：本文件不开连接、不装配 exporter、不注册节点。
 package main

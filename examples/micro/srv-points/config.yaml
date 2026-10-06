@@ -1,0 +1,114 @@
+# ============================================================
+# mall 示例 · 积分域（srv 档）
+#
+# 纪律：端口 / DSN / 中间件地址一律来自本文件，Go 代码不出现任何硬编码地址。
+# 本档不建 webx，故**不出现** webx 段；注册进 consul 由 launchx 按 mode 自己做
+# （地址取 service.self.addr），业务侧不调 Register / Deregister。
+#
+# 积分是"钱"：入账/消费必须幂等（同订单号同类型只能记一次），故本域用了
+# 两层幂等 —— 数据库唯一键（order_no + type）为事实来源，kvx 幂等键为前置
+# 快速失败（详见 service 注释）。
+#
+# 运行前导出库密码：export HUBX_DB_PW=hubx123
+# ============================================================
+
+service:
+  name: demo-points              # 服务名 = Jaeger 的 service，也是 dbx/cachex/mqx/kvx 的实例名
+  mode: srv                     # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:9024"        # rpcx(kitex) 监听地址
+  self:
+    addr: "${SRV_POINTS_SELF_ADDR}"  # 容器内外地址不一致时显式声明注册地址
+
+# 调用链：全局闸 + 组件级开关。trace.on.<name> 只裁决入链，不裁决构造。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    db: true
+    cache: true
+    mq: true
+    kv: true
+    lock: true
+    registry: true
+
+logx:
+  level: info
+  otel:
+    enable_trace: true
+    exporter: otlp
+    endpoint: "127.0.0.1:4318"
+
+# 地基失败即退：连不上库就启动失败 —— 积分账错了比服务不可用更难挽回。
+strict:
+  db: true
+
+xmiddleware:
+
+  # ----- sqlx：私有库 points_db（账号 mall_rw）-----
+  sqlx:
+    driver: gorm
+    databases:
+      demo-points:               # 实例名须与 service.name 一致（dbx loader 按名字取段）
+        dsn: "mall_rw:${HUBX_DB_PW}@tcp(127.0.0.1:3306)/points_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        conn_max_lifetime: 5m
+        conn_max_idle_time: 1m
+        tracing:
+          enabled: true
+
+  # ----- cachex：账户缓存（余额读多写少，入账/消费后 Delete 失效）-----
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      demo-points:
+        addr: "127.0.0.1:6379"
+        db: 0
+        pool_size: 50
+
+  # ----- mqx：积分变动事件（topic points.changed.v1，经 outbox 补发）-----
+  mqx:
+    driver: kafka
+    instances:
+      demo-points:
+        brokers:
+          - "127.0.0.1:9092"
+        enable_trace: true
+        # 键位口径（mqx 现状，实测）：producer 的目标 topic 读的是 consumer.topic，
+        # 配 producer.topic 不生效（发送时 topic 为空串，报 Unknown Topic Or
+        # Partition）。业务 Message 侧不再自带 topic（kafka-go both-specified 红线）。
+        consumer:
+          topic: points.changed.v1
+        producer:
+          batch_size: 100
+          batch_timeout: 10ms
+          required_acks: -1   # sarama WaitForAll
+
+  # ----- kvx：限流计数 + 幂等键（幂等键用 Set 写、Exists 查）-----
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      demo-points:
+        addr: "127.0.0.1:6379"
+        db: 1
+        pool_size: 30
+
+  # ----- lockx：入账/消费按用户维度加锁（防余额竞态）-----
+  lockx:
+    driver: redis
+    addr: "127.0.0.1:6379"
+    namespace: demo-points
+    ttl: 10s
+    enable_trace: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff_ms: 50
+
+  # ----- coordx：注册中心（注册/注销由 launchx 按 mode 负责）-----
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true

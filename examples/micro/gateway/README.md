@@ -108,7 +108,7 @@ GET /api/order/1001              (SERVER, webx 的 otel 中间件开的根 span)
 └── gateway.proxy.api            转发 span，internal/proxy/proxy.go
     └── HTTP GET                 出向 CLIENT span，otelhttp 包 http.Client 产出
         ↓ traceparent 经 HTTP 头注入
-        demo-bff  GET /order/1001  →  handler.GetOrder → downstream... → client.demo-srv...
+        demo-bff  GET /order/1001  →  handler.GetOrder → downstream... → client.demo-order...
 ```
 
 出向那一层由 `otelhttp.NewTransport` 产出（`app/setup.go` 把 provider 交给
@@ -177,7 +177,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx
 # ① main.go ≤ 50 行
 wc -l examples/micro/gateway/cmd/main.go                       # 49
 
-# ② 地址全部配置化（陷阱 14：网格要复用同一份二进制）
+# ② 地址全部配置化（换部署形态只改配置，不重新编译）
 grep -rn "127\.0\.0\.1\|localhost" --include='*.go' examples/micro/gateway/   # 必须为空
 
 # ③ 不自建客户端：注册中心句柄只能经 a.Registry() 取
@@ -225,14 +225,14 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-gateway&limit=1' > /tmp/
 | 不注册（代码里没有 `Register`/`Deregister`） | gateway 是流量入口，注册它只会让注册中心多一批无人调用的条目 |
 | 不自建 `consul.NewClient` / `coordx.NewDiscover` | 发现句柄一律经 `a.Registry()` 取，拿不到发现能力就走配置兜底 |
 | 不改写上游状态码 | 404/429/502 原样透传，改写会把上游错误语义抹掉 |
-| 不在代码里写 `127.0.0.1` | 网格要复用同一份二进制，地址必须全部配置化（陷阱 14） |
+| 不在代码里写 `127.0.0.1` | 换部署形态只改配置，地址必须全部配置化 |
 | 不覆盖 webx 的入口根 span | `gateway.proxy.*` 只做子 span，另起根就把链路断成两根 |
 | 不省略 traceparent 注入 | webx 中间件只有 Extract，不注入就会断链（T6/T7） |
 | 不建数据层、不接 MQ（无 sqlx/mqx 段） | 网关不落数据 |
 | 不写形态字面量进 `internal/**` | 换形态只改 `config.yaml` 的 `service.mode`（C4） |
 
-## 7. 与网格的关系
+## 7. 形态无关
 
-`internal/**` 内**不含任何形态分支**（见 §5 第 ④ 条 grep）。换形态只改
-`config.yaml` 的 `service.mode`；网格形态复用**同一份二进制**，差异只在
-配置副本与部署清单。
+`internal/**` 内**不含任何形态分支**（见 §5 第 ④ 条 grep）。本 demo 只服务于
+gateway 一档：换形态只改 `config.yaml` 的 `service.mode`，业务代码与部署形态
+解耦 —— 换部署方式（宿主进程 / 容器 / 集群）都不需要重新编译。
