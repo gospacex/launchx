@@ -58,10 +58,11 @@ db → cache → mq → kv → lock → registry → search → mongodb
 | SDK | 是否内建 tracing | 真正生效的开关 | 默认 | 备注 |
 |---|---|---|---|---|
 | dbx | ✅ GORM 回调（`db.query` 等带完整 SQL） | `trace.on.db` → `orm.Open` vs `orm.OpenNoTrace` | 关 | ⚠ SDK 自己的 `enable_trace` 被 launchx 丢弃（`db.go:19` 丢弃第二个返回值） |
-| cachex | ✅ redis 驱动 | **全局** `SetTracingConfig` | 关 | ⚠ 实例级 `enable_trace` 对 span **无效**；launchx 已在 `cache.go:37` 以 `HostProvider:true` 补全局位 |
+| cachex | ✅ redis / memcached 驱动 | 实例级 `EnableTrace` **或** 全局 `SetTracingConfig` | 关 | 2026-10-06 前实例级对 span **无效**（见下节第 ② 条）；现已修为三层裁决 |
 | mongodbx | ✅ `db.mongodb.<op>` | **实例级** `EnableTrace` | 关 | ⚠ 全局 `SetTracingConfig` / `IsTracingEnabled()` **全库无调用者**（死开关） |
 | coordx | ✅ consul 驱动有 `coord.register` / `coord.deregister` | 实例级 `cfg.EnableTrace` | 关 | 后台轮询已做孤儿 span 抑制（`consul.go:176-178`），但 `Deregister` 未见同样保护 ← 即我们见过的那条孤儿 span |
-| kvx / lockx / searchx | ✅ 各自驱动 | 实例级 `EnableTrace` | 关 | ⚠ 三者 `Config` 无 mapstructure tag：业务自行 `Unmarshal` 时 `enable_trace` 静默失效（launchx 用逐字段 `Get` 绕开） |
+| kvx | ✅ 各自驱动 | 实例级 `EnableTrace` | 关 | ⚠ `Config` 仍无 mapstructure tag：业务自行 `Unmarshal` 时 `enable_trace` 静默失效（launchx 用逐字段 `Get` 绕开） |
+| lockx / searchx | ✅ 各自驱动 | 实例级 `EnableTrace` | 关 | `Config` 的 yaml/json/mapstructure 三套 tag **2026-10-06 已补齐**（原状同上） |
 | mqx | ✅ `messaging.kafka.send` 等 | `trace.on.mq` → `EnableTrace \|\| CallChainEnabled` | 关 | 2026-10-05 前恒产 span，已修（见下节第 ① 条） |
 | rpcx | ✅ kitex obs-opentelemetry suite | 实例级 `TraceEnabled`（`trace.enabled`） | 关 | 只从 `otel.GetTracerProvider()` 取用，绝不自建 |
 | webx | ✅ 中间件（**只有 Extract 无 Inject**） | `trace.enabled` | 关 | 出向注入要靠业务自己调 `trace.Inject` |
@@ -84,11 +85,19 @@ tracer: traceflag.NewTracer(cfg.EnableTrace || cfg.CallChainEnabled,
 
 回归测试 `mqx/kafka/tracer_gate_test.go` 同时钉住两条：开关开则入链、开关关则不入链，且**两种情况下 producer 都建得出来**（开关不是构造开关）。
 
-### ② cachex / mongodbx：同一个 SDK 里"实例级"与"全局"两个开关，只有一个有效
-- cachex 只看全局（`redis.go` 的 `startSpan` 查 `IsTracingEnabled()`），实例级 `EnableTrace` 存了从不读；
-- mongodbx 正好相反：只看实例级，全局 `SetTracingConfig` 是死开关。
+### ② 开关的"有效层级"各 SDK 不一样（cachex 已修，mongodbx 仍是坑）
 
-两边都得写，写少了不报错。
+- **cachex 曾只看全局**（`redis.go` 的 `startSpan` 查 `IsTracingEnabled()`），实例级 `EnableTrace` 存了从不读 —— 只配 `instances.<name>.enable_trace` 的调用方 span 恒为零，且不打任何日志。2026-10-06 已修：新增 `Client.traceEnabled()`，裁决顺序统一为
+  `traceflag 总闸 AND 组件闸("cachex") AND (实例级 OR 全局)`，
+  memcached 驱动同改。回归用例在 `cachex/redis/tracer_gate_test.go`（五条）。
+- **mongodbx 正好相反**：只看实例级，全局 `SetTracingConfig` / `IsTracingEnabled()` **全库无调用者**（死开关）。
+
+写之前先确认这一层，写少了不报错。
+
+> 附带一条：`cachex.SetTracingConfig` 内部会 `traceflag.Apply("cachex", cfg.Enabled)`，
+> **顺带把组件闸也写成同一个值**。想模拟「全局关、实例开」必须先
+> `SetTracingConfig(false)` 再把组件闸单独拨回 `true`，顺序反了会被覆盖
+> —— 写测试时极易踩。
 
 ### ③ 命名空间分裂：launchx 组件名 ≠ SDK traceflag 组件名
 launchx 侧是 `cache / mq / mongodb / registry …`，SDK 侧是 `cachex / mqx / mongodbx / coordx …`。
@@ -120,3 +129,22 @@ yaml 里写 `trace.on.<launchx 名>`，代码里 `traceflag.SetComponent("<SDK �
 - `internal/component/mongodb.go`：注释校正 —— 原注释称"实例级 enable_trace 不存在、必须走 SetTracingConfig"，与代码不符（实例级才有效，全局是死开关）。
 - `internal/component/mq.go`：记录 mqx 无条件 span 的历史偏差与修法（含"launchx 侧不要另加拦截"的结论）。
 - `mqx`（五个驱动 + kafka 回归测试）：span 改由 `traceflag.NewTracer` 按开关产出，恢复「`trace.on.*` 只控入链」红线。
+
+---
+
+## 6. 版本与 tag（2026-10-06 现状）
+
+行为改动必须落到 tag 上，否则外部依赖方拿到的仍是旧行为（本仓各模块之间
+靠 `replace` 指向本地路径，所以**仓内**不受影响，坑在仓外）。
+
+| 仓库 | 模块 | tag | 含的改动 |
+|---|---|---|---|
+| mqx | `mqx` / `kafka` / `nsq` / `pulsar` / `rabbitmq` / `rocketmq` | `v0.1.0` 及 `<子模块>/v0.1.0` | span 改由 traceflag 裁决 |
+| cachex | `cachex` / `redis` / `memcached` | `v0.1.0` 及 `redis|memcached/v0.1.0` | 实例级开关生效 |
+| lockx | `lockx` / `redis` | `v0.1.0` 及 `redis/v0.1.0` | 三套 tag 补齐 |
+| searchx | `searchx` / `elasticsearch` | `v0.1.0` 及 `elasticsearch/v0.1.0` | 三套 tag 补齐 + LegacyCluster |
+
+子模块是**独立 go.mod**，必须各自打 `<子模块名>/v0.1.0`；只打根模块的
+`v0.1.0` 对子模块无效（Go 的模块版本按模块路径解析）。
+
+均未 push —— 推送属对外动作，须人工确认。
