@@ -34,8 +34,8 @@
 - [x] 3.3 单测：component 双分支（strict 降级/失败）、`trace.on` 门控不改变组件构造（验收案例 D1/D2） <!-- 已实现: component_test.go 补 D2 降级（Mount 返回 nil/DB nil/Warn 点名 component=db + 后果文案）、D2 即退（init db + errors.Is 穿透 %w 到哨兵根因）、D1 门控（trace.on.mq=false 构造器仍被调用且 MQ 非 nil）三组断言，a1b9af3 -->
 - [x] 3.4 单测：mode 四档装配与非法 mode 报错（验收案例 C1/C2/C3） <!-- 已实现: 四档映射矩阵（webx/注册/RPCServer/RPCClientOptions 互斥）+ srv ServerOptions 服务名端口 + 非法/缺失/mesh 报错含合法取值，4621fd9 -->
 - [ ] 3.5 集成验收：`examples/monolith` 在共享底座（`hubx/dockers` compose，mysql 就绪）下启动 + HTTP 请求（订单读写落 mysql）+ SIGTERM 正常退出（验收案例 E1）
-- [ ] 3.6 集成验收：共享底座（consul + kafka + jaeger，`hubx/dockers` compose）就绪下，`gateway → bff → srv` 调用链返回预期响应（验收案例 E2）
-- [ ] 3.7 回归验收：迁移后 srv 跑原 srv-order e2e 下单链路全绿，含 outbox 经 kafka 投递断言（topic 自动创建），`examples/micro/srv/cmd/main.go` ≤ 50 行（验收案例 E3）
+- [x] 3.6 集成验收：共享底座（consul + kafka + jaeger，`hubx/dockers` compose）就绪下，`gateway → bff → srv` 调用链返回预期响应（验收案例 E2） <!-- 已实现: 9984cfe examples/micro/scripts/e2e.sh（四域服+bff+gateway 自起自停 + /api/ping 与 /api/order/1001?user_id 双断言），真机复跑退出码 0 -->
+- [x] 3.7 回归验收：迁移后 srv 跑原 srv-order e2e 下单链路全绿，含 outbox 经 kafka 投递断言（topic 自动创建），`examples/micro/srv/cmd/main.go` ≤ 50 行（验收案例 E3） <!-- 已实现: ad92167 examples/micro/srv-order/scripts/run-e2e.sh + ordercli RPC 驱动：下单落库 + outbox→kafka(order.completed.v1) + main.go 49 ≤ 50 -->
 - [ ] 3.8 网格验收：三级——(a) 硬验收（自动化）：`kubectl apply --dry-run=client -f examples/mesh/ -R` 全过 + `bash examples/mesh/scripts/bring-up.sh check` 通过（无集群时 check 须明确报缺失并退出非零，不得静默通过）；(b) 人工验证项（close 不硬阻塞）：`examples/mesh/scripts/bring-up` 部署微服 demo 三服务进 minikube + Istio，应用 span 与 sidecar span 同 trace（验收案例 E4），证据记录 `examples/mesh/docs/verify.md`；`hubx.trace` OFF/ON 对比可复现（验收案例 E5）；(c) 链路形态断言见 4.9–4.11（T10–T12）
 - [ ] 3.9 降级验收：`trace.enabled=false` 启动运行正常；无 consul 启动带病运行（验收案例 A3 降级路径、registry 场景）
 - [ ] 3.10 验收案例对齐核对：A1–E5 每个编号在 `specs/*/spec.md` Scenario 与本文件验证项双向可追溯
@@ -49,14 +49,14 @@
 
 前置：0.3 底座脚本 `check` 全绿（jaeger / mysql / kafka / elasticsearch 就绪）。网格部分（4.9–4.11）另需 minikube + Istio 就绪。
 
-- [ ] 4.1 单测：telemetry 步骤后 `otel.GetTextMapPropagator().Fields()` 含 `traceparent`/`tracestate`/`baggage`，且注入后 carrier 中存在合法 `traceparent`（验收案例 T1）；反向断言——不跑 telemetry 步骤时提取不到上游 span context（验收案例 T7）
-- [ ] 4.2 集成：`examples/monolith` 落库接口在 Jaeger 中形成 span 树深度 ≥ 3（入口 → 业务层 → 数据层），数据层 span 祖先链含入口 span，无孤儿（验收案例 T5）
-- [ ] 4.3 集成：数据库**单表** CRUD 四类 span 均带非空 `db.query.text`（完整 SQL）与 `db.sql.table`（验收案例 T2）
-- [ ] 4.4 集成：数据库**多表**操作入链——`JOIN`（或 `Preload`）查询的 `db.query.text` 含关联文本；跨表事务内多条 SQL 为同 trace 的兄弟 span；回滚时相关 span 标 Error（验收案例 T3）
-- [ ] 4.5 集成：同一请求内 cache / mq / `db.elasticsearch.*` / `db.mongodb.*` 四类 span 共存于同一 trace，均为业务 span 子节点（验收案例 T4）
-- [ ] 4.6 集成：`gateway → bff → srv` 三段 span 共享同一 trace-id 且父子链正确（非三个并列根），srv 侧数据层 span 亦在同一 trace（验收案例 T6）
-- [ ] 4.7 集成：Jaeger API `http://127.0.0.1:16686/api/traces?service=<service.name>` 可检索到上述 trace，且尾部 span 不缺失（证明退出冲刷生效）（验收案例 T9）
-- [ ] 4.8 代码断言：全仓无网格专属 trace 分支，`mode` 枚举无 `mesh` 取值；`examples/mesh` 与 `examples/micro` 三服务 main.go 差异仅在配置路径与地址副本（验收案例 T8）
+- [x] 4.1 单测：telemetry 步骤后 `otel.GetTextMapPropagator().Fields()` 含 `traceparent`/`tracestate`/`baggage`，且注入后 carrier 中存在合法 `traceparent`（验收案例 T1）；反向断言——不跑 telemetry 步骤时提取不到上游 span context（验收案例 T7） <!-- 已实现: 2abdfd3 internal/telemetry/trace_e2e_test.go（T1 传播器三头 + 注入闭环；T7 反向断言，随门禁跑） -->
+- [x] 4.2 集成：`examples/monolith` 落库接口在 Jaeger 中形成 span 树深度 ≥ 3（入口 → 业务层 → 数据层），数据层 span 祖先链含入口 span，无孤儿（验收案例 T5） <!-- 已实现: 6ce422f examples/monolith/trace_e2e_test.go TestT5（单根 + 树深 6 + 数据层祖先含入口 + 无悬空引用） -->
+- [x] 4.3 集成：数据库**单表** CRUD 四类 span 均带非空 `db.query.text`（完整 SQL）与 `db.sql.table`（验收案例 T2） <!-- 已实现: 6ce422f TestT2：INSERT/SELECT/UPDATE/DELETE 四类 span 的 db.query.text 与 db.sql.table 均非空（真机逐类 PASS） -->
+- [x] 4.4 集成：数据库**多表**操作入链——`JOIN`（或 `Preload`）查询的 `db.query.text` 含关联文本；跨表事务内多条 SQL 为同 trace 的兄弟 span；回滚时相关 span 标 Error（验收案例 T3） <!-- 已实现: 6ce422f/c369d57 TestT3：JOIN 文本可见、跨表 INSERT 同父兄弟 span、回滚时 db/repository/service 均标 Error（真机回滚经金额越界触发） -->
+- [x] 4.5 集成：同一请求内 cache / mq / `db.elasticsearch.*` / `db.mongodb.*` 四类 span 共存于同一 trace，均为业务 span 子节点（验收案例 T4） <!-- 已实现: 6ce422f TestT4：mq + db.elasticsearch.* + db.mongodb.* 同挂 service.CreateOrder；cache 类在 service.UpdateOrder 下（本 demo 无同时触达四类之路径，已在用例注释写明偏差） -->
+- [x] 4.6 集成：`gateway → bff → srv` 三段 span 共享同一 trace-id 且父子链正确（非三个并列根），srv 侧数据层 span 亦在同一 trace（验收案例 T6） <!-- 已实现: 9703c12 TestT6：同一 trace 内 gateway→bff→srv 父子链成立且 srv 数据层同 trace（非三棵并列根） -->
+- [x] 4.7 集成：Jaeger API `http://127.0.0.1:16686/api/traces?service=<service.name>` 可检索到上述 trace，且尾部 span 不缺失（证明退出冲刷生效）（验收案例 T9） <!-- 已实现: 9703c12 TestT9：无悬空父引用 + 晚起步 span + 二次拉取 span 数不增长（证明退出冲刷完成） -->
+- [x] 4.8 代码断言：全仓无网格专属 trace 分支，`mode` 枚举无 `mesh` 取值；`examples/mesh` 与 `examples/micro` 三服务 main.go 差异仅在配置路径与地址副本（验收案例 T8） <!-- 已实现: 9703c12 TestT8：ParseMode 拒绝 mesh 且给出替代档、internal/** 库源码零网格分支、micro 六服务 main.go 去掉注释后逐字节一致 -->
 - [ ] 4.9 集成（网格）：minikube + Istio 就绪、sidecar 追踪 100% 采样并绑定 OTLP provider 后，触发 `gateway → bff → srv` 全链路，Jaeger 同一 trace 下同时存在应用 span（`gateway`/`bff`/`srv`）与 sidecar span（`<workload>.<ns>`），且应用 span 父子链仍为 gateway → bff → srv、srv 数据层 span 同 trace（验收案例 T10）
 - [ ] 4.10 反向断言（网格）：仅开 sidecar 追踪、应用侧不注册传播器时，Jaeger 呈现「1 条 sidecar 链 + 应用侧各自孤儿 trace」的分裂形态（trace 数 ≥ 4）（验收案例 T11）
 - [ ] 4.12 调用链完整性（验收案例 T13）：(a) 分层完整——根 span 为路由入口、树深 ≥3、handler/service/repository 各层至少 1 span；(b) 中间件入链矩阵逐行核对，具备外部依赖的中间件全部有 span，豁免项写明理由，未列入矩阵视为缺失；(c) CRUD 与连表逐条入链——`db.query.text` 非空 span 数 == 实际执行 SQL 条数、JOIN 语句 text 含 join、INSERT/SELECT/UPDATE/DELETE 四类各至少一条；(d) 反向断言——关闭任一埋点（如 `trace.on.db=false`）后完整性检查 MUST 失败

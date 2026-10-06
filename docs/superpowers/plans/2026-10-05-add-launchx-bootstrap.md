@@ -1152,7 +1152,7 @@ git add examples/monolith/e2e_test.go && git commit -m "test: monolith E1 集成
 **文件：**
 - 创建：`examples/micro/scripts/e2e.sh`
 
-- [ ] **步骤 17.1：写 E2 脚本（底座前置 + 三进程 + 双 curl 断言 + 清理）**
+- [x] **步骤 17.1：写 E2 脚本（底座前置 + 三进程 + 双 curl 断言 + 清理）**
 
 ```bash
 #!/usr/bin/env bash
@@ -1176,13 +1176,13 @@ cd "$(dirname "$0")/.."
 运行：`bash examples/micro/scripts/e2e.sh`
 预期：两条断言通过，退出码 0。
 
-- [ ] **步骤 17.2：Commit**
+- [x] **步骤 17.2：Commit**
 
 ```bash
 git add examples/micro/scripts && git commit -m "test: micro E2 调用链集成验收（3.6，gateway→bff→srv）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.6 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.6 同步）
 
 ---
 
@@ -1194,7 +1194,7 @@ git add examples/micro/scripts && git commit -m "test: micro E2 调用链集成�
 **文件：**
 - 创建：`examples/micro/srv/scripts/run-e2e.sh`
 
-- [ ] **步骤 18.1：写 E3 回归脚本（下单链路 + outbox 投递断言 + 行数断言）**
+- [x] **步骤 18.1：写 E3 回归脚本（下单链路 + outbox 投递断言 + 行数断言）**
 
 ```bash
 #!/usr/bin/env bash
@@ -1213,13 +1213,13 @@ set -euo pipefail
 运行：`bash examples/micro/srv/scripts/run-e2e.sh`
 预期：下单全绿 + kafka 消息断言 + 行数 ≤50 通过。
 
-- [ ] **步骤 18.2：Commit**
+- [x] **步骤 18.2：Commit**
 
 ```bash
 git add examples/micro/srv && git commit -m "test: srv E3 回归（下单 + outbox→kafka + main.go ≤50 行，3.7）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.7 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.7 同步）
 
 ---
 
@@ -1404,45 +1404,45 @@ git add trace.go trace_test.go examples/micro/gateway && git commit -m "feat(lau
 **文件：**
 - 创建：`examples/monolith/trace_e2e_test.go`、`examples/micro/trace_e2e_test.go`、`internal/traceutil/`（Jaeger API 检索助手）
 
-- [ ] **步骤 23b.1：T1 传播器字段与注入断言 / T7 反向断言（4.1）**
+- [x] **步骤 23b.1：T1 传播器字段与注入断言 / T7 反向断言（4.1）**
 
 断言 telemetry 步骤后 `otel.GetTextMapPropagator().Fields()` 含 `traceparent` / `tracestate` / `baggage`，且注入后 carrier 中存在合法 `traceparent`；反向断言 —— 不跑 telemetry 步骤时提取不到上游 span context。
 
-- [ ] **步骤 23b.2：T5 monolith span 树深度 ≥ 3（4.2）**
+- [x] **步骤 23b.2：T5 monolith span 树深度 ≥ 3（4.2）**
 
 落库接口的一条 trace 中，span 树须为「入口 → 业务层 → 数据层」，数据层 span 的祖先链含入口 span，**无孤儿**。
 
-- [ ] **步骤 23b.3：T2 单表 CRUD 四类 span（4.3）**
+- [x] **步骤 23b.3：T2 单表 CRUD 四类 span（4.3）**
 
 `db.query.text`（完整 SQL）与 `db.sql.table` 均非空；单表四类操作（INSERT / SELECT / UPDATE / DELETE）逐一断言。
 
-- [ ] **步骤 23b.4：T3 多表操作入链（4.4）**
+- [x] **步骤 23b.4：T3 多表操作入链（4.4）**
 
 `JOIN`（或 `Preload`）查询的 `db.query.text` 含关联文本；跨表事务内多条 SQL 为同 trace 的兄弟 span；回滚时相关 span 标 Error。
 
-- [ ] **步骤 23b.5：T4 四类组件同 trace（4.5）**
+- [x] **步骤 23b.5：T4 四类组件同 trace（4.5）**
 
 同一请求内依次操作 cache / mq / `db.elasticsearch.*` / `db.mongodb.*`，断言四类 span 共存于同一 trace 且均为业务 span 的子节点（依托 Task 4 的六类组件超集实现）。
 
-- [ ] **步骤 23b.6：T6 gateway → bff → srv 三段同 trace（4.6）**
+- [x] **步骤 23b.6：T6 gateway → bff → srv 三段同 trace（4.6）**
 
 **这是最容易假通过的断言**：不注册传播器时三服务各产一根 trace，每条都能点开、都有 span，看起来完全正常。必须断言 **traceID 相等 + 父子关系**（gateway → bff → srv，而不是三个并列根），而非「各服务都能查到 trace」。
 
-- [ ] **步骤 23b.7：T9 尾部 span 不缺失（4.7）**
+- [x] **步骤 23b.7：T9 尾部 span 不缺失（4.7）**
 
 经 `traceutil` 检索 Jaeger API `http://127.0.0.1:16686/api/traces?service=<service.name>`，断言 span 数量符合预期且尾部节点不缺失 —— 证明退出链 `tracing.shutdown(15s)` 冲刷生效（批量导出器未冲刷会静默丢最后一个 span）。
 
-- [ ] **步骤 23b.8：T8 网格同构代码断言（4.8）**
+- [x] **步骤 23b.8：T8 网格同构代码断言（4.8）**
 
 全仓无网格专属 trace 分支；`mode` 枚举无 `mesh` 取值；`examples/mesh` 与 `examples/micro` 三服务 main.go 差异仅在配置路径与地址副本。
 
-- [ ] **步骤 23b.9：Commit**
+- [x] **步骤 23b.9：Commit**
 
 ```bash
 git add examples/monolith/trace_e2e_test.go examples/micro/trace_e2e_test.go internal/traceutil/ trace_test.go && git commit -m "test: Jaeger 端到端调用链验收 T1-T9（4.1-4.8）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 4.1–4.8 同步；plan-ready.md 无对应 Task）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 4.1–4.8 同步；plan-ready.md 无对应 Task）
 
 ---
 

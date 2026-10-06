@@ -200,13 +200,13 @@
 - 验证方式：`go test ./examples/monolith/ -v` 全绿
 
 ### Task 19: micro 调用链集成验收（验收案例 E2）
-- [ ] **任务完成**（与 superpowers plan `Task 19`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 19`、`tasks.md` 对应条目同步勾选）
 - 目标：`examples/micro/e2e_test.go` 或 `scripts/e2e.sh`：共享底座（`hubx/dockers` compose，consul + kafka + jaeger）就绪 → 启 srv/bff/gateway 三进程 → `curl gateway /api/ping` 与 `/api/order/1001` 断言 gateway→bff→srv 链路返回 → 清理
 - 改动文件：`examples/micro/e2e_test.go` 或 `examples/micro/scripts/e2e.sh`
 - 验证方式：执行脚本/测试全绿（本地 consul docker 可用前提）
 
 ### Task 20: srv-order e2e 回归（验收案例 E3）
-- [ ] **任务完成**（与 superpowers plan `Task 20`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 20`、`tasks.md` 对应条目同步勾选）
 - 目标：将 micro_apps 原下单 e2e 场景对接 `examples/micro/srv`：共享底座（`hubx/dockers` compose，mysql 8.4 + kafka）就绪 → 迁移服务启动 → 下单 RPC 链路（含 outbox 经 kafka 投递断言：topic 自动创建，消费端或直查 kafka 确认消息落地）→ 断言 `examples/micro/srv/cmd/main.go` ≤50 行
 - 改动文件：`examples/micro/srv/e2e_test.go`（或 scripts/run-e2e.sh）
 - 验证方式：e2e 全绿 + `wc -l` 断言通过
