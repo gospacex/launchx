@@ -80,7 +80,7 @@ go run ./cmd
 | POST | `/orders` | 建单：事务写 orders + order_items | `db.create` × 2 → `messaging.PublishOrder`+`messaging.kafka.send`、`search.IndexOrder`+`db.elasticsearch.index`、`docs.SaveSnapshot`+`db.mongodb.insert` |
 | GET | `/orders?limit=20` | 单表列表 | `db.query` |
 | GET | `/orders/search?q=` | **检索**（ES） | `search.SearchOrder` + `db.elasticsearch.search` |
-| GET | `/orders/:order_no` | 单表单条，**缓存 read-through** | `cache.GetOrder`+`db.redis.GET`、未命中则 `repository.Get`+`db.query`、回写 `cache.SetOrder`+`db.redis.SET` |
+| GET | `/orders/:order_no` | 单表单条，**缓存 read-through** | `cache.GetOrder`+`db.redis.GET`、未命中则 `repository.order.Get`+`db.query`、回写 `cache.SetOrder`+`db.redis.SET` |
 | GET | `/orders/:order_no/join` | **连表**：orders JOIN users | JOIN 语句单独成 span（`db.query.text` 含 `join`） |
 | GET | `/orders/:order_no/snapshot` | **文档库**：读该单快照 | `docs.FindSnapshot` + `db.mongodb.find_one` |
 | GET | `/secure/orders`（需 `X-Token`） | **鉴权**入口 | `middleware.AuthToken` + `db.redis.GET` |
@@ -153,6 +153,36 @@ cd examples/monolith && go test ./...            # 约 2.5 分钟
 
 环境不具备（无 go / mysql 不可达 / 无 docker）时用例 **Skip 并写明缺什么**，
 不会假装通过；库名统一走 `order_mono`。
+
+### 存储句柄的来源与入链确认（`internal/handlesrc`）
+
+装配期（`app.Setup` 刚取到句柄、还没分发给分层时）对六个存储组件逐个核对两件
+事：句柄是不是 launchx 交出来的、经它执行的操作会不会真的进调用链。**背离即
+fail-fast**（服务起不来），而不是 Warn —— 这类失效一律无声：自己 `gorm.Open`
+一个同名库照样能查能写，组件开关没打开也照样能读写，唯一的差别是 Jaeger 上整片
+span 消失，而进程看着完全健康。
+
+| 组件 | 判据 | 强度 |
+|---|---|---|
+| db | 探 dbx 注册在 gorm 句柄上的四个 trace 回调（`dbx:trace_before_*`） | 最强：是来源的实质证据 |
+| cache / mongodb | 读 SDK 的全局 `IsTracingEnabled()`（由 builder 写入） | 中 |
+| kv / mq / search | 读 `traceflag.EnabledFor("<sdk>")` | 弱：只能反映开关链，拿不到实例级字段 |
+
+三者强度不一致是事实，写在这是希望别被当成同一类证据。kv / mq / search 那三条
+补不上来的部分（"挡不住拿自造句柄冒充"）由 `handlesrc_test.go` 的源码守卫兜住：
+它用 AST 扫全案例，禁止出现 `gorm.Open` / `redis.NewClient` / `mongo.Connect` / `elasticsearch.NewClient` / `kafka.New*` 等自建调用（走 AST 而非 grep，是因为
+这些串会出现在错误提示和注释里，grep 会把释义当违规）。
+
+期望值取的是**有效裁决** `trace.enabled AND trace.on.<name>`，不是 yaml 原话：
+traceflag 的全局位默认 true，且 launchx 并不把 `trace.enabled` 写进去（它在
+provider 侧），照原话当期望值会把"总闸关"这种正当配置判成背离。
+
+对应用例：单测 `TestVerifyDBXRejectsBareHandle` / `TestDivergedOnlyFlagsSilentLoss`，
+真机 `TestE1StorageHandlesVerifiedInProcess`（断言进程日志里六条 `joins_trace=true`）。
+
+> 坑位记录：`VerifyDBX` 里判 nil 的顺序不能改 —— `gorm.DB` 内嵌的是**指针**
+> `type DB struct{ *Config }`，`Config` 为 nil 时 `db.Callback()` 不是返回 nil 而是
+> 当场 panic，于是"句柄不合格就让服务起不来"这道检查自己先把进程带崩了。
 
 ## 5. 本 demo 刻意不做的事
 

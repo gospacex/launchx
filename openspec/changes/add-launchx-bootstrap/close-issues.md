@@ -127,7 +127,34 @@ Task 24 实测三条判据，两条与现状冲突，**判据口径过时而非�
       mongodbx / searchx 首次被自动实测（此前长期 Skip）。库名统一走 `order_mono`
       （`order_db` 被 mall 的 schema 占着，缺 item/qty/amount 三列）。
 
-## 五、微服 T6 用例自身的缺陷（2026-10-07 修）
+## 五、存储句柄来源/入链确认（`examples/monolith/internal/handlesrc`，2026-10-07 新增）
+
+- [x] **`VerifyDBX` 对零值句柄 panic（已修）**：`gorm.DB` 内嵌的是**指针**
+      `type DB struct{ *Config }`，`Config` 为 nil 时 `db.Callback()` 不是返回 nil，
+      而是当场 nil dereference panic —— 于是"句柄不合格就让服务起不来"这道检查
+      自己先把进程带崩（退化成一个 crash loop 而不是一条 error）。既有的那句
+      `if db.Callback() == nil` 永远到不了。
+      修法：判 nil 时**先**判 `db.Config == nil`。同样形态的副本还有三份
+      （`examples/micro/pkg/handlecheck` 已修；`examples/monolith/internal/handlecheck`
+      与 `examples/mall/pkg/handlecheck` 属另一会话/另一路改动，**未动**，需 owner 并入）。
+- [x] **期望值不能取 yaml 原话**：判据初版用 `trace.on.<name>` 当期望，而
+      traceflag 的全局位 `init()` 里就是 true、launchx 又把 `trace.enabled` 落在
+      provider 侧（`telemetry.Init`）而非 traceflag 全局，故总闸关掉时组件开关读
+      出来仍是 true —— 会把"总闸关"这种正当配置判成背离，让本该带病跑的服务起
+      不来。改为**有效裁决** `trace.enabled AND trace.on.<name>`；回归用例
+      `TestDegradeTraceDisabledServesWithoutSpans`（2026-10-07 复跑：关总闸后零
+      span、下单仍成功，且进程正常起来）。
+- [x] **判据强度不一致（现状，非缺陷）**：dbx 能验到"回调在不在"（来源的实质证据）；
+      cachex / mongodbx 只能读 SDK 全局 `IsTracingEnabled()`；kvx / mqx / searchx
+      更弱，只有 `traceflag.EnabledFor("<sdk>")` —— 它们在构造期把实例级开关注册进
+      traceflag 组件位，装配期拿不到实例级字段。三者不可当成同一类证据使用，
+      故再配一条 AST 源码守卫兜"自造句柄"这一侧。
+- [x] **守卫必须走 AST 而不是 grep**：`gorm.Open` 这类串出现在错误提示与注释里
+      （本仓既有 handlecheck 即是），grep 会把释义当违规；且相对路径 "../.." 的
+      `filepath.Base` 是 ".."，会被"跳过隐藏目录"那条判据整个 SkipDir，walker
+      一次都不跑却显示通过（两处均已实际踩到）。
+
+## 六、微服 T6 用例自身的缺陷（2026-10-07 修）
 
 - [x] **anchor span 选得随机，判据假红**：`TestT6ThreeHopsShareOneTrace` 第 ③ 步
       取"第一个祖先链经过 bff 的域服 span"当 anchor，而 Jaeger 返回的 span 顺序
@@ -141,7 +168,7 @@ Task 24 实测三条判据，两条与现状冲突，**判据口径过时而非�
       `db.query|db.create|db.update|db.delete`，并显式处理缓存命中情形
       （否则缓存一热就测不到 SQL）。**未改**：改判据等于改验收口径，留给新 change。
 
-## 六、与本轮其它决策的交叉影响
+## 七、与本轮其它决策的交叉影响
 
 - [ ] **`examples/micro/srv` 已删除**（网格清单部署的 demo-srv，拆分前单域旧样例，
       含 3 个单测）。受影响的既有条目：tasks.md 3.7（E3 回归）、4.9–4.11

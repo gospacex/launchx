@@ -52,6 +52,15 @@ func VerifyDBX(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("handlecheck: db handle is nil")
 	}
+	// 顺序不能改：gorm.DB 内嵌的是 **指针**（type DB struct{ *Config }），
+	// callbacks 是经它提升上来的字段。Config 为 nil 时 db.Callback() 不是返回
+	// nil，而是当场 nil dereference panic —— 这道"句柄不合格就让服务起不来"的
+	// 检查会把进程自己带崩。见 examples/monolith/internal/handlesrc 的同名判据
+	// （那边用 TestVerifyDBXRejectsBareHandle 构造 &gorm.DB{} 锁住这条）。
+	if db.Config == nil {
+		return errors.New("handlecheck: db handle is not initialized (gorm.Config is nil); " +
+			"a dbx-produced handle always carries one")
+	}
 	if db.Callback() == nil {
 		return errors.New("handlecheck: db handle carries no gorm callbacks")
 	}

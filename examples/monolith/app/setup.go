@@ -13,6 +13,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -25,6 +26,7 @@ import (
 	"github.com/gospacex/launchx/examples/monolith/internal/cache"
 	"github.com/gospacex/launchx/examples/monolith/internal/docs"
 	"github.com/gospacex/launchx/examples/monolith/internal/handler"
+	"github.com/gospacex/launchx/examples/monolith/internal/handlesrc"
 	"github.com/gospacex/launchx/examples/monolith/internal/messaging"
 	"github.com/gospacex/launchx/examples/monolith/internal/middleware"
 	"github.com/gospacex/launchx/examples/monolith/internal/ratelimit"
@@ -62,6 +64,27 @@ func Setup(a *launchx.App) error {
 		logger = logx.GetGlobal()
 	}
 	name := cfg.GetString("service.name")
+
+	// ---------- 存储句柄的来源与入链确认 ----------
+	// 必须在取用句柄之后、装配分层之前做：这时句柄刚由 launchx 的 builder 交出，
+	// 还没被任何业务代码包一层（包过之后就不是同一个实例了，判据失效）。
+	//
+	// 验两件事：①句柄来源合规（不是自己开的）；②trace.on 要求入链时它真的会产
+	// span。两者都不满足会照样能读写，只是走着走着链路就空了一块。
+	checks, err := handlesrc.VerifyOrError(a)
+	if err != nil {
+		return err
+	}
+	for _, c := range checks {
+		if !c.Present {
+			continue
+		}
+		logger.Info("storage handle verified",
+			logx.String("component", c.Component),
+			logx.String("backend", c.Backend),
+			logx.String("joins_trace", strconv.FormatBool(c.Observed)),
+			logx.String("probe", c.Probe))
+	}
 
 	repo := repository.New(db, tr)
 

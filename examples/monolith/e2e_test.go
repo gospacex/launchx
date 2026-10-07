@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -316,8 +317,15 @@ func (in *instance) waitExit(timeout time.Duration) (int, error) {
 	case <-in.state:
 		return in.code, nil
 	case <-time.After(timeout):
+		// SIGKILL 之前先要一份 goroutine 栈：直接杀掉就等于永远不知道它卡在哪。
+		// Go 运行时收到 SIGQUIT 会把所有 goroutine 的栈打到 stderr（这里就是
+		// in.logs），等一小会儿让这条输出走完管道。
+		_ = in.cmd.Process.Signal(syscall.SIGQUIT)
+		time.Sleep(1500 * time.Millisecond)
+		stack := tail(in.logs.String(), 60)
 		_ = in.cmd.Process.Signal(syscall.SIGKILL)
-		return 0, fmt.Errorf("%s 内进程没有退出（strict 即退未生效？）\n%s", timeout, tail(in.logs.String(), 30))
+		return 0, fmt.Errorf("%s 内进程没有退出（退出链挂住了？下面是退出前的栈）：\n%s",
+			timeout, stack)
 	}
 }
 
@@ -590,6 +598,56 @@ func TestE1MonolithServesMySQLThenExitsGracefully(t *testing.T) {
 		t.Errorf("进程已退出但 127.0.0.1:%d 仍可连：server.stop 没关掉监听，重启会 address already in use", in.port)
 	}
 	t.Logf("退出 ✓ code=0，端口 %d 已释放", in.port)
+}
+
+// TestE1StorageHandlesVerifiedInProcess 把手柄核对从"启动日志里看到了"升级成断言。
+//
+// 为什么值得单列一条：handlesrc 那六道核对是 fail-fast 的 —— 背离就起不来。这带来
+// 一个反向风险：**它一旦没跑到，进程照样正常起来**，而且没有任何痕迹。上面几条
+// 用例判的是"服务能不能用"，判不出"装配期那道检查有没有执行"（它可能压根没被
+// 调用，也可能因为 Present=false 被整段跳过）。所以这里直接对着进程日志断言。
+func TestE1StorageHandlesVerifiedInProcess(t *testing.T) {
+	requireApp(t)
+	if sharedInstance == nil {
+		t.Skip("共享实例不是本跑拉起的（MONOLITH_BASE 指向外部进程），取不到它的启动日志")
+	}
+
+	var lines []string
+	for _, l := range strings.Split(sharedInstance.logs.String(), "\n") {
+		if strings.Contains(l, "storage handle verified") {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		t.Fatalf("进程日志里没有 storage handle verified 记录：装配期的句柄核对没跑\n%s",
+			tail(sharedInstance.logs.String(), 30))
+	}
+
+	// 六个必须逐个出现且 joins_trace=true。用宽松正则而不是拆字段：logx 的落地
+	// 形态（key=value 还是 JSON、冒号后有没有空格）随部署而变，把断言绑在编码上
+	// 会让换个 encoder 就红，故用宽松正则匹配字段名与值。
+	compRe := func(comp string) *regexp.Regexp {
+		return regexp.MustCompile(`component"?[=:]"?\s*"?` + comp + `\b`)
+	}
+	for _, comp := range []string{"db", "cache", "kv", "mq", "search", "mongodb"} {
+		var line string
+		for _, l := range lines {
+			if compRe(comp).MatchString(l) {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Errorf("进程日志里没有 %s 的核对记录（配了段却没参与核对 = 该组件的入链能力无人看守）", comp)
+			continue
+		}
+		if !regexp.MustCompile(`joins_trace"?[=:]"?\s*"?true`).MatchString(line) {
+			t.Errorf("%s 的核对结果是 joins_trace=false：trace.on.%s 要求入链，经它执行的操作却不会有 span\n%s",
+				comp, comp, truncate(line, 200))
+			continue
+		}
+		t.Logf("%s ✓ %s", comp, truncate(line, 160))
+	}
 }
 
 // TestE1MongoAndSearchBackendsReallyServe 把 mongodbx / searchx 从"配了段"推到"真的读写过"。
