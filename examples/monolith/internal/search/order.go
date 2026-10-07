@@ -10,9 +10,8 @@ import (
 
 	"github.com/gospacex/searchx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
+	"github.com/gospacex/otelx/layer"
 )
 
 // spanPrefix 本层前缀。
@@ -20,26 +19,26 @@ const spanPrefix = "search."
 
 // Order 订单索引。
 type Order struct {
-	cli   searchx.SearchClient
-	index string
-	tr    trace.Tracer
+	cli     searchx.SearchClient
+	index   string
+	traceOn bool
 }
 
 // NewOrder 构造订单索引。cli 由装配层从 App.Search() 取（业务不自建 ES 客户端）。
-func NewOrder(cli searchx.SearchClient, index string, tr trace.Tracer) *Order {
-	return &Order{cli: cli, index: index, tr: tr}
+func NewOrder(cli searchx.SearchClient, index string, traceOn bool) *Order {
+	return &Order{cli: cli, index: index, traceOn: traceOn}
 }
 
 // begin 开本层 span（沿用两段式 search.<Op> 命名），返回「收 error 再收尾」的闭包。
-func (o *Order) begin(ctx context.Context, op string) (context.Context, tracex.End) {
-	return tracex.BeginSpan(o.tr, ctx, spanPrefix+op, nil)
+func (o *Order) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "search", "order", op, o.traceOn, nil)
 }
 
 // Index 写一条订单进索引（订单号即文档 ID：幂等，覆盖写 = 更新）。
 func (o *Order) Index(ctx context.Context, id string, doc map[string]any) (err error) {
 	ctx, end := o.begin(ctx, "IndexOrder")
 	defer func() { end(err) }()
-	tracex.Attrs(ctx,
+	layer.Attrs(ctx,
 		attribute.String("search.index", o.index),
 		attribute.String("search.document_id", id),
 	)
@@ -57,7 +56,7 @@ func (o *Order) Index(ctx context.Context, id string, doc map[string]any) (err e
 func (o *Order) Search(ctx context.Context, query string, limit int) (out []map[string]any, err error) {
 	ctx, end := o.begin(ctx, "SearchOrder")
 	defer func() { end(err) }()
-	tracex.Attrs(ctx,
+	layer.Attrs(ctx,
 		attribute.String("search.index", o.index),
 		attribute.String("search.query", query),
 		attribute.Int("search.limit", limit),
@@ -67,7 +66,7 @@ func (o *Order) Search(ctx context.Context, query string, limit int) (out []map[
 	if err != nil {
 		return nil, fmt.Errorf("search: search order %q: %w", query, err)
 	}
-	tracex.Attrs(ctx, attribute.Int("search.hits", res.Total))
+	layer.Attrs(ctx, attribute.Int("search.hits", res.Total))
 
 	out = make([]map[string]any, 0, len(res.Hits))
 	for i, hit := range res.Hits {

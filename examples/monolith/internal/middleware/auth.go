@@ -15,9 +15,8 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
+	"github.com/gospacex/otelx/layer"
 )
 
 // 本层 span 前缀。
@@ -28,8 +27,8 @@ const spanPrefix = "middleware."
 // 中间件与 handler 都是 hertz 的回调形态（**没有返回值**），拿不到「返回的 err」
 // 交给收尾闭包，故在函数体里显式声明一个 err 变量：所有失败分支给它赋值，
 // defer 里的 end(err) 才能看到。少了这一步，失败路径就一个都标不上 —— 比不统一更糟。
-func begin(tr trace.Tracer, ctx context.Context, op string) (context.Context, tracex.End) {
-	return tracex.BeginSpan(tr, ctx, spanPrefix+op, nil)
+func begin(ctx context.Context, op string, traceOn bool) (context.Context, layer.End) {
+	return layer.Begin(ctx, "middleware", "order", op, traceOn, nil)
 }
 
 // Token 令牌校验中间件。
@@ -38,13 +37,13 @@ func begin(tr trace.Tracer, ctx context.Context, op string) (context.Context, tr
 // 留下一次 cache 调用。改成本地 map 比对会让这里变成无调用的纯 CPU 操作 —— 那就
 // 不该有 span，也不该出现在验收矩阵的"必须入链"栏里。
 type Token struct {
-	lookup func(ctx context.Context, token string) (int64, bool)
-	tr     trace.Tracer
+	lookup  func(ctx context.Context, token string) (int64, bool)
+	traceOn bool
 }
 
 // NewToken 构造令牌校验中间件。lookup 由装配层喂（实现基于缓存）。
-func NewToken(lookup func(ctx context.Context, token string) (int64, bool), tr trace.Tracer) *Token {
-	return &Token{lookup: lookup, tr: tr}
+func NewToken(lookup func(ctx context.Context, token string) (int64, bool), traceOn bool) *Token {
+	return &Token{lookup: lookup, traceOn: traceOn}
 }
 
 // Handle 校验 X-Token：不合法即 401 并中止后续 handler。
@@ -52,7 +51,7 @@ func NewToken(lookup func(ctx context.Context, token string) (int64, bool), tr t
 // 通过时把 user_id 塞进 request context（hertz 的 c.Set），下游 handler 不必再
 // 解一次令牌 —— 重复解析等于把"谁在调用"这件事在层间传两遍。
 func (m *Token) Handle(ctx context.Context, c *app.RequestContext) {
-	ctx, end := begin(m.tr, ctx, "AuthToken")
+	ctx, end := begin(ctx, "AuthToken", m.traceOn)
 	var err error
 	defer func() { end(err) }()
 
@@ -62,7 +61,7 @@ func (m *Token) Handle(ctx context.Context, c *app.RequestContext) {
 		fail(c, http.StatusUnauthorized, "missing X-Token")
 		return
 	}
-	tracex.Attrs(ctx, attribute.Bool("auth.token_present", true))
+	layer.Attrs(ctx, attribute.Bool("auth.token_present", true))
 
 	userID, ok := m.lookup(ctx, token)
 	if !ok {
@@ -73,7 +72,7 @@ func (m *Token) Handle(ctx context.Context, c *app.RequestContext) {
 		fail(c, http.StatusUnauthorized, "invalid token")
 		return
 	}
-	tracex.Attrs(ctx, attribute.Int64("auth.user_id", userID))
+	layer.Attrs(ctx, attribute.Int64("auth.user_id", userID))
 	c.Set("user_id", userID)
 	c.Next(ctx)
 }

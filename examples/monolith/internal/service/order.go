@@ -22,13 +22,14 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/otelx/layer"
+
 	"github.com/gospacex/launchx/examples/monolith/internal/cache"
 	"github.com/gospacex/launchx/examples/monolith/internal/docs"
 	"github.com/gospacex/launchx/examples/monolith/internal/messaging"
 	"github.com/gospacex/launchx/examples/monolith/internal/model"
 	"github.com/gospacex/launchx/examples/monolith/internal/repository"
 	"github.com/gospacex/launchx/examples/monolith/internal/search"
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 )
 
 // 领域错误。handler 按类型映射 HTTP 状态码，故这里的取值是业务语义而非 HTTP 语义。
@@ -63,31 +64,20 @@ type Service struct {
 	messaging *messaging.Order
 	search    *search.Order
 	docs      *docs.Order
-	tracer    trace.Tracer
+	traceOn   bool
 }
 
 // New 构造订单服务。
-func New(repo *repository.Repository, c *cache.Order, m *messaging.Order, s *search.Order, d *docs.Order, tracer trace.Tracer) *Service {
-	return &Service{repo: repo, cache: c, messaging: m, search: s, docs: d, tracer: tracer}
+func New(repo *repository.Repository, c *cache.Order, m *messaging.Order, s *search.Order, d *docs.Order, traceOn bool) *Service {
+	return &Service{repo: repo, cache: c, messaging: m, search: s, docs: d, traceOn: traceOn}
 }
 
 // begin 开 service 层 span，返回「收 error 再收尾」的闭包。
 //
 // quiet 传 nil：本层不豁免任何错误（见 ErrNotFound 注释里的两层判据差异）。
 // 方法的结果列表因此必须具名，defer 里的 err 才能覆盖所有 return 路径。
-func (s *Service) begin(ctx context.Context, op string) (context.Context, tracex.End) {
-	return tracex.Begin(s.tracer, ctx, "service", "order", op, nil)
-}
-
-// attrs 在当前 span 上挂属性。
-//
-// span 句柄由收尾闭包持有（本层不再外露），故经 ctx 取回 —— 与微服示例同一
-// 写法。IsRecording 判空：埋点关闭时 SpanFromContext 返回的是 noop span，
-// 对它写属性只是浪费一次接口调用，不会出错。
-func attrs(ctx context.Context, kvs ...attribute.KeyValue) {
-	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-		span.SetAttributes(kvs...)
-	}
+func (s *Service) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "order", op, s.traceOn, nil)
 }
 
 // mark 记录「非致命」依赖失败：记 event 与属性，但**不改 span 状态码**。
@@ -128,7 +118,7 @@ func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, er
 	if strings.TrimSpace(orderNo) == "" {
 		return nil, ErrInvalidInput
 	}
-	attrs(ctx, attribute.Bool("cache.enabled", s.cache != nil))
+	layer.Attrs(ctx, attribute.Bool("cache.enabled", s.cache != nil))
 
 	if s.cache != nil {
 		raw, cerr := s.cache.Get(ctx, orderNo)
@@ -139,7 +129,7 @@ func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, er
 				// 否则"命中率看着很高却每次都打库"会完全无从解释。
 				s.mark(ctx, "cache.decode_failed", derr)
 			} else {
-				attrs(ctx, attribute.Bool("cache.hit", true))
+				layer.Attrs(ctx, attribute.Bool("cache.hit", true))
 				return &cached, nil
 			}
 		} else if cerr != nil {
@@ -226,7 +216,7 @@ func (s *Service) fanout(ctx context.Context, order *model.Order) {
 			s.mark(ctx, "event.publish_failed", perr)
 		}
 	} else {
-		attrs(ctx, attribute.Bool("mq.skipped", true))
+		layer.Attrs(ctx, attribute.Bool("mq.skipped", true))
 	}
 
 	if s.search != nil {
@@ -242,7 +232,7 @@ func (s *Service) fanout(ctx context.Context, order *model.Order) {
 			s.mark(ctx, "search.index_failed", ierr)
 		}
 	} else {
-		attrs(ctx, attribute.Bool("search.skipped", true))
+		layer.Attrs(ctx, attribute.Bool("search.skipped", true))
 	}
 
 	if s.docs != nil {
@@ -258,7 +248,7 @@ func (s *Service) fanout(ctx context.Context, order *model.Order) {
 			s.mark(ctx, "docs.save_failed", serr)
 		}
 	} else {
-		attrs(ctx, attribute.Bool("docs.skipped", true))
+		layer.Attrs(ctx, attribute.Bool("docs.skipped", true))
 	}
 }
 

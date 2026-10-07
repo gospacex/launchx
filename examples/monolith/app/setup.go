@@ -35,9 +35,6 @@ import (
 	"github.com/gospacex/launchx/examples/monolith/internal/service"
 )
 
-// tracerName 业务侧 instrumentation 名（区别于 dbx / webx / 各组件 SDK 的 tracer 名）。
-const tracerName = "order"
-
 // demoUserID 演示令牌绑定的用户 ID（scripts/bring-up.sh 的种子用户之一）。
 const demoUserID = 1
 
@@ -57,8 +54,10 @@ func Setup(a *launchx.App) error {
 		return errors.New("monolith: webx engine is unavailable in this mode")
 	}
 
-	tr := a.Tracer().TracerProvider().Tracer(tracerName)
 	cfg := a.Config()
+	// 分层 span 的开关：与组件级 trace.on.* 各管一段（前者管业务分层，
+	// 后者管 db/mq/cache 等组件），不要互相顶替。
+	traceOn := cfg.GetBool("trace.enabled")
 	logger := a.Logger()
 	if logger == nil {
 		logger = logx.GetGlobal()
@@ -86,14 +85,14 @@ func Setup(a *launchx.App) error {
 			logx.String("probe", c.Probe))
 	}
 
-	repo := repository.New(db, tr)
+	repo := repository.New(db, traceOn)
 
 	// ---------- 缓存（订单 read-through + 令牌查询）----------
 	var orderCache *cache.Order
 	var tokenStore *cache.TokenStore
 	if inst := a.Cache()[name]; inst != nil {
 		ttl := durationOrDefault(cfg.GetString("demo.cache_ttl"), time.Minute)
-		orderCache = cache.NewOrder(inst, ttl, tr)
+		orderCache = cache.NewOrder(inst, ttl, traceOn)
 		store := cache.NewTokenStore(inst)
 		tokenStore = &store
 	} else {
@@ -118,7 +117,7 @@ func Setup(a *launchx.App) error {
 	// 注意键是 consumer.topic：producer 的目标 topic 在 mqx 里就是从这个键出来的，
 	// producer.topic 看似更贴切但当前不生效（详见 config.yaml 该段的注释）。
 	if p := a.MQ(); p != nil {
-		orderEvents = messaging.NewOrder(p, cfg.GetString("xmiddleware.mqx.instances."+name+".consumer.topic"), tr)
+		orderEvents = messaging.NewOrder(p, cfg.GetString("xmiddleware.mqx.instances."+name+".consumer.topic"), traceOn)
 	} else {
 		logger.Warn("monolith: mq unavailable, order events are not published",
 			logx.String("hint", "check xmiddleware.mqx"))
@@ -127,7 +126,7 @@ func Setup(a *launchx.App) error {
 	// ---------- 检索（ES 索引）----------
 	var orderIndex *search.Order
 	if cli := a.Search(); cli != nil {
-		orderIndex = search.NewOrder(cli, cfg.GetString("demo.order_index"), tr)
+		orderIndex = search.NewOrder(cli, cfg.GetString("demo.order_index"), traceOn)
 	} else {
 		logger.Warn("monolith: search unavailable, orders are not indexed",
 			logx.String("hint", "check xmiddleware.searchx"))
@@ -137,13 +136,13 @@ func Setup(a *launchx.App) error {
 	// 集合句柄在这层取好：缺库缺集合应当在装配期暴露，不该拖到第一次写数据时。
 	var snapshots *docs.Order
 	if inst := a.Mongo()[name]; inst != nil {
-		snapshots = docs.NewOrder(inst.Collection(cfg.GetString("demo.snapshot_collection")), tr)
+		snapshots = docs.NewOrder(inst.Collection(cfg.GetString("demo.snapshot_collection")), traceOn)
 	} else {
 		logger.Warn("monolith: mongo unavailable, order snapshots are not stored",
 			logx.String("hint", "check xmiddleware.mongodbx"))
 	}
 
-	svc := service.New(repo, orderCache, orderEvents, orderIndex, snapshots, tr)
+	svc := service.New(repo, orderCache, orderEvents, orderIndex, snapshots, traceOn)
 
 	// ---------- 业务中间件：鉴权 ----------
 	// 凭据走缓存，故只在缓存可用时装配；令牌为空则不注册 /secure 路由，
@@ -172,7 +171,7 @@ func Setup(a *launchx.App) error {
 		if err != nil {
 			logger.Warn("monolith: seed demo token failed", logx.Err(err))
 		}
-		tokMW := middleware.NewToken(tokenStore.Resolve, tr)
+		tokMW := middleware.NewToken(tokenStore.Resolve, traceOn)
 		auth = tokMW.Handle
 	}
 
@@ -182,11 +181,11 @@ func Setup(a *launchx.App) error {
 	// 门控换成 KV 就绪与否（不再是缓存可用）：计数数字段的实际依赖变了，
 	// 跟着旧门控走会出现"缓存挂了但计数其实还能用"的误判。
 	if counter.Ready() {
-		rl := middleware.NewRateLimit(counter, cfg.GetInt64("demo.rate_limit_per_min"), time.Minute, tr)
+		rl := middleware.NewRateLimit(counter, cfg.GetInt64("demo.rate_limit_per_min"), time.Minute, traceOn)
 		engine.Engine.Use(rl.Handle)
 	}
 
-	RegisterRoutes(engine.Engine, handler.New(svc, tr), auth)
+	RegisterRoutes(engine.Engine, handler.New(svc, traceOn), auth)
 	return nil
 }
 

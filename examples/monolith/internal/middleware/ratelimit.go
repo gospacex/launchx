@@ -10,9 +10,8 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
+	"github.com/gospacex/otelx/layer"
 )
 
 // Counter 窗口计数器（由 internal/ratelimit 注入 kvx 实现）。
@@ -30,12 +29,12 @@ type RateLimit struct {
 	counter Counter
 	limit   int64
 	window  time.Duration
-	tr      trace.Tracer
+	traceOn bool
 }
 
 // NewRateLimit 构造限流中间件。limit/window 由配置注入。
-func NewRateLimit(counter Counter, limit int64, window time.Duration, tr trace.Tracer) *RateLimit {
-	return &RateLimit{counter: counter, limit: limit, window: window, tr: tr}
+func NewRateLimit(counter Counter, limit int64, window time.Duration, traceOn bool) *RateLimit {
+	return &RateLimit{counter: counter, limit: limit, window: window, traceOn: traceOn}
 }
 
 // Handle 按客户端 IP 计数，超限即 429。
@@ -48,27 +47,27 @@ func NewRateLimit(counter Counter, limit int64, window time.Duration, tr trace.T
 //   - 超限 = 主动拒绝，属性 ratelimit.exceeded=true
 //     混在一起的话，「限流没生效」和「限流生效了但被打爆」在错误率上长得一样。
 func (m *RateLimit) Handle(ctx context.Context, c *app.RequestContext) {
-	ctx, end := begin(m.tr, ctx, "RateLimit")
+	ctx, end := begin(ctx, "RateLimit", m.traceOn)
 	var err error
 	defer func() { end(err) }()
 
 	ip := c.ClientIP()
 	bucket := strconv.FormatInt(time.Now().Unix()/int64(m.window.Seconds()), 10)
 	n, cerr := m.counter.Incr(ctx, fmt.Sprintf("rate:%s:%s", ip, bucket), m.window)
-	tracex.Attrs(ctx,
+	layer.Attrs(ctx,
 		attribute.String("ratelimit.key", ip),
 		attribute.Int64("ratelimit.limit", m.limit),
 		attribute.Int64("ratelimit.count", n),
 	)
 	if cerr != nil {
 		err = cerr
-		tracex.Attrs(ctx, attribute.Bool("ratelimit.degraded", true))
+		layer.Attrs(ctx, attribute.Bool("ratelimit.degraded", true))
 		c.Next(ctx) // 组件不可用 → 放行，错误已在 span 上
 		return
 	}
 	if m.limit > 0 && n > m.limit {
 		err = errors.New("ratelimit: exceeded")
-		tracex.Attrs(ctx, attribute.Bool("ratelimit.exceeded", true))
+		layer.Attrs(ctx, attribute.Bool("ratelimit.exceeded", true))
 		fail(c, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}

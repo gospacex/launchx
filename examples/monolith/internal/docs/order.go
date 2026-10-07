@@ -12,9 +12,8 @@ import (
 
 	mongodbx "github.com/gospacex/mongodbx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
+	"github.com/gospacex/otelx/layer"
 )
 
 // spanPrefix 本层前缀。
@@ -32,21 +31,21 @@ type OrderSnapshot struct {
 
 // Order 订单快照仓储。
 type Order struct {
-	coll mongodbx.Collection
-	tr   trace.Tracer
+	coll    mongodbx.Collection
+	traceOn bool
 }
 
 // NewOrder 构造快照仓储。
 //
 // 集合句柄（而非 DB）在装配层就取好：缺库缺集合的情况应当在装配期暴露，
 // 不该拖到第一次写数据时才报错。
-func NewOrder(coll mongodbx.Collection, tr trace.Tracer) *Order {
-	return &Order{coll: coll, tr: tr}
+func NewOrder(coll mongodbx.Collection, traceOn bool) *Order {
+	return &Order{coll: coll, traceOn: traceOn}
 }
 
 // begin 开本层 span（沿用两段式 docs.<Op> 命名），返回「收 error 再收尾」的闭包。
-func (o *Order) begin(ctx context.Context, op string, quiet func(error) bool) (context.Context, tracex.End) {
-	return tracex.BeginSpan(o.tr, ctx, spanPrefix+op, quiet)
+func (o *Order) begin(ctx context.Context, op string, quiet func(error) bool) (context.Context, layer.End) {
+	return layer.Begin(ctx, "docs", "order", op, o.traceOn, quiet)
 }
 
 // Save 写一份快照，返回文档 ID。同一单多次写入会产生多份历史快照（追加语义），
@@ -54,7 +53,7 @@ func (o *Order) begin(ctx context.Context, op string, quiet func(error) bool) (c
 func (o *Order) Save(ctx context.Context, snap OrderSnapshot) (id string, err error) {
 	ctx, end := o.begin(ctx, "SaveSnapshot", nil)
 	defer func() { end(err) }()
-	tracex.Attrs(ctx, attribute.String("docs.entity", "order_snapshots"))
+	layer.Attrs(ctx, attribute.String("docs.entity", "order_snapshots"))
 
 	id, err = o.coll.Insert(ctx, mongodbx.Document{
 		"order_no": snap.OrderNo,
@@ -80,7 +79,7 @@ func (o *Order) Find(ctx context.Context, orderNo string) (doc mongodbx.Document
 		return errors.Is(err, mongodbx.ErrNotFound)
 	})
 	defer func() { end(err) }()
-	tracex.Attrs(ctx, attribute.String("docs.entity", "order_snapshots"))
+	layer.Attrs(ctx, attribute.String("docs.entity", "order_snapshots"))
 
 	doc, err = o.coll.FindOne(ctx, mongodbx.Document{"order_no": orderNo})
 	if err != nil {

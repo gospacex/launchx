@@ -12,11 +12,11 @@ import (
 	"net/http"
 
 	"github.com/gospacex/launchx"
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 	"github.com/gospacex/mqx"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gospacex/otelx/layer"
 )
 
 // spanPrefix 本层前缀。
@@ -26,12 +26,12 @@ const spanPrefix = "messaging."
 type Order struct {
 	producer mqx.Producer
 	topic    string
-	tr       trace.Tracer
+	traceOn  bool
 }
 
 // NewOrder 构造投递器。producer 由装配层从 App.MQ() 取；topic 来自配置。
-func NewOrder(producer mqx.Producer, topic string, tr trace.Tracer) *Order {
-	return &Order{producer: producer, topic: topic, tr: tr}
+func NewOrder(producer mqx.Producer, topic string, traceOn bool) *Order {
+	return &Order{producer: producer, topic: topic, traceOn: traceOn}
 }
 
 // flatten 把 http.Header 摊平成 mqx 的消息头（多值取第一个）。
@@ -53,14 +53,14 @@ func flatten(h http.Header) map[string]string {
 // 降级语义由调用方保证 producer 非 nil —— 本方法不吞 nil：producer 为空时
 // 返回 error 并打进 span，让"事件没发出去"在链路上可见，而不是静默丢。
 // begin 开本层 span（沿用两段式 messaging.<Op> 命名），返回「收 error 再收尾」的闭包。
-func (o *Order) begin(ctx context.Context, op string) (context.Context, tracex.End) {
-	return tracex.BeginSpan(o.tr, ctx, spanPrefix+op, nil)
+func (o *Order) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "messaging", "order", op, o.traceOn, nil)
 }
 
 func (o *Order) Publish(ctx context.Context, key string, payload []byte) (err error) {
 	ctx, end := o.begin(ctx, "PublishOrder")
 	defer func() { end(err) }()
-	tracex.Attrs(ctx,
+	layer.Attrs(ctx,
 		attribute.String("messaging.system", "kafka"),
 		attribute.String("messaging.destination", o.topic),
 		attribute.String("messaging.message_key", key),

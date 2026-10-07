@@ -13,22 +13,22 @@ import (
 	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gospacex/otelx/layer"
 
 	"github.com/gospacex/launchx/examples/monolith/internal/model"
 	"github.com/gospacex/launchx/examples/monolith/internal/service"
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 )
 
 // OrderHandler 订单 HTTP 入口。
 type OrderHandler struct {
-	svc    *service.Service
-	tracer trace.Tracer
+	svc     *service.Service
+	traceOn bool
 }
 
 // New 构造订单 handler。
-func New(svc *service.Service, tracer trace.Tracer) *OrderHandler {
-	return &OrderHandler{svc: svc, tracer: tracer}
+func New(svc *service.Service, traceOn bool) *OrderHandler {
+	return &OrderHandler{svc: svc, traceOn: traceOn}
 }
 
 // begin 开 handler 层 span，返回「收 error 再收尾」的闭包。
@@ -38,8 +38,8 @@ func New(svc *service.Service, tracer trace.Tracer) *OrderHandler {
 //
 // handler 是 hertz 回调（无返回值），故每个方法里显式 `var err error` 并在失败
 // 分支赋值 —— 少这一步，失败路径在 Jaeger 上就是"成功"的绿色。
-func (h *OrderHandler) begin(ctx context.Context, op string) (context.Context, tracex.End) {
-	return tracex.Begin(h.tracer, ctx, "handler", "order", op, nil)
+func (h *OrderHandler) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "handler", "order", op, h.traceOn, nil)
 }
 
 // List GET /orders —— 单表查询入口（E1 的 JSON 数组断言落在这里）。

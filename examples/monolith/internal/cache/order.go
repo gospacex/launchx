@@ -16,9 +16,8 @@ import (
 
 	"github.com/gospacex/cachex"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
-	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
+	"github.com/gospacex/otelx/layer"
 )
 
 // 本层 span 前缀，与服务 / 数据层的前缀互不相犯。
@@ -26,14 +25,14 @@ const spanPrefix = "cache."
 
 // Order 订单缓存。
 type Order struct {
-	inst cachex.Cache
-	ttl  time.Duration
-	tr   trace.Tracer
+	inst    cachex.Cache
+	ttl     time.Duration
+	traceOn bool
 }
 
 // NewOrder 构造订单缓存。inst 由装配层从 App.Cache() 取（业务不自建连接）。
-func NewOrder(inst cachex.Cache, ttl time.Duration, tr trace.Tracer) *Order {
-	return &Order{inst: inst, ttl: ttl, tr: tr}
+func NewOrder(inst cachex.Cache, ttl time.Duration, traceOn bool) *Order {
+	return &Order{inst: inst, ttl: ttl, traceOn: traceOn}
 }
 
 // key 订单缓存键。集中一处，避免读写两侧拼法不一致导致「写了读不到」。
@@ -41,8 +40,8 @@ func key(orderNo string) string { return "order:" + orderNo }
 
 // begin 开本层 span（名字沿用既有的两段式 cache.<Op>，不走三段式，
 // 改名会打断既有 trace 判据），返回「收 error 再收尾」的闭包。
-func (c *Order) begin(ctx context.Context, op string) (context.Context, tracex.End) {
-	return tracex.BeginSpan(c.tr, ctx, spanPrefix+op, nil)
+func (c *Order) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "cache", "order", op, c.traceOn, nil)
 }
 
 // Get 读订单缓存。未命中返回 ("", nil) —— miss 不是错误，
@@ -50,14 +49,14 @@ func (c *Order) begin(ctx context.Context, op string) (context.Context, tracex.E
 func (c *Order) Get(ctx context.Context, orderNo string) (v string, err error) {
 	ctx, end := c.begin(ctx, "GetOrder")
 	defer func() { end(err) }()
-	tracex.Attrs(ctx, attribute.String("cache.key", key(orderNo)))
+	layer.Attrs(ctx, attribute.String("cache.key", key(orderNo)))
 
 	v, err = c.inst.Get(ctx, key(orderNo))
 	if err != nil {
 		err = fmt.Errorf("cache: get order %q: %w", orderNo, err)
 		return "", err
 	}
-	tracex.Attrs(ctx, attribute.Bool("cache.hit", v != ""))
+	layer.Attrs(ctx, attribute.Bool("cache.hit", v != ""))
 	return v, nil
 }
 
@@ -65,7 +64,7 @@ func (c *Order) Get(ctx context.Context, orderNo string) (v string, err error) {
 func (c *Order) Set(ctx context.Context, orderNo, payload string) (err error) {
 	ctx, end := c.begin(ctx, "SetOrder")
 	defer func() { end(err) }()
-	tracex.Attrs(ctx,
+	layer.Attrs(ctx,
 		attribute.String("cache.key", key(orderNo)),
 		attribute.Int("cache.ttl_ms", int(c.ttl.Milliseconds())),
 	)
@@ -80,7 +79,7 @@ func (c *Order) Set(ctx context.Context, orderNo, payload string) (err error) {
 func (c *Order) Delete(ctx context.Context, orderNo string) (err error) {
 	ctx, end := c.begin(ctx, "DeleteOrder")
 	defer func() { end(err) }()
-	tracex.Attrs(ctx, attribute.String("cache.key", key(orderNo)))
+	layer.Attrs(ctx, attribute.String("cache.key", key(orderNo)))
 
 	if err = c.inst.Delete(ctx, key(orderNo)); err != nil {
 		err = fmt.Errorf("cache: delete order %q: %w", orderNo, err)

@@ -10,11 +10,10 @@ import (
 	"errors"
 	"fmt"
 
-	"go.opentelemetry.io/otel/trace"
+	"github.com/gospacex/otelx/layer"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/monolith/internal/model"
-	"github.com/gospacex/otelx/layer"
 )
 
 // ErrNotFound 订单不存在：把驱动层的 gorm.ErrRecordNotFound 在**持久层边界**
@@ -27,22 +26,22 @@ var ErrNotFound = errors.New("repository: order not found")
 
 // Repository 订单仓储：持权 launchx 挂载的 DB 句柄与调用链 tracer。
 type Repository struct {
-	db     *gorm.DB
-	tracer trace.Tracer
+	db      *gorm.DB
+	traceOn bool
 }
 
 // New 构造仓储。db 必须来自 App.DB() 的断言结果——本层不自建连接。
-func New(db *gorm.DB, tracer trace.Tracer) *Repository {
-	return &Repository{db: db, tracer: tracer}
+func New(db *gorm.DB, traceOn bool) *Repository {
+	return &Repository{db: db, traceOn: traceOn}
 }
 
 // begin 开 repository 层 span，返回「收 error 再收尾」的闭包。
 //
-// 与微服 / 电商示例同一口径（otelx/layer）：span 句柄不交给调用方（本层因此
+// 与微服 / 电商示例的 pkg/tracex 同一口径：span 句柄不交给调用方（本层因此
 // 不碰 otel 的 SetStatus / RecordError），由收尾闭包代标错误 —— 少一次手写就
 // 少一处漏标，漏标的表现是「SQL 报错但 span 是绿的」。
 func (r *Repository) begin(ctx context.Context, op string) (context.Context, layer.End) {
-	return layer.BeginWith(r.tracer, ctx, "repository", "order", op, quietNotFound)
+	return layer.Begin(ctx, "repository", "order", op, r.traceOn, quietNotFound)
 }
 
 // quietNotFound 「记录不存在」不是故障：一次未命中是正常 miss，标成错误会让
