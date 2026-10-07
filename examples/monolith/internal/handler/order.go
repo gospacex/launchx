@@ -13,11 +13,11 @@ import (
 	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/monolith/internal/model"
 	"github.com/gospacex/launchx/examples/monolith/internal/service"
+	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 )
 
 // OrderHandler 订单 HTTP 入口。
@@ -31,15 +31,27 @@ func New(svc *service.Service, tracer trace.Tracer) *OrderHandler {
 	return &OrderHandler{svc: svc, tracer: tracer}
 }
 
+// begin 开 handler 层 span，返回「收 error 再收尾」的闭包。
+//
+// span 名由另一处改为三段式 handler.order.<Op>（与 service / repository 对齐），
+// 本次只统一调用形态，不动命名。
+//
+// handler 是 hertz 回调（无返回值），故每个方法里显式 `var err error` 并在失败
+// 分支赋值 —— 少这一步，失败路径在 Jaeger 上就是"成功"的绿色。
+func (h *OrderHandler) begin(ctx context.Context, op string) (context.Context, tracex.End) {
+	return tracex.Begin(h.tracer, ctx, "handler", "order", op, nil)
+}
+
 // List GET /orders —— 单表查询入口（E1 的 JSON 数组断言落在这里）。
 func (h *OrderHandler) List(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.ListOrders")
-	defer span.End()
+	ctx, end := h.begin(ctx, "ListOrders")
+	var err error
+	defer func() { end(err) }()
 
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	orders, err := h.svc.List(ctx, limit)
 	if err != nil {
-		fail(span, c, http.StatusInternalServerError, err)
+		fail(c, http.StatusInternalServerError, err)
 		return
 	}
 	if orders == nil {
@@ -50,12 +62,13 @@ func (h *OrderHandler) List(ctx context.Context, c *app.RequestContext) {
 
 // Create POST /orders —— 创建订单（事务写 orders + order_items）。
 func (h *OrderHandler) Create(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.CreateOrder")
-	defer span.End()
+	ctx, end := h.begin(ctx, "CreateOrder")
+	var err error
+	defer func() { end(err) }()
 
 	var req createRequest
-	if err := c.Bind(&req); err != nil {
-		fail(span, c, http.StatusBadRequest, service.ErrInvalidInput)
+	if err = c.Bind(&req); err != nil {
+		fail(c, http.StatusBadRequest, service.ErrInvalidInput)
 		return
 	}
 	in := service.CreateInput{
@@ -67,7 +80,7 @@ func (h *OrderHandler) Create(ctx context.Context, c *app.RequestContext) {
 	}
 	order, err := h.svc.Create(ctx, in)
 	if err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusCreated, order)
@@ -75,12 +88,13 @@ func (h *OrderHandler) Create(ctx context.Context, c *app.RequestContext) {
 
 // Get GET /orders/:order_no —— 单表单条查询。
 func (h *OrderHandler) Get(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetOrder")
-	defer span.End()
+	ctx, end := h.begin(ctx, "GetOrder")
+	var err error
+	defer func() { end(err) }()
 
 	order, err := h.svc.Get(ctx, c.Param("order_no"))
 	if err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusOK, order)
@@ -88,12 +102,13 @@ func (h *OrderHandler) Get(ctx context.Context, c *app.RequestContext) {
 
 // GetWithUser GET /orders/:order_no/join —— 连表查询（orders JOIN users）。
 func (h *OrderHandler) GetWithUser(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetOrderWithUser")
-	defer span.End()
+	ctx, end := h.begin(ctx, "GetOrderWithUser")
+	var err error
+	defer func() { end(err) }()
 
 	order, err := h.svc.GetWithUser(ctx, c.Param("order_no"))
 	if err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusOK, order)
@@ -104,13 +119,14 @@ func (h *OrderHandler) GetWithUser(ctx context.Context, c *app.RequestContext) {
 // 路径刻意是独立的 /orders/search 而不是 /orders?q=：路由上 /orders/:order_no
 // 会先命中 "search"，把检索请求当订单号去查库。
 func (h *OrderHandler) Search(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.SearchOrders")
-	defer span.End()
+	ctx, end := h.begin(ctx, "SearchOrders")
+	var err error
+	defer func() { end(err) }()
 
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	out, err := h.svc.Search(ctx, c.Query("q"), limit)
 	if err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	if out == nil {
@@ -121,12 +137,13 @@ func (h *OrderHandler) Search(ctx context.Context, c *app.RequestContext) {
 
 // Snapshot GET /orders/:order_no/snapshot —— 读该单最近一份 Mongo 快照。
 func (h *OrderHandler) Snapshot(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetOrderSnapshot")
-	defer span.End()
+	ctx, end := h.begin(ctx, "GetOrderSnapshot")
+	var err error
+	defer func() { end(err) }()
 
 	doc, err := h.svc.Snapshot(ctx, c.Param("order_no"))
 	if err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusOK, doc)
@@ -134,8 +151,9 @@ func (h *OrderHandler) Snapshot(ctx context.Context, c *app.RequestContext) {
 
 // Update PUT /orders/:order_no —— 更新订单状态。
 func (h *OrderHandler) Update(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.UpdateOrder")
-	defer span.End()
+	ctx, end := h.begin(ctx, "UpdateOrder")
+	var err error
+	defer func() { end(err) }()
 
 	var req struct {
 		Status string `json:"status"`
@@ -143,7 +161,7 @@ func (h *OrderHandler) Update(ctx context.Context, c *app.RequestContext) {
 	_ = c.Bind(&req)
 	order, err := h.svc.UpdateStatus(ctx, c.Param("order_no"), req.Status)
 	if err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusOK, order)
@@ -151,11 +169,12 @@ func (h *OrderHandler) Update(ctx context.Context, c *app.RequestContext) {
 
 // Delete DELETE /orders/:order_no —— 删除订单与明细。
 func (h *OrderHandler) Delete(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.DeleteOrder")
-	defer span.End()
+	ctx, end := h.begin(ctx, "DeleteOrder")
+	var err error
+	defer func() { end(err) }()
 
 	if err := h.svc.Delete(ctx, c.Param("order_no")); err != nil {
-		fail(span, c, statusOf(err), err)
+		fail(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusOK, map[string]any{"order_no": c.Param("order_no"), "deleted": true})
@@ -171,10 +190,11 @@ type createRequest struct {
 	UnitPrice float64 `json:"unit_price"`
 }
 
-// fail 统一错误渲染：错误码记进 span，响应体只带领域文案（不泄漏内部细节）。
-func fail(span trace.Span, c *app.RequestContext, status int, err error) {
-	span.RecordError(err)
-	span.SetStatus(codes.Error, err.Error())
+// fail 统一错误渲染：响应体只带领域文案（不泄漏内部细节）。
+//
+// span 状态不再由这里标 —— 交给收尾闭包 end(err)：调用方只需在函数体里把失败
+// 赋给 err，不必记得"还要调一次 fail 才算标上"。
+func fail(c *app.RequestContext, status int, err error) {
 	c.JSON(status, map[string]string{"error": err.Error()})
 }
 
