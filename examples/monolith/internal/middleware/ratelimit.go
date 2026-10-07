@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,8 +10,9 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 )
 
 // Counter 窗口计数器（由 internal/ratelimit 注入 kvx 实现）。
@@ -40,27 +42,34 @@ func NewRateLimit(counter Counter, limit int64, window time.Duration, tr trace.T
 //
 // 计数失败时**放行**（fail-open）：限流组件挂了不该让全站不可用，
 // 但必须留在 span 上 —— 放行 + 无痕 = 事后无法解释"那阵子为什么没限住"。
+//
+// 两种「标 Error」的语义不同，靠属性区分而不是靠状态码：
+//   - 计数失败 = 依赖故障（fail-open 放行），属性 ratelimit.degraded=true
+//   - 超限 = 主动拒绝，属性 ratelimit.exceeded=true
+//     混在一起的话，「限流没生效」和「限流生效了但被打爆」在错误率上长得一样。
 func (m *RateLimit) Handle(ctx context.Context, c *app.RequestContext) {
-	ctx, span := m.tr.Start(ctx, spanPrefix+"RateLimit")
-	defer span.End()
+	ctx, end := begin(m.tr, ctx, "RateLimit")
+	var err error
+	defer func() { end(err) }()
 
 	ip := c.ClientIP()
 	bucket := strconv.FormatInt(time.Now().Unix()/int64(m.window.Seconds()), 10)
-	n, err := m.counter.Incr(ctx, fmt.Sprintf("rate:%s:%s", ip, bucket), m.window)
-	span.SetAttributes(
+	n, cerr := m.counter.Incr(ctx, fmt.Sprintf("rate:%s:%s", ip, bucket), m.window)
+	tracex.Attrs(ctx,
 		attribute.String("ratelimit.key", ip),
 		attribute.Int64("ratelimit.limit", m.limit),
 		attribute.Int64("ratelimit.count", n),
 	)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+	if cerr != nil {
+		err = cerr
+		tracex.Attrs(ctx, attribute.Bool("ratelimit.degraded", true))
 		c.Next(ctx) // 组件不可用 → 放行，错误已在 span 上
 		return
 	}
 	if m.limit > 0 && n > m.limit {
-		span.SetStatus(codes.Error, "ratelimit: exceeded")
-		fail(span, c, http.StatusTooManyRequests, "rate limit exceeded")
+		err = errors.New("ratelimit: exceeded")
+		tracex.Attrs(ctx, attribute.Bool("ratelimit.exceeded", true))
+		fail(c, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 	c.Next(ctx)
