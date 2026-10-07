@@ -19,6 +19,7 @@ import (
 	"github.com/gospacex/launchx/internal/mode"
 	"github.com/gospacex/launchx/internal/pipeline"
 	"github.com/gospacex/launchx/internal/telemetry"
+	"github.com/gospacex/launchx/internal/wiring"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	_ "github.com/gospacex/logx/zap" // 注册 logx 的 zap provider（无此空白导入 logx.New 会失败）
@@ -27,11 +28,6 @@ import (
 	"github.com/gospacex/otelx"
 	"github.com/gospacex/searchx"
 )
-
-// componentOrder 组件挂载顺序。db/cache/mq 先（业务最先用到），kv/lock 次之
-// （业务态与并发互斥，不依赖注册中心），registry 再次（服务端起来前要能注册），
-// search/mongodb 最后。
-var componentOrder = []string{"db", "cache", "mq", "kv", "lock", "registry", "search", "mongodb"}
 
 // serverShutdownTimeout 优雅停机排空 in-flight 请求的上限。
 const serverShutdownTimeout = 5 * time.Second
@@ -101,6 +97,9 @@ type App struct {
 	logger      logx.Logger
 	tracer      otelx.Provider
 	comp        *component.Env
+	// graph 是 component.mount 那一步由 wire 求解产出的注册面快照。
+	// 业务取句柄走 App.DB()/Cache()/... ，这里是为排查准备的（见 Graph 注释）。
+	graph *wiring.Graph
 
 	// 形态装配产物（stepMode 填充；服务端句柄以 any 承载，
 	// launchx 库源码不直接依赖 hertz/kitex）
@@ -133,6 +132,20 @@ func (a *App) Cache() cachex.Instances {
 // MQ 返回消息生产者。
 func (a *App) MQ() mqx.Producer {
 	v, _ := a.compProduct(func(c *component.Env) any { return c.MQ }).(mqx.Producer)
+	return v
+}
+
+// MQConsumer 返回消息消费者（App.MQ 是它的发布侧配对句柄）。
+//
+// 未装配 / 构造降级时为 nil，业务必须显式判空 —— 消费不到消息不会立刻被
+// 看见，静默跳过的后果是队列无声地一直涨。
+//
+// 使用姿势：拿到句柄后自行决定何时开始消费（一般是在一个可取消的 ctx 上调
+// Consume，并把 cancel 挂到 App.OnStop）。本方法**不**替业务起消费循环：
+// 什么时候开始消费、并发几路、失败要不要重投都是业务决策，框架替做会让
+// 退出顺序与位点提交时机变成不可控项。
+func (a *App) MQConsumer() mqx.Consumer {
+	v, _ := a.compProduct(func(c *component.Env) any { return c.MQConsumer }).(mqx.Consumer)
 	return v
 }
 
@@ -228,6 +241,14 @@ func (a *App) compProduct(fn func(*component.Env) any) any {
 	}
 	return fn(a.comp)
 }
+
+// Graph 返回 wire 求解产出的注册面快照（component.mount 之后才有值，此前为 nil）。
+//
+// 业务取句柄照旧走 App.DB()/Cache()/... —— 这个访问器不是给业务用的，是给
+// "为什么这个句柄是空的"这类排查用的：每个句柄带 Name() / Constructed() /
+// TraceEnabled()，能一次回答「构造了没有」与「开没开入链」，不必去翻日志，
+// 也不必去猜 yaml 里哪个段没生效。
+func (a *App) Graph() *wiring.Graph { return a.graph }
 
 // Engine 返回 webx 引擎（*webx.App）：monolith/bff/gateway 档非空，srv 档为 nil。
 //
@@ -475,10 +496,19 @@ func stopHook(srv any) func() error {
 	return rpcStop(srv)
 }
 
-// stepComponents 按固定顺序挂载六类内置组件。
+// stepComponents 挂载内置组件：经 wire 求解出的依赖顺序执行各 SDK 的构造。
 //
 // 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决：
 // 降级不打断启动，strict=true 则返回 error（由 Bootstrap 走完整反序退出链）。
+//
+// 为什么不再用一张手写的挂载顺序表：原先的 `componentOrder` 是八个字符串，
+// 顺序全靠人记谁依赖谁，加一个组件就要回头想它该插在哪。现在交给
+// `wiring.InitializeGraph` —— 顺序由 provider 的入参依赖推导，
+// 改一个 provider 的入参，其余自动跟着走。
+//
+// 注意 wire **只**接管顺序：presence / trace.on / strict 三条裁决仍在 provider
+// 内读 Env 完成（不进图，理由见 internal/wiring 包注释）。另外形态装配不在这里
+// 重做 —— mode.assemble 已在它前面跑过，图里那一步会判"已装配"并跳过。
 func (a *App) stepComponents(e *pipeline.Env) error {
 	cenv := &component.Env{
 		Cfg:         a.cfg,
@@ -487,10 +517,12 @@ func (a *App) stepComponents(e *pipeline.Env) error {
 		TraceOn:     a.boolMap("trace.on"),
 		Strict:      a.boolMap("strict"),
 	}
-	if err := component.Mount(cenv, componentOrder); err != nil {
+	graph, err := wiring.InitializeGraph(cenv, a.holders)
+	if err != nil {
 		return err
 	}
 	a.comp = cenv
+	a.graph = &graph
 	return nil
 }
 

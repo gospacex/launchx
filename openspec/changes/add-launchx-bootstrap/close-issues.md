@@ -88,6 +88,19 @@ Task 24 实测三条判据，两条与现状冲突，**判据口径过时而非�
       tag 排除的文件）一并计入。已改为三层判据：源码级（parser 查真实 import）、
       产物级（wire_gen.go 零 wire）、链接级（`go version -m` 查二进制模块清单）。
 
+- [x] **注册面接进主装配链路后的两个新发现（2026-10-07，随 5.11 一并修）**
+      - **typed nil 被当成"已构造"**：`Env.Cache` / `KV` / `Mongo` 是 map、slice 类的
+        命名类型，零值装进 `any` 之后 `raw != nil` 恒为真。单测里这些字段恒为零值、
+        没人问过"构造了没有"，接进主链路后 `Graph().Cache.Constructed()` 才第一次
+        被真问，立刻暴露：yaml 没配段却报已构造。修法见 `base.Constructed()`
+        （反射判 nil），回归断言 `TestConstructedRejectsTypedNil`。
+      - **形态装配会被跑两次**：pipeline 是 `mode.assemble → component.mount`，
+        而图里形态产物排在可选组件之后，于是图被求解时 mode 已经装过一遍。
+        再装一遍会换掉 `Out.Webx`，而 `a.engine` 早先已被交出去 —— 症状是
+        "引擎在听、路由一个都没有"。修法是 `ProvideModeReady` 判 `Out.Mode` 跳过，
+        断言见 `TestProvideModeReadySkipsWhenAlreadyAssembled` 与
+        `TestGraphWebHandleIsTheOneAppUses`。
+
 ## 四、与本轮其它决策的交叉影响
 
 - [ ] **`examples/micro/srv` 已删除**（网格清单部署的 demo-srv，拆分前单域旧样例，

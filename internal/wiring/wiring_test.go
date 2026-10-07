@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gospacex/launchx/internal/component"
+	"github.com/gospacex/launchx/internal/mode"
 )
 
 // 本文件是 dependency-injection capability W1–W7 的可执行判据。
@@ -241,6 +242,90 @@ func TestW5NoGormInLibrarySource(t *testing.T) {
 	}
 	if strings.Contains(string(b), "gorm.io/gorm") {
 		t.Errorf("component 层直接 import 了 gorm —— 库不得绑定具体 ORM（DB 句柄刻意保持 any）")
+	}
+}
+
+// TestProvideModeReadySkipsWhenAlreadyAssembled 形态装配只做一次。
+//
+// 为什么值得单测：pipeline 的顺序是 mode.assemble → component.mount，而图里
+// 形态产物排在可选组件之后，所以本图被求解时 mode 已经装过一遍了。若这里再装
+// 一次，Out 会换成一批新产物（新的 webx 引擎、新的 kitex 选项），而 App 在
+// mode 步骤已经把旧的 out.Webx 交给了 a.engine —— 症状是"引擎起来了，路由却挂
+// 在另一个引擎上"，且不报任何错。这种错在 Jaeger 上表现为"链路全绿但没有业务
+// span"，极难反查。
+//
+// 判据设计成不需要真配置：Out.Mode 非空时 Cfg 给 nil 也必须通过 —— 因为一旦
+// 真去 Assemble，nil Cfg 必然报错。这就把"跳过"钉死了。
+func TestProvideModeReadySkipsWhenAlreadyAssembled(t *testing.T) {
+	h := &mode.AppHolders{Out: mode.Out{Mode: string(mode.ModeMonolith), Webx: "engine-sentinel"}}
+	if _, err := ProvideModeReady(h); err != nil {
+		t.Fatalf("已装配时应跳过 Assemble 并直接返回，实际 err=%v", err)
+	}
+	if h.Out.Webx != "engine-sentinel" {
+		t.Errorf("Out.Webx 被换掉了（%v）—— 说明 Assemble 又跑了一次，"+
+			"App 上已交出去的引擎句柄会变成孤儿", h.Out.Webx)
+	}
+}
+
+// TestProvideModeReadyAssemblesWhenOutEmpty 反向断言：Out 为空时必须真去装配。
+//
+// 没有这条，"跳过"就可能退化成"什么都不做也算过"——那时 mode 装配被整个绕开，
+// 服务会以「没有形态」的状态继续启动，比重复装配更糟。
+func TestProvideModeReadyAssemblesWhenOutEmpty(t *testing.T) {
+	if _, err := ProvideModeReady(&mode.AppHolders{}); err == nil {
+		t.Error("Out.Mode 为空时必须执行 Assemble（nil 配置必然报错），实际返回 nil error")
+	}
+	if _, err := ProvideModeReady(nil); err == nil {
+		t.Error("holders 为 nil 时必须报错")
+	}
+}
+
+// TestEveryComponentBuilderIsWired 组件层每注册一个 builder，图里就得有归属。
+//
+// componentOrder 那张手写顺序表删掉之后，"加组件别忘接线"这件事就只剩这个断言
+// 守着了 —— 漏掉的表现是：yaml 里配了段、builder 也在，但句柄恒为零值，
+// 因为图里根本没人调它。
+func TestEveryComponentBuilderIsWired(t *testing.T) {
+	wired := map[string]bool{}
+	for _, e := range Catalog {
+		if e.Builder != "" {
+			wired[e.Builder] = true
+		}
+	}
+	for _, name := range component.Names() {
+		if !wired[name] {
+			t.Errorf("组件 builder %q 已注册却没接进 wire 图 —— 去 wiring.go 的 Catalog 补一条 Entry", name)
+		}
+	}
+}
+
+// TestConstructedRejectsTypedNil 零值句柄不得报成"已构造"。
+//
+// 背景见 base.Constructed 的注释：Env.Cache / KV / Mongo 是 map、slice 类型的
+// 命名类型，零值装进 `any` 之后 `raw != nil` 恒为真。这里用一个同构的 map 零值
+// 复现该形态，避免为了写这条测试去 import cachex（那会无谓地加一条依赖边）。
+//
+// 这条断言是 wire 接进主链路后才有的：在那之前 env 上这些字段恒为零值，
+// 谁也没真的问过"它构造了没有"。
+func TestConstructedRejectsTypedNil(t *testing.T) {
+	var zero map[string]int // 与 cachex.Instances 同构的零值
+
+	cases := []struct {
+		name string
+		raw  any
+		want bool
+	}{
+		{"nil 接口", nil, false},
+		{"typed nil map", zero, false},
+		{"typed nil slice", []string(nil), false},
+		{"typed nil pointer", (*int)(nil), false},
+		{"非空 map", map[string]int{"a": 1}, true},
+		{"非空字符串", "db-sentinel", true},
+	}
+	for _, c := range cases {
+		if got := (base{name: "probe", raw: c.raw}).Constructed(); got != c.want {
+			t.Errorf("%s: Constructed() = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 

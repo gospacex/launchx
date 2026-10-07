@@ -118,7 +118,11 @@ func ProvideMQ(env *component.Env) (MQHandle, error) {
 	if !ok {
 		return MQHandle{}, nil
 	}
-	return MQHandle{base: base{name: "mqx", raw: env.MQ, trace: env.TraceOnOf("mq")}}, nil
+	return MQHandle{
+		base:     base{name: "mqx", raw: env.MQ, trace: env.TraceOnOf("mq")},
+		Producer: env.MQ,
+		Consumer: env.MQConsumer,
+	}, nil
 }
 
 // ProvideCoord coordx 句柄（注册侧与发现侧一起返回）。
@@ -230,13 +234,26 @@ type ModeReady struct {
 	holders *mode.AppHolders
 }
 
-// ProvideModeReady 执行形态装配。
+// ProvideModeReady 执行形态装配（已装配则跳过，见判据注释）。
+//
+// 为什么要有这个"跳过"分支：pipeline 的骨架是
+// `mode.assemble → component.mount`，而图里形态产物排在可选组件之后
+// （rpcx/webx 要读 Out）。本图在 component.mount 这一步被求解，那时
+// mode.assemble **已经跑过一次**了。若这里无脑再 Assemble 一遍，Out 会被换成
+// 一批新产物（新的 webx 引擎、新的 kitex 选项），而 App 在 mode 步骤已经把
+// `out.Webx` 交给了 `a.engine` —— 后果是"引擎起来了，路由却挂在另一个引擎上"，
+// 且没有任何报错。**装配一次**是语义要求，不是性能优化。
+//
+// 判据取 `Out.Mode`：Assemble 成功的第一件事就是填 Mode，失败则留空，
+// 所以"空"恰好等价于"尚未装配"，不需要额外的 bool 标记。
 func ProvideModeReady(holders *mode.AppHolders) (ModeReady, error) {
 	if holders == nil {
 		return ModeReady{}, errors.New("wiring: mode.AppHolders 为空")
 	}
-	if err := mode.Assemble(holders); err != nil {
-		return ModeReady{}, fmt.Errorf("wiring: 形态装配失败: %w", err)
+	if holders.Out.Mode == "" {
+		if err := mode.Assemble(holders); err != nil {
+			return ModeReady{}, fmt.Errorf("wiring: 形态装配失败: %w", err)
+		}
 	}
 	return ModeReady{holders: holders}, nil
 }

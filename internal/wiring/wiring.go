@@ -17,6 +17,8 @@
 // 调用方断言方式不变。
 package wiring
 
+import "reflect"
+
 // base 是所有具名句柄的公共部分。各 SDK 句柄用嵌入的方式继承这四个方法，
 // 同时各自保有一个**互不相同的类型** —— 这正是 wire 求解所需的 type identity。
 type base struct {
@@ -32,8 +34,31 @@ type base struct {
 
 func (b base) Name() string       { return b.name }
 func (b base) Raw() any           { return b.raw }
-func (b base) Constructed() bool  { return b.raw != nil }
 func (b base) TraceEnabled() bool { return b.trace }
+
+// Constructed 是否真的拿到了句柄。
+//
+// 判 nil 必须走反射，不能写 `b.raw != nil`：`Env.Cache` 是 `cachex.Instances`、
+// `Env.KV` 是 `kvx.Stores`、`Env.Mongo` 是 `mongodbx.Instances` —— 三者底层都是
+// map/slice，零值是 **typed nil**，装进 `any` 之后与 nil 比较恒为不等。
+// 于是「yaml 里根本没配这个段」会被报告成「已构造」。
+//
+// 这个误报的代价很具体：排查时问「缓存到底接上没有」，Graph 说接上了，
+// Jaeger 上却一个 redis span 都没有 —— 而真相只是没人配那段。
+// 它是 wire 接进主链路之后才暴露的（单测里 env.Cache 恒为零值，不会走到这）。
+func (b base) Constructed() bool {
+	if b.raw == nil {
+		return false
+	}
+	v := reflect.ValueOf(b.raw)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func,
+		reflect.Interface, reflect.UnsafePointer:
+		return !v.IsNil()
+	default:
+		return true
+	}
+}
 
 // ===== 地基（恒构造，失败即退，不受 strict 影响）=====
 
@@ -55,7 +80,16 @@ type DBHandle struct{ base }
 type CacheHandle struct{ base }
 
 // MQHandle mqx 句柄。
-type MQHandle struct{ base }
+//
+// 生产侧与消费侧刻意都留：同一个 `xmiddleware.mqx` 段既解出 broker 地址也解出
+// topic，两侧必须同源 —— 只留 producer 的话业务要么自己 `mqx.NewConsumer`
+// （绕开 launchx，也绕开 `trace.on.mq`），要么根本没有消费侧，表现为
+// "消息投出去了但链路在 broker 这一跳断成孤儿"。
+type MQHandle struct {
+	base
+	Producer any // mqx.Producer
+	Consumer any // mqx.Consumer
+}
 
 // CoordHandle coordx 句柄。coordx 把「注册」与「发现」拆成两个接口，
 // HTTP 网关与 RPC 客户端都要用发现侧，故两个都留。
