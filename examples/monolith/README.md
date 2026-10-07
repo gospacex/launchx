@@ -71,21 +71,26 @@ go run ./cmd
 
 ## 3. 接口
 
-每条链路都自带**两个业务中间件 span**（`middleware.RateLimit` 全局、
-`middleware.AuthToken` 仅 `/secure` 分组）——它们都有外部依赖（缓存计数 / 缓存查
+每条链路都自带**两个业务中间件 span**（`middleware.order.RateLimit` 全局、
+`middleware.order.AuthToken` 仅 `/secure` 分组）——它们都有外部依赖（缓存计数 / 缓存查
 凭据），是验收矩阵里"必须入链"的项；webx 的 recovery / cors 属可豁免项，不埋点。
 
 | 方法 | 路径 | 说明 | 链路上可见的 span |
 |---|---|---|---|
-| POST | `/orders` | 建单：事务写 orders + order_items | `db.create` × 2 → `messaging.PublishOrder`+`messaging.kafka.send`、`search.IndexOrder`+`db.elasticsearch.index`、`docs.SaveSnapshot`+`db.mongodb.insert` |
+| POST | `/orders` | 建单：事务写 orders + order_items | `db.create` × 2 → `messaging.order.PublishOrder`+`messaging.kafka.send`、`search.order.IndexOrder`+`db.elasticsearch.index`、`docs.order.SaveSnapshot`+`db.mongodb.insert` |
 | GET | `/orders?limit=20` | 单表列表 | `db.query` |
-| GET | `/orders/search?q=` | **检索**（ES） | `search.SearchOrder` + `db.elasticsearch.search` |
-| GET | `/orders/:order_no` | 单表单条，**缓存 read-through** | `cache.GetOrder`+`db.redis.GET`、未命中则 `repository.order.Get`+`db.query`、回写 `cache.SetOrder`+`db.redis.SET` |
+| GET | `/orders/search?q=` | **检索**（ES） | `search.order.SearchOrder` + `db.elasticsearch.search` |
+| GET | `/orders/:order_no` | 单表单条，**缓存 read-through** | `cache.order.GetOrder`+`db.redis.GET`、未命中则 `repository.order.Get`+`db.query`、回写 `cache.order.SetOrder`+`db.redis.SET` |
 | GET | `/orders/:order_no/join` | **连表**：orders JOIN users | JOIN 语句单独成 span（`db.query.text` 含 `join`） |
-| GET | `/orders/:order_no/snapshot` | **文档库**：读该单快照 | `docs.FindSnapshot` + `db.mongodb.find_one` |
-| GET | `/secure/orders`（需 `X-Token`） | **鉴权**入口 | `middleware.AuthToken` + `db.redis.GET` |
+| GET | `/orders/:order_no/snapshot` | **文档库**：读该单快照 | `docs.order.FindSnapshot` + `db.mongodb.find_one` |
+| GET | `/secure/orders`（需 `X-Token`） | **鉴权**入口 | `middleware.order.AuthToken` + `db.redis.GET` |
 | PUT | `/orders/:order_no` | 改状态（会回读一次 + 失效缓存） | `db.update` + `db.query` + `db.redis.DEL` |
 | DELETE | `/orders/:order_no` | 删主子数据（+ 失效缓存） | `db.delete` × 2 |
+
+> span 命名统一为 `<layer>.<entity>.<op>` 三段式（`cache.order.GetOrder`、
+> `repository.order.Get` …），与微服 / 电商示例同一个约定，封装在
+> `github.com/gospacex/otelx/layer`。此前 cache / search / docs / messaging /
+> middleware 五层是两段式（`cache.GetOrder`），跨示例对不上同一个 op。
 
 ```bash
 NO=$(curl -s -XPOST localhost:8080/orders -H 'Content-Type: application/json' \
