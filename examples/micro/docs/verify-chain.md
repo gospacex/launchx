@@ -214,3 +214,46 @@ bff 绑的是 `127.0.0.1:8081`（loopback），容器绑的是 `*:8081`，在 ma
 所以链路照跑；但如果 bff 改成绑 `0.0.0.0:8081` 就会**直接起不来**（address already in use）。
 复验环境里要么换端口，要么接受这个共存关系。
 
+
+## 12. 复验（2026-10-07 12:0x）：Jaeger 里怎么认出这四个域服
+
+**micro 四服的服务名是 `demo-` 前缀，不是 `srv-`** —— `srv-*` 是 `examples/mall` 那四个。
+两个 demo 同机跑时，Jaeger 的 service 下拉里**两套名字都在**（实测 18 项），在搜索框里
+敲 `srv` 只会筛出 mall 的四个，micro 的一个都不会出现。这是"明明跑通了却在 UI 里找不到
+四个微服"最常见的原因，不是链路故障。
+
+| 形态 | 目录 | Jaeger 服务名 | 端口 |
+|---|---|---|---|
+| micro | `examples/micro/srv-product` | **demo-product** | 9021 |
+| micro | `examples/micro/srv-order` | **demo-order** | 9022 |
+| micro | `examples/micro/srv-stock` | **demo-stock** | 9023 |
+| micro | `examples/micro/srv-points` | **demo-points** | 9024 |
+| micro | `examples/micro/bff` | **demo-bff** | 8081 |
+| micro | `examples/micro/gateway` | **demo-gateway** | 8080 |
+| mall | `examples/mall/srv-*` | `srv-order` / `srv-product` / `srv-stock` / `srv-points` | 9101-9104 |
+
+名字之所以要分开：两套 demo 共用一个 consul，同名的两个实例会互相抢注册条目（§11 ①）。
+
+**UI 直链**（服务名写死，不用在下拉里找）：
+
+```
+http://127.0.0.1:16686/search?service=demo-product
+http://127.0.0.1:16686/search?service=demo-order
+http://127.0.0.1:16686/search?service=demo-stock
+http://127.0.0.1:16686/search?service=demo-points
+```
+
+**页面是早先打开的要硬刷新（Cmd+Shift+R）**：service 下拉只在页面加载时拉一次
+`/api/services`，新服务首次上报后不刷新不会出现。实测核对方式：
+
+```bash
+curl -s --noproxy '*' 'http://127.0.0.1:16686/api/services'   # 应有 demo-{product,order,stock,points}
+```
+
+### 本轮复跑结果
+
+- `bash examples/micro/scripts/chain.sh` 八条路径 8/8（新单 `order_id=1028`）
+- `python3 examples/scripts/trace-audit.py --service demo-gateway,demo-bff,demo-product,demo-order,demo-stock,demo-points --lookback 30m` → **PASS**
+- 六服务近 10 分钟孤儿 trace **全为 0**；主链路 `POST /api/order` 88-97 span、单根、树深 16
+- 同时段 `examples/micro/srv`（旧单档 `demo-srv` :9013）**未启动**，故本轮 trace 里
+  不应出现 `demo-srv`；若出现，说明有人把它起起来了（与四域共 order_db，会互相补发事件）
