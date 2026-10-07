@@ -101,7 +101,47 @@ Task 24 实测三条判据，两条与现状冲突，**判据口径过时而非�
         断言见 `TestProvideModeReadySkipsWhenAlreadyAssembled` 与
         `TestGraphWebHandleIsTheOneAppUses`。
 
-## 四、与本轮其它决策的交叉影响
+## 四、单体集成验收（E1 / 3.9）执行中的新发现
+
+- [x] **降级路径会 panic（已修，2026-10-07）**：`examples/monolith/app/routes.go`
+      只判 `auth != nil` 建 `/secure` 分组，循环里却直接用 `secure.GET(...)`
+      —— 缓存降级导致 auth 为 nil 时，`secure` 是 nil 分组，hertz 在 nil 接收者
+      上取字段直接 panic（实测：redis 不可达 → cache 降级 → 启动期崩溃，退出码 2）。
+      修法是循环内补 `if secure == nil { continue }`：**降级场景下崩溃是最坏的
+      姿态**，旁路边车挂了把主流程一起带走。
+- [ ] **`/secure` 路由实际注册成 `/secure/secure/orders`**（**未修**，routes.go
+      归另一处改动所有）：`route.Table()` 里该条 Pattern 已含 `/secure` 前缀，
+      `RegisterRoutes` 又挂在 `e.Group("/secure")` 下，前缀重复。后果是
+      `/secure/orders` 是 404，鉴权链路其实探不到。修法二选一（表里的 Pattern
+      改 `/orders`，或注册时 TrimPrefix），须由该文件的 owner 定，避免两处语义打架。
+- [x] **SDK 构造是否连后端并不一致（判据据此改写）**：redis 侧（cachex / kvx）
+      构造即 ping，失败走 launchx 降级分支；`searchx` / `coordx` 是**惰性构造**，
+      死地址照样打 "client created" / "register initialized"，故障推迟到首次读写；
+      `mongodbx` 在地址真死时构造期即失败。**推论**：`strict.<name>` 只对急切构造型
+      组件在启动期有意义 —— 用惰性组件做 strict 样本会得到"strict 没生效"的假结论。
+- [x] **"死地址"必须先验它是死的**：本机 27018/27019/27020 上跑着三个 mongo 容器，
+      首次把 Mongo 死地址写成 27019 时它是活的，用例跑出全绿的"没有降级发生"。
+      故 `degrade_test.go` 开工前先 `requireDeadPorts` 校验四个死端口无人监听。
+- [x] **8080 撞车问题的根治**：monolith 的 e2e 改由 `TestMain` 挑空闲端口自起
+      进程并写入 `MONOLITH_BASE`，T2–T5 与本次新增用例因此全部真机化；
+      mongodbx / searchx 首次被自动实测（此前长期 Skip）。库名统一走 `order_mono`
+      （`order_db` 被 mall 的 schema 占着，缺 item/qty/amount 三列）。
+
+## 五、微服 T6 用例自身的缺陷（2026-10-07 修）
+
+- [x] **anchor span 选得随机，判据假红**：`TestT6ThreeHopsShareOneTrace` 第 ③ 步
+      取"第一个祖先链经过 bff 的域服 span"当 anchor，而 Jaeger 返回的 span 顺序
+      不保证按深度排 —— 取到叶子 `db.kvx.INCR` 时，第 ④ 步"找一个挂在它下面的
+      db.* span"永远不成立，于是报"数据层不在同 trace"，与被测行为无关
+      （实测：product 缓存命中那次必现，因为入口 span 排在了后面）。
+      修法是取**最浅**的候选（祖先链最短 = 该服务的业务入口 span）。
+- [ ] **T6 的"数据层"判据实际被缓存命中满足**：product 走缓存时没有 SQL span，
+      命中的是 `db.redis.GET`（缓存读）与 `db.kvx.INCR`（限流计数）—— 二者都以
+      `db.` 开头，故断言照样绿。若想钉住"SQL 真的入链"，须把判据收窄到
+      `db.query|db.create|db.update|db.delete`，并显式处理缓存命中情形
+      （否则缓存一热就测不到 SQL）。**未改**：改判据等于改验收口径，留给新 change。
+
+## 六、与本轮其它决策的交叉影响
 
 - [ ] **`examples/micro/srv` 已删除**（网格清单部署的 demo-srv，拆分前单域旧样例，
       含 3 个单测）。受影响的既有条目：tasks.md 3.7（E3 回归）、4.9–4.11

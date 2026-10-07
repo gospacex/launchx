@@ -52,6 +52,10 @@ export HUBX_DB_PW=hubx123
 # 3) 建表 + 授权 + 种子用户（幂等，可反复执行）
 cd examples/monolith && ./scripts/bring-up.sh && ./scripts/bring-up.sh check
 # 期望输出：OK tables:orders order_items users db:order_db users:2
+
+# 建议：自动化用例走独立库 order_mono（MYSQL_DB 可覆盖），避开与 mall/micro 共库
+# 时 orders 表缺 item/qty/amount 三列的串扰：
+# MYSQL_DB=order_mono ./scripts/bring-up.sh
 ```
 
 ### 启动
@@ -126,6 +130,29 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-monolith&limit=1' > /tmp
 # config.yaml 里把 trace.on.db 改成 false，重启后重跑 T13 检查 —— 必须失败。
 # 改之前之后都通过，说明完整性检查是空壳。
 ```
+
+### 自动化验收（用例自起进程，2026-10-07 起）
+
+```bash
+export PATH=$HOME/sdk/go1.24.3/bin:$PATH CGO_ENABLED=0 HUBX_DB_PW=hubx123
+cd examples/monolith && go test ./...            # 约 2.5 分钟
+```
+
+**不需要先手工起进程**：`TestMain` 会自己 build、挑一个空闲端口拉起实例，并把
+地址写进 `MONOLITH_BASE`，之后 T2–T5 与 E1 用例都在真机上跑。
+
+这样改的原因：本 demo 默认端口 8080 与微服 gateway 撞车，"先起进程再跑用例"
+长期处在"这次能不能跑看谁先占端口"的状态，mongodbx / searchx 两段因此一直没
+能实测。端口改由用例自挑后，这两条路径第一次被自动执行：
+
+| 用例 | 判据 |
+|---|---|
+| `TestE1MonolithServesMySQLThenExitsGracefully` | 健康检查 → 下单 → 读回 → 改状态 → **docker exec 直查 mysql 复核**（绕开缓存证明真落库）→ SIGTERM 退出码 0 + 端口释放 |
+| `TestE1MongoAndSearchBackendsReallyServe` | mongodbx 快照读回 + searchx 检索命中（ES 默认 1s refresh，给 15s 轮询窗口） |
+| `TestDegrade*` / `TestStrict*` | 后端不可达时的带病运行（含"失败必须在链路上可见"）、`strict` 翻面即退、`trace.enabled=false` 零 span（带正向对照） |
+
+环境不具备（无 go / mysql 不可达 / 无 docker）时用例 **Skip 并写明缺什么**，
+不会假装通过；库名统一走 `order_mono`。
 
 ## 5. 本 demo 刻意不做的事
 

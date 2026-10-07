@@ -268,6 +268,14 @@ func TestT6ThreeHopsShareOneTrace(t *testing.T) {
 		hopBFF    traceutil.Span
 		ancestors []traceutil.Span
 	)
+	//
+	// 候选里取**最浅**的那个（祖先链最短 = 该服务的业务入口 span），而不是
+	// 取第一个。
+	//
+	// 为什么必须挑最浅：Jaeger 返回的 span 顺序不保证按深度排，随手取第一个会
+	// 拿到叶子（实测取到过 db.kvx.INCR），于是下面第 ④ 步"找一个挂在它下面的
+	// db.* span"永远不成立 —— 断言失败的原因变成"选错了 anchor"，与被测行为
+	// 无关，且只在特定返回顺序下复现，是典型的假红。
 	for _, s := range tr.Spans {
 		if tr.ServiceOf(s) != domain {
 			continue
@@ -286,8 +294,9 @@ func TestT6ThreeHopsShareOneTrace(t *testing.T) {
 		if bffIdx < 0 {
 			continue
 		}
-		srvSpan, hopBFF, ancestors = s, anc[bffIdx], anc
-		break
+		if len(ancestors) == 0 || len(anc) < len(ancestors) {
+			srvSpan, hopBFF, ancestors = s, anc[bffIdx], anc
+		}
 	}
 	if len(ancestors) == 0 {
 		t.Fatalf("域服 %s 的 span 没有任何一条祖先链是 %s → … → %s 的形态 —— "+
