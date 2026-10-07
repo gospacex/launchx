@@ -81,9 +81,16 @@ curl /api/order/:id
 | **E2** 微服调用链跑通 | `gateway → bff → 四域服` **共享同一 traceID 且父子链正确**（不是三个并列根）；srv 侧数据层 span 亦在同一 trace | `bash scripts/chain.sh` |
 | **E3** srv 下单回归 | 下单落 `order_db`、outbox 行与业务行同事务、轮询补发后 `order.completed.v1` 收到事件 | `bash scripts/chain.sh`（第 ⑤ 步） |
 
-**E3 的目标服务已变更**：原计划指向 `examples/micro/srv`（拆分前的单域旧样例
-`demo-srv`，也是网格清单部署的那一份）。该目录已随四域拆分删除，E3 现在落到
-`srv-order`。
+**E3 的目标服务是 `srv-order`**，不是 `examples/micro/srv`。
+
+`examples/micro/srv`（`demo-srv`，`127.0.0.1:9013`）是四域拆分**之前**的单域旧样例，
+随拆分被删过一次，现按「拆分前形态对照」的用途**恢复保留**：它的价值是那份 49 行
+`cmd/main.go` 与「三层 + tracex」的旧分层，用来对照六层新分层差在哪。
+
+**它不参与全链路验收，默认也不启动** —— 与四域共用 `order_db`（同一张 outbox 表）
+和同一个 topic `order.completed.v1`，两边同时跑会互相替对方补发事件，Jaeger 上表现为
+一条 trace 里混进 `demo-srv` / `srv-order` 两套服务的 `messaging.*` span。要跑它验证
+旧形态，先停掉 `srv-order` 或改库名与端口。
 
 观测：span 经 otelx 推 Jaeger，UI `http://127.0.0.1:16686`；取本 demo 的 trace：
 
