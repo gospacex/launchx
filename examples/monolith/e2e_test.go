@@ -317,15 +317,8 @@ func (in *instance) waitExit(timeout time.Duration) (int, error) {
 	case <-in.state:
 		return in.code, nil
 	case <-time.After(timeout):
-		// SIGKILL 之前先要一份 goroutine 栈：直接杀掉就等于永远不知道它卡在哪。
-		// Go 运行时收到 SIGQUIT 会把所有 goroutine 的栈打到 stderr（这里就是
-		// in.logs），等一小会儿让这条输出走完管道。
-		_ = in.cmd.Process.Signal(syscall.SIGQUIT)
-		time.Sleep(1500 * time.Millisecond)
-		stack := tail(in.logs.String(), 60)
-		_ = in.cmd.Process.Signal(syscall.SIGKILL)
-		return 0, fmt.Errorf("%s 内进程没有退出（退出链挂住了？下面是退出前的栈）：\n%s",
-			timeout, stack)
+		return 0, fmt.Errorf("%s 内进程没有退出（strict 即退未生效？）\n%s",
+			timeout, tail(in.logs.String(), 30))
 	}
 }
 
@@ -372,9 +365,52 @@ func (in *instance) signalAndWait(sig syscall.Signal, timeout time.Duration) (in
 	case <-in.state:
 		return in.code, nil
 	case <-time.After(timeout):
+		// SIGKILL 之前先要一份 goroutine 栈：直接杀掉就等于永远不知道它卡在哪。
+		// Go 运行时收到 SIGQUIT 会把所有 goroutine 的栈打到 stderr（这里就是
+		// in.logs），等一小会儿让输出走完管道。"退出链挂住了"这类故障只有翻当期
+		// 栈才看得出来 —— 退出阶段的日志往往一条都没有。
+		_ = in.cmd.Process.Signal(syscall.SIGQUIT)
+		time.Sleep(1500 * time.Millisecond)
+		diag := exitDiagnostics(in.logs.String())
+		// 兜底必须杀掉：不然这个实例会一直挂着端口，后面的用例被连累。
 		_ = in.cmd.Process.Signal(syscall.SIGKILL)
-		return -1, fmt.Errorf("发 %v 后 %s 内没有退出", sig, timeout)
+		return -1, fmt.Errorf("发 %v 后 %s 内没有退出（退出链挂住了？代码如下）：\n%s",
+			sig, timeout, diag)
 	}
+}
+
+// exitDiagnostics 从 goroutine 栈里挑出真正有关的那几行。
+//
+// 为什么要挑：一次 dump 动辄几千行，绝大多数是 hertz/netpoll 的连接协程（它们
+// 在 keep-alive 上阻塞是**正常**的），整段贴出来等于把答案埋了。而退出阶段往往
+// 一条日志都没有，当下只有这份栈能说清卡在哪 —— 所以顺手把完整 dump 落到临时
+// 文件里，需要时还能翻。
+func exitDiagnostics(dump string) string {
+	var interesting = []string{
+		"launchx", "gospacex/", "gorm.io", "kafka-go", "mongo-driver",
+		"go-redis", "elastic", "otel", "Shutdown", "Flush", "Close",
+	}
+	var hit []string
+	for _, l := range strings.Split(dump, "\n") {
+		for _, kw := range interesting {
+			if strings.Contains(l, kw) {
+				hit = append(hit, l)
+				break
+			}
+		}
+	}
+	if f, err := os.CreateTemp("", "monolith-exit-stack-*.log"); err == nil {
+		_, _ = f.WriteString(dump)
+		_ = f.Close()
+		hit = append(hit, "完整 goroutine 栈："+f.Name())
+	}
+	if len(hit) == 0 {
+		return tail(dump, 80)
+	}
+	if len(hit) > 60 {
+		hit = hit[:60]
+	}
+	return strings.Join(hit, "\n")
 }
 
 // stop 兜底收尾：先 SIGTERM，超时再 SIGKILL。
