@@ -12,9 +12,9 @@ import (
 	"net/http"
 
 	"github.com/gospacex/launchx"
+	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 	"github.com/gospacex/mqx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -52,10 +52,15 @@ func flatten(h http.Header) map[string]string {
 //
 // 降级语义由调用方保证 producer 非 nil —— 本方法不吞 nil：producer 为空时
 // 返回 error 并打进 span，让"事件没发出去"在链路上可见，而不是静默丢。
-func (o *Order) Publish(ctx context.Context, key string, payload []byte) error {
-	ctx, span := o.tr.Start(ctx, spanPrefix+"PublishOrder")
-	defer span.End()
-	span.SetAttributes(
+// begin 开本层 span（沿用两段式 messaging.<Op> 命名），返回「收 error 再收尾」的闭包。
+func (o *Order) begin(ctx context.Context, op string) (context.Context, tracex.End) {
+	return tracex.BeginSpan(o.tr, ctx, spanPrefix+op, nil)
+}
+
+func (o *Order) Publish(ctx context.Context, key string, payload []byte) (err error) {
+	ctx, end := o.begin(ctx, "PublishOrder")
+	defer func() { end(err) }()
+	tracex.Attrs(ctx,
 		attribute.String("messaging.system", "kafka"),
 		attribute.String("messaging.destination", o.topic),
 		attribute.String("messaging.message_key", key),
@@ -74,10 +79,8 @@ func (o *Order) Publish(ctx context.Context, key string, payload []byte) error {
 		Value:   payload,
 		Headers: flatten(headers),
 	}
-	if err := o.producer.Send(ctx, msg); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return fmt.Errorf("messaging: publish order event: %w", err)
+	if err = o.producer.Send(ctx, msg); err != nil {
+		err = fmt.Errorf("messaging: publish order event: %w", err)
 	}
-	return nil
+	return err
 }

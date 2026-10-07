@@ -10,8 +10,9 @@ import (
 
 	"github.com/gospacex/searchx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 )
 
 // spanPrefix 本层前缀。
@@ -29,31 +30,34 @@ func NewOrder(cli searchx.SearchClient, index string, tr trace.Tracer) *Order {
 	return &Order{cli: cli, index: index, tr: tr}
 }
 
+// begin 开本层 span（沿用两段式 search.<Op> 命名），返回「收 error 再收尾」的闭包。
+func (o *Order) begin(ctx context.Context, op string) (context.Context, tracex.End) {
+	return tracex.BeginSpan(o.tr, ctx, spanPrefix+op, nil)
+}
+
 // Index 写一条订单进索引（订单号即文档 ID：幂等，覆盖写 = 更新）。
-func (o *Order) Index(ctx context.Context, id string, doc map[string]any) error {
-	ctx, span := o.tr.Start(ctx, spanPrefix+"IndexOrder")
-	defer span.End()
-	span.SetAttributes(
+func (o *Order) Index(ctx context.Context, id string, doc map[string]any) (err error) {
+	ctx, end := o.begin(ctx, "IndexOrder")
+	defer func() { end(err) }()
+	tracex.Attrs(ctx,
 		attribute.String("search.index", o.index),
 		attribute.String("search.document_id", id),
 	)
 
-	if err := o.cli.Index(ctx, o.index, searchx.Document(doc)); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return fmt.Errorf("search: index order %q: %w", id, err)
+	if err = o.cli.Index(ctx, o.index, searchx.Document(doc)); err != nil {
+		err = fmt.Errorf("search: index order %q: %w", id, err)
 	}
-	return nil
+	return err
 }
 
 // Search 按关键词检索订单，返回原始文档切片。
 //
 // 返回值保留原始 Document：命中结果的字段组合由调用方决定要不要规范化，
 // 本层做映射只会把 ES 的真实返回形态藏起来。
-func (o *Order) Search(ctx context.Context, query string, limit int) ([]map[string]any, error) {
-	ctx, span := o.tr.Start(ctx, spanPrefix+"SearchOrder")
-	defer span.End()
-	span.SetAttributes(
+func (o *Order) Search(ctx context.Context, query string, limit int) (out []map[string]any, err error) {
+	ctx, end := o.begin(ctx, "SearchOrder")
+	defer func() { end(err) }()
+	tracex.Attrs(ctx,
 		attribute.String("search.index", o.index),
 		attribute.String("search.query", query),
 		attribute.Int("search.limit", limit),
@@ -61,13 +65,11 @@ func (o *Order) Search(ctx context.Context, query string, limit int) ([]map[stri
 
 	res, err := o.cli.Search(ctx, o.index, query)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("search: search order %q: %w", query, err)
 	}
-	span.SetAttributes(attribute.Int("search.hits", res.Total))
+	tracex.Attrs(ctx, attribute.Int("search.hits", res.Total))
 
-	out := make([]map[string]any, 0, len(res.Hits))
+	out = make([]map[string]any, 0, len(res.Hits))
 	for i, hit := range res.Hits {
 		if limit > 0 && i >= limit {
 			break

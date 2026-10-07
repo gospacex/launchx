@@ -22,9 +22,22 @@ package tracex
 import (
 	"context"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// Attrs 在当前 span 上挂属性。
+//
+// span 句柄由收尾闭包持有（分层不再外露），挂属性只能经 ctx 取回 —— 这是
+// 「收尾闭包代标」这一选择的代价，收口在这里，免得每个适配层各写一份。
+// IsRecording 判空：埋点关闭时 SpanFromContext 返回 noop span，对它写属性
+// 不会出错，只是白跑一次接口调用，判掉更干净。
+func Attrs(ctx context.Context, kvs ...attribute.KeyValue) {
+	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+		span.SetAttributes(kvs...)
+	}
+}
 
 // End 收尾闭包：传本次调用的 error，由它决定 span 状态并收尾。
 type End func(err error)
@@ -37,7 +50,16 @@ type End func(err error)
 // 注意：err 必须是**接口意义上的**非空判断 —— 传 *codes.Error 这类具体指针时
 // 先判空再进接口，否则 nil 指针装进 error 接口后 != nil，成功路径会被标成错误。
 func Begin(tr trace.Tracer, ctx context.Context, layer, entity, op string, quiet func(error) bool) (context.Context, End) {
-	c, span := tr.Start(ctx, layer+"."+entity+"."+op)
+	return BeginSpan(tr, ctx, layer+"."+entity+"."+op, quiet)
+}
+
+// BeginSpan 开一个**名字由调用方拼好**的 span，返回同样的收尾闭包。
+//
+// 给 span 名不是 layer.entity.op 三段式的层用（例如 cache 层的 cache.GetOrder）。
+// 本次统一的是调用形态与错误标记口径，**不是 span 命名**：改名字会打断既有
+// 的 trace 判据、看板与回归用例，那是另一件事，不该夹带在风格统一里做。
+func BeginSpan(tr trace.Tracer, ctx context.Context, name string, quiet func(error) bool) (context.Context, End) {
+	c, span := tr.Start(ctx, name)
 	return c, func(err error) {
 		if err != nil && (quiet == nil || !quiet(err)) {
 			span.RecordError(err)

@@ -7,12 +7,14 @@ package docs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	mongodbx "github.com/gospacex/mongodbx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gospacex/launchx/examples/monolith/internal/tracex"
 )
 
 // spanPrefix 本层前缀。
@@ -42,14 +44,19 @@ func NewOrder(coll mongodbx.Collection, tr trace.Tracer) *Order {
 	return &Order{coll: coll, tr: tr}
 }
 
+// begin 开本层 span（沿用两段式 docs.<Op> 命名），返回「收 error 再收尾」的闭包。
+func (o *Order) begin(ctx context.Context, op string, quiet func(error) bool) (context.Context, tracex.End) {
+	return tracex.BeginSpan(o.tr, ctx, spanPrefix+op, quiet)
+}
+
 // Save 写一份快照，返回文档 ID。同一单多次写入会产生多份历史快照（追加语义），
 // 便于演示"文档库存的是时间线"；只想覆盖写时应先 DeleteOne。
-func (o *Order) Save(ctx context.Context, snap OrderSnapshot) (string, error) {
-	ctx, span := o.tr.Start(ctx, spanPrefix+"SaveSnapshot")
-	defer span.End()
-	span.SetAttributes(attribute.String("docs.entity", "order_snapshots"))
+func (o *Order) Save(ctx context.Context, snap OrderSnapshot) (id string, err error) {
+	ctx, end := o.begin(ctx, "SaveSnapshot", nil)
+	defer func() { end(err) }()
+	tracex.Attrs(ctx, attribute.String("docs.entity", "order_snapshots"))
 
-	id, err := o.coll.Insert(ctx, mongodbx.Document{
+	id, err = o.coll.Insert(ctx, mongodbx.Document{
 		"order_no": snap.OrderNo,
 		"user_id":  snap.UserID,
 		"item":     snap.Item,
@@ -58,25 +65,26 @@ func (o *Order) Save(ctx context.Context, snap OrderSnapshot) (string, error) {
 		"status":   snap.Status,
 	})
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return "", fmt.Errorf("docs: save snapshot %q: %w", snap.OrderNo, err)
+		err = fmt.Errorf("docs: save snapshot %q: %w", snap.OrderNo, err)
 	}
-	return id, nil
+	return id, err
 }
 
 // Find 按订单号取最近一份快照；无命中返回 mongodbx.ErrNotFound 的原义错误。
-func (o *Order) Find(ctx context.Context, orderNo string) (mongodbx.Document, error) {
-	ctx, span := o.tr.Start(ctx, spanPrefix+"FindSnapshot")
-	defer span.End()
-	span.SetAttributes(attribute.String("docs.entity", "order_snapshots"))
+//
+// quiet 例外：ErrNotFound 是一次正常 miss（快照本来就可能没写），不算 span 错误。
+// 原实现里这条注释写了、代码却无条件 RecordError —— 注释与行为不符，借这次
+// 收口一并改齐：豁免规则由 quiet 表达，不再是"注释说一套、代码做一套"。
+func (o *Order) Find(ctx context.Context, orderNo string) (doc mongodbx.Document, err error) {
+	ctx, end := o.begin(ctx, "FindSnapshot", func(err error) bool {
+		return errors.Is(err, mongodbx.ErrNotFound)
+	})
+	defer func() { end(err) }()
+	tracex.Attrs(ctx, attribute.String("docs.entity", "order_snapshots"))
 
-	doc, err := o.coll.FindOne(ctx, mongodbx.Document{"order_no": orderNo})
+	doc, err = o.coll.FindOne(ctx, mongodbx.Document{"order_no": orderNo})
 	if err != nil {
-		// ErrNotFound 是一次正常 miss，不算 span 错误；其余要看得见。
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, fmt.Errorf("docs: find snapshot %q: %w", orderNo, err)
+		err = fmt.Errorf("docs: find snapshot %q: %w", orderNo, err)
 	}
-	return doc, nil
+	return doc, err
 }
