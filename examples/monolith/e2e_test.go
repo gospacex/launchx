@@ -709,8 +709,11 @@ func TestE1MongoAndSearchBackendsReallyServe(t *testing.T) {
 	// "快照没落库"掩盖成"多等一会儿就好了"。
 	snap, code := request(t, http.MethodGet, appBase()+"/orders/"+orderNo+"/snapshot", "", nil)
 	if code != http.StatusOK {
-		t.Fatalf("GET /orders/%s/snapshot → HTTP %d：%s（mongodbx 未真正读写）",
-			orderNo, code, truncate(snap, 200))
+		// 附上进程日志尾部：这条偶发红过一次（2026-10-08 全包跑），而"文档没找到"
+		// 只是症状 —— 真正的原因（快照写入失败、还是 mongo 整体降级）只在进程日志
+		// 里。不贴出来的话，一次偶发红就只能靠猜。
+		t.Fatalf("GET /orders/%s/snapshot → HTTP %d：%s（mongodbx 未真正读写）\n进程日志尾部：\n%s",
+			orderNo, code, truncate(snap, 200), sharedLogTail(t, 30))
 	}
 	var doc map[string]any
 	if err := json.Unmarshal([]byte(snap), &doc); err != nil {
@@ -760,6 +763,19 @@ func TestE1SharedInstanceIsOurs(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &hits); err != nil {
 		t.Fatalf("%s 的 /orders/search 返回的不是数组（%s）：那不是本 demo", appBase(), truncate(body, 160))
 	}
+}
+
+// sharedLogTail 取共享实例的日志尾部（没有共享实例时给一句说明）。
+//
+// 判据失败时只贴 HTTP 响应会把"为什么"留在进程里：降级类故障（组件不可用、
+// 副作用写入失败）在响应上看不出来，只在 Warn 日志里。贴不出日志的失败信息
+// 等于让人重跑一次碰运气。
+func sharedLogTail(t *testing.T, n int) string {
+	t.Helper()
+	if sharedInstance == nil {
+		return "（本跑没有共享实例，取不到进程日志：MONOLITH_BASE 指向外部进程）"
+	}
+	return tail(sharedInstance.logs.String(), n)
 }
 
 // mustStatusShared 对共享实例发请求并断言状态码。

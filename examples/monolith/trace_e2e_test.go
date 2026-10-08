@@ -324,9 +324,9 @@ func TestT4ComponentSpansShareTrace(t *testing.T) {
 	since := time.Now()
 	orderNo := createOrder(t)
 	tr := awaitTrace(t, c, since, http.MethodPost)
-	bizSpan, ok := findSpan(tr, "service.CreateOrder")
+	bizSpan, ok := findSpan(tr, "service.order.CreateOrder")
 	if !ok {
-		t.Fatalf("trace %s 内没有 service.CreateOrder 业务 span（ops=%v）", tr.TraceID, tr.OperationNames())
+		t.Fatalf("trace %s 内没有 service.order.CreateOrder 业务 span（ops=%v）", tr.TraceID, tr.OperationNames())
 	}
 	for _, kind := range []struct {
 		label  string
@@ -361,7 +361,7 @@ func TestT4ComponentSpansShareTrace(t *testing.T) {
 	updateNo := createOrder(t)
 	request(t, http.MethodPut, appBase()+"/orders/"+updateNo, `{"status":"paid"}`, nil)
 	tr = awaitTrace(t, c, since, http.MethodPut)
-	bizSpan, ok = findSpan(tr, "service.UpdateOrder")
+	bizSpan, ok = findSpan(tr, "service.order.UpdateOrder")
 	if !ok {
 		t.Fatalf("Update 的 trace %s 内没有 service.UpdateOrder（ops=%v）", tr.TraceID, tr.OperationNames())
 	}

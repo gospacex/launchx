@@ -14,8 +14,11 @@
 #      minikube(docker driver) 同为 amd64 → GOOS=linux GOARCH=amd64。
 #      GOARCH 写错的表现是容器内 `exec format error`，见 README 排查表。
 #
-#   3. **一个镜像装三个二进制**，三个 Deployment 用 command 区分 ——
-#      这是「网格复用同一份二进制」最硬的证据形式：镜像 id 完全相同。
+#   3. **一个镜像装全部二进制**，各 Deployment 用 command 区分 ——
+#      这是「同一份二进制跑多种形态」最硬的证据形式：镜像 id 完全相同。
+#      六个进程由 examples/micro/scripts/build-bin.sh 产出，名字是
+#      demo-gateway / demo-bff / demo-product / demo-order / demo-stock /
+#      demo-points（**服务名**，与目录名 srv-* 不是一回事）。
 #
 #   4. 不用 scratch：业务要发 HTTPS 出向、要读时区（DSN 的 loc=Local）。
 # =============================================================================

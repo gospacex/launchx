@@ -22,6 +22,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/logx"
+
 	"github.com/gospacex/otelx/layer"
 
 	"github.com/gospacex/launchx/examples/monolith/internal/cache"
@@ -64,12 +66,13 @@ type Service struct {
 	messaging *messaging.Order
 	search    *search.Order
 	docs      *docs.Order
+	logger    logx.Logger
 	traceOn   bool
 }
 
 // New 构造订单服务。
-func New(repo *repository.Repository, c *cache.Order, m *messaging.Order, s *search.Order, d *docs.Order, traceOn bool) *Service {
-	return &Service{repo: repo, cache: c, messaging: m, search: s, docs: d, traceOn: traceOn}
+func New(repo *repository.Repository, c *cache.Order, m *messaging.Order, s *search.Order, d *docs.Order, logger logx.Logger, traceOn bool) *Service {
+	return &Service{repo: repo, cache: c, messaging: m, search: s, docs: d, logger: logger, traceOn: traceOn}
 }
 
 // begin 开 service 层 span，返回「收 error 再收尾」的闭包。
@@ -80,11 +83,22 @@ func (s *Service) begin(ctx context.Context, op string) (context.Context, layer.
 	return layer.Begin(ctx, "service", "order", op, s.traceOn, nil)
 }
 
-// mark 记录「非致命」依赖失败：记 event 与属性，但**不改 span 状态码**。
+// mark 记录「非致命」依赖失败：记日志 + 记 event 与属性，但**不改 span 状态码**。
 //
 // 与收尾闭包的错误标记区别是刻意的：span 变 Error 会让 Jaeger 把它算进错误率，
 // 而缓存写失败这类降级并不代表请求失败；混在一起会让错误率指标失真。
-func (s *Service) mark(ctx context.Context, reason string, err error) {
+//
+// 日志必须在 span 之外**单独**打：早先这里只在 span 上留痕，而 span 不录时
+// （trace.enabled=false —— 这是生产上为了成本常态关闭的开关）函数直接返回，
+// 于是「事件没投出去 / 索引没写 / 快照没存」在线上完全静默。降级不是请求失败，
+// 但不该是不可观测的：查「为什么 ES 里没有这单」时日志是唯一能回答的东西。
+func (s *Service) mark(ctx context.Context, orderNo string, reason string, err error) {
+	if s.logger != nil {
+		s.logger.Warn("订单下游动作失败（不回滚已落库订单）",
+			logx.String("order_no", orderNo),
+			logx.String("degrade.reason", reason),
+			logx.String("degrade.error", err.Error()))
+	}
 	span := trace.SpanFromContext(ctx)
 	if span == nil || !span.IsRecording() {
 		return
@@ -127,13 +141,13 @@ func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, er
 			if derr := json.Unmarshal([]byte(raw), &cached); derr != nil {
 				// 缓存里的数据解析器都解析不出来，只能当 miss 处理；但必须留痕，
 				// 否则"命中率看着很高却每次都打库"会完全无从解释。
-				s.mark(ctx, "cache.decode_failed", derr)
+				s.mark(ctx, orderNo, "cache.decode_failed", derr)
 			} else {
 				layer.Attrs(ctx, attribute.Bool("cache.hit", true))
 				return &cached, nil
 			}
 		} else if cerr != nil {
-			s.mark(ctx, "cache.read_failed", cerr)
+			s.mark(ctx, orderNo, "cache.read_failed", cerr)
 		}
 	}
 
@@ -150,7 +164,7 @@ func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, er
 		payload, eerr := cache.Encode(out)
 		if eerr == nil {
 			if serr := s.cache.Set(ctx, orderNo, payload); serr != nil {
-				s.mark(ctx, "cache.write_failed", serr)
+				s.mark(ctx, orderNo, "cache.write_failed", serr)
 			}
 		}
 	}
@@ -207,13 +221,13 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (out *model.Order,
 func (s *Service) fanout(ctx context.Context, order *model.Order) {
 	payload, err := json.Marshal(order)
 	if err != nil {
-		s.mark(ctx, "event.encode_failed", err)
+		s.mark(ctx, order.OrderNo, "event.encode_failed", err)
 		return
 	}
 
 	if s.messaging != nil {
 		if perr := s.messaging.Publish(ctx, order.OrderNo, payload); perr != nil {
-			s.mark(ctx, "event.publish_failed", perr)
+			s.mark(ctx, order.OrderNo, "event.publish_failed", perr)
 		}
 	} else {
 		layer.Attrs(ctx, attribute.Bool("mq.skipped", true))
@@ -229,7 +243,7 @@ func (s *Service) fanout(ctx context.Context, order *model.Order) {
 			"status":   order.Status,
 		}
 		if ierr := s.search.Index(ctx, order.OrderNo, doc); ierr != nil {
-			s.mark(ctx, "search.index_failed", ierr)
+			s.mark(ctx, order.OrderNo, "search.index_failed", ierr)
 		}
 	} else {
 		layer.Attrs(ctx, attribute.Bool("search.skipped", true))
@@ -245,7 +259,7 @@ func (s *Service) fanout(ctx context.Context, order *model.Order) {
 			Status:  order.Status,
 		}
 		if _, serr := s.docs.Save(ctx, snap); serr != nil {
-			s.mark(ctx, "docs.save_failed", serr)
+			s.mark(ctx, order.OrderNo, "docs.save_failed", serr)
 		}
 	} else {
 		layer.Attrs(ctx, attribute.Bool("docs.skipped", true))
@@ -286,7 +300,7 @@ func (s *Service) UpdateStatus(ctx context.Context, orderNo, status string) (out
 	}
 	if s.cache != nil {
 		if derr := s.cache.Delete(ctx, orderNo); derr != nil {
-			s.mark(ctx, "cache.invalidate_failed", derr)
+			s.mark(ctx, orderNo, "cache.invalidate_failed", derr)
 		}
 	}
 	return out, nil
@@ -308,7 +322,7 @@ func (s *Service) Delete(ctx context.Context, orderNo string) (err error) {
 	}
 	if s.cache != nil {
 		if derr := s.cache.Delete(ctx, orderNo); derr != nil {
-			s.mark(ctx, "cache.invalidate_failed", derr)
+			s.mark(ctx, orderNo, "cache.invalidate_failed", derr)
 		}
 	}
 	return err

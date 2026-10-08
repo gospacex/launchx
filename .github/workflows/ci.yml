@@ -1,0 +1,86 @@
+# =============================================================================
+# examples 门禁
+# -----------------------------------------------------------------------------
+# 跑什么由 examples/scripts/ci.sh 决定，本文件只负责环境与编排。
+# 为什么不把四条 go 命令直接写在这里：见那个脚本的头部注释（顺序有依赖，
+# 写在 YAML 里容易被人加 `|| true` 让某一步静默失效）。
+#
+# 一条容易踩的坑：go.mod 的 replace 指向 ../<sdk>，故 CI 必须先把兄弟 SDK 仓
+# 克隆到仓库目录之外（fetch-sdks.sh）。少了这一步，go 会去拉 github 上的
+# 上游版本 —— 编译的是另一份代码，而 CI 依然是绿的。
+# =============================================================================
+name: examples-ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一个分支上的多次推送只保留最新一次：这些用例里有真机（MySQL/Jaeger）断言，
+# 排队跑旧提交没有意义。
+concurrency:
+  group: examples-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gofmt / build / vet / test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: launchx
+
+      - uses: actions/setup-go@v5
+        with:
+          # 与 go.mod 的 go 指令对齐；缓存 key 里带 go.mod 的 hash，
+          # 依赖变了自动失效。
+          go-version-file: launchx/go.mod
+          cache-dependency-path: launchx/go.sum
+
+      - name: 拉取兄弟 SDK（replace 指到 ../<sdk>）
+        working-directory: launchx
+        run: bash examples/scripts/fetch-sdks.sh
+
+      # 真机断言（MySQL / Redis / Kafka / Jaeger）在没起底座时会自行 Skip，
+      # 但起得起的部分要真的跑 —— 故这里把 compose 拉起来。
+      # 起不来不算失败：底座挂了不该让 Go 门禁红，那两类故障要分开看。
+      # compose 文件不在本仓（在 hubx/dockers 仓），故这里按环境变量取路径：
+      # 没配 DOCKERS_COMPOSE 就跳过，真机用例自行 Skip —— "底座没起"不该让
+      # Go 门禁红，那是两类故障。
+      - name: 起中间件底座（尽力而为）
+        working-directory: launchx
+        continue-on-error: true
+        env:
+          DOCKERS_COMPOSE: ${{ vars.DOCKERS_COMPOSE }}
+        run: |
+          if [ -z "${DOCKERS_COMPOSE:-}" ]; then
+            echo "未配置 DOCKERS_COMPOSE，真机用例将自行 Skip"
+            exit 0
+          fi
+          docker compose -f "$DOCKERS_COMPOSE" up -d consul jaeger mysql redis kafka
+
+      - name: 门禁
+        working-directory: launchx
+        env:
+          HUBX_DB_PW: hubx123
+          CGO_ENABLED: "1"
+        run: bash examples/scripts/ci.sh
+
+  # 纯代码扫描，不依赖任何底座，任何环境都必须出结论。
+  # 与上面的 job 分开跑：它应该永远绿，红了就说明有人在代码里开了形态分支。
+  no-mode-branch:
+    name: 源码守卫
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: 库源码不得直引中间件 / examples 布局约束
+        run: |
+          go test . -run 'TestLibrarySourceHasNoDirectMiddlewareImports' -count=1
+          go test . -run 'TestMeshHasNoGoCode|TestMicroNotCoupledToMesh' -count=1

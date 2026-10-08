@@ -168,3 +168,38 @@ trace-id `4bd70cf26461108333c1250b76d4e932`：**97 span / 树深 16 / 6 服务**
 
 验证：`go build ./...` 通过；`internal/...` + 根包 + `examples/micro`（T6/T8/T9 真机）
 + `examples/monolith` 全绿。
+
+---
+
+## 六、补记：单体 / 微服分层埋点风格收敛（同日，未提交）
+
+以「单体仓储用 `span` + `recordError`、微服仓储用 `begin` + `defer end()`」的对照为起点做了一次评估，
+查出四条**实质差异**（不是风格偏好），并就地收敛：
+
+| # | 问题 | 处置 |
+|---|---|---|
+| ① | 微服 repository / service / handler 三层 `RecordError\|SetStatus` **零命中** —— 失败与成功在 Jaeger 上同色，错误率恒 0 | `pkg/tracex` 新增 `End` + `Begin(ctx, layer, entity, op, traceOn, quiet)`：`end(err)` 标状态后 End（该包后于同日上提为 `otelx/layer`，见 `examples/HANDLE-AUDIT.md` §5）；12 个分层文件 70 个方法改成命名返回值 + `defer func() { end(err) }()` |
+| ② | 单体内同一件事两处判定相反（持久层视 `ErrRecordNotFound` 为非错、service 层 `s.end(span, ErrNotFound)` 标错），未写明是有意的 | 保留行为（判据问的不是同一个问题），在 `service.ErrNotFound` 上写明这层对比 |
+| ③ | 单体 service `import gorm.io/gorm` 判 `ErrRecordNotFound`，与包注释「不直接用任何 SDK 客户端」自相矛盾 | 归一化下沉到持久层：加 `repository.ErrNotFound`，`Get` / `GetWithUser` 出边界即包装；service 删 gorm import 与 3 处驱动判定 |
+| ④ | span 命名两套（单体 2 段 `service.X` / 微服 3 段 `service.order.X`），而层埋点包的注释声称「跨示例可比」 | 单体统一到 3 段：`repository.order.*` / `service.order.*` / `handler.order.*`，文档与断言同步 |
+
+豁免规则两边**同一条**：`ErrNotFound` / `gorm.ErrRecordNotFound` 是正常 miss，不标 span 错（微服由
+`begin` 传入的 `quiet` 判定；单体仍在 `recordError` 里判），避免正常未命污染错误率。
+
+新增用例（现位于 `otelx/layer/layer_test.go`）钉住五件事：错误 → `codes.Error` + error 事件、
+`quiet` 命中不标、`err=nil` 不标、`traceOn=false` 零 span、span 名是三段式。
+
+刻意不动的地方：
+
+- 微服 `rpc` 层（kitex 服务端桩）仍 `layer.Start + defer span.End()`：其上的错误要么来自 handler
+  （已标红），要么是限流准入（不是失败），再标一次只是重复计数。
+- 单体 service / handler 保留显式 `s.end(span, err)` 与 `fail(span, ...)`：本层要表达第三态 ——
+  `mark()` 记 event 但**不改**状态码（缓存写失败这类降级不该进错误率），闭包 `end(err)` 表达不了。
+- `examples/mall/**` 与 `examples/micro/srv/`（拆分前旧样例）未跟进：前者正被另一会话改动，
+  后者是对照样例、不参与验收。
+
+证据：`go build ./...` 与 `go vet ./...` 通过；`examples/micro/...`（含 tracex 新用例）+ 根包 +
+`internal/...` + `examples/monolith/internal/handlesrc` 全绿。单体 `trace_e2e` 与 micro T6/T9 需底座
+（本轮 9092/6379/3306/8500/16686/4318 全关）未复跑：它们的断言按前缀 `handler.` / `service.` /
+`repository.` 匹配，不受加实体段影响；2 处精确匹配（`service.order.CreateOrder` /
+`service.order.UpdateOrder`）与 1 处失败文案已同步修改。

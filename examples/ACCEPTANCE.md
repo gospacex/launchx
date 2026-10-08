@@ -270,12 +270,12 @@ jq '[.data[0].spans[]] | length' /tmp/t.json                                    
 
 | 请求 | 根 span | 三层 span | 数据层 span | 总 span 数 |
 |---|---|---|---|---|
-| `POST /orders` | `POST /orders` | `handler.CreateOrder` → `service.CreateOrder` → `repository.CreateWithItems` | `db.create` × 2（orders + order_items，**同父兄弟**） | 6 |
-| `GET /orders` | `GET /orders` | `handler.ListOrders` → `service.ListOrders` → `repository.List` | `db.query` × 1 | 5 |
-| `GET /orders/:no` | 同名根 | `handler.GetOrder` → `service.GetOrder` → `repository.Get` | `db.query` × 1 | 5 |
-| `GET /orders/:no/join` | 同名根 | `handler.GetOrderWithUser` → `service.GetOrderWithUser` → `repository.GetWithUser` | `db.query` × 1（含 `JOIN users`） | 5 |
-| `PUT /orders/:no` | 同名根 | `handler.UpdateOrder` → `service.UpdateOrder` → `repository.UpdateStatus`、`repository.Get` | `db.update` × 1 + `db.query` × 1 | 7 |
-| `DELETE /orders/:no` | 同名根 | `handler.DeleteOrder` → `service.DeleteOrder` → `repository.DeleteItems`、`repository.Delete` | `db.delete` × 2 | 7 |
+| `POST /orders` | `POST /orders` | `handler.order.CreateOrder` → `service.order.CreateOrder` → `repository.order.CreateWithItems` | `db.create` × 2（orders + order_items，**同父兄弟**） | 6 |
+| `GET /orders` | `GET /orders` | `handler.order.ListOrders` → `service.order.ListOrders` → `repository.order.List` | `db.query` × 1 | 5 |
+| `GET /orders/:no` | 同名根 | `handler.order.GetOrder` → `service.order.GetOrder` → `repository.order.Get` | `db.query` × 1 | 5 |
+| `GET /orders/:no/join` | 同名根 | `handler.order.GetOrderWithUser` → `service.order.GetOrderWithUser` → `repository.order.GetWithUser` | `db.query` × 1（含 `JOIN users`） | 5 |
+| `PUT /orders/:no` | 同名根 | `handler.order.UpdateOrder` → `service.order.UpdateOrder` → `repository.order.UpdateStatus`、`repository.order.Get` | `db.update` × 1 + `db.query` × 1 | 7 |
+| `DELETE /orders/:no` | 同名根 | `handler.order.DeleteOrder` → `service.order.DeleteOrder` → `repository.order.DeleteItems`、`repository.order.Delete` | `db.delete` × 2 | 7 |
 
 实测 SQL 文本（8 条去重后）：`INSERT INTO orders/order_items`、`SELECT * FROM orders [ORDER BY id DESC LIMIT ?|WHERE order_no = ? LIMIT ?]`、
 `SELECT o.id ... FROM orders o JOIN users u ON o.user_id = u.id WHERE o.order_no = ?`、`UPDATE orders SET status=?,updated_at=? WHERE order_no = ?`、
@@ -516,7 +516,7 @@ jq -r '.spans[] | select(.operationName|startswith("db.")) | .tags[] | select(.k
 | 日志 | 进程 stdout / `/tmp/monolith.log` | 启动序列与退出序列完整（见 A-6） |
 | 健康 | `curl -sf http://127.0.0.1:8080/healthz/live` | 200（webx `Config.HealthPrefix` 默认 `/healthz`（`webx/config.go:51`），但**实际注册的是 `/healthz/live` 与 `/healthz/ready` 两条**（`webx/webx.go:130`），裸 `/healthz` 为 404；`ReadyCheck` 未配时 `/healthz/ready` 恒 200） |
 | 数据 | `mysql order_db` 行数 | 落真库，非内存 |
-| metrics | **无** | 见 13.4，`/metrics` 404 是预期，不判 FAIL |
+| metrics | `curl -s http://127.0.0.1:8080/metrics` | **200 + Prometheus 文本**（2026-10-08 真机复验，见 §13.4）。判据不止 200：须含 `# HELP`、`webx_requests_total`、`webx_request_duration_seconds` 且分桶为秒级（`le="0.001"` 起，不是缺省的 `le="5"`） |
 
 #### A-6 判定清单
 
@@ -849,11 +849,18 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | 日志 ↔ 链路关联（trace_id 落日志字段） | ✅ | ✅ | ✅ | **2026-10-05 真机确认**：webx 访问日志自带 `trace_id` / `span_id` / `request_id`（`webx/middleware/logging.go:34`），实测 `{"trace_id":"993a319f…","span_id":"f464c7d2…","method":"POST","path":"/orders","status":201}`，与 Jaeger 中该请求的 traceID 一致 |
 | HTTP 健康端点 | ✅ `/healthz/live` + `/healthz/ready` | gateway/bff ✅；srv ❌ | 由 k8s 探针替代 | `webx/webx.go:130`（`HealthPrefix` 默认 `/healthz`，`webx/config.go:51`；**裸前缀路径无 handler**） |
 | 注册与健康检查 | 不注册 | consul TTL + 心跳 | consul + k8s 双层 | coordx |
-| metrics / Prometheus | ❌ | ❌ | ❌ | **实测缺口**：`webx.Config.MetricsEnabled`（`webx/config.go:35`）在全仓零引用；otelx 未导出 MeterProvider → `/metrics` 不存在是**预期**，判 SKIP 而非 FAIL，更不得伪造端点记 PASS |
+| metrics / Prometheus | ✅ | ✅ | ⚠️ 配置就绪，**未真机复验** | 落点：`internal/telemetry.NewMetrics` 建 MeterProvider（拉取式，`otel/exporters/prometheus`）→ HTTP 档挂 `webx.MetricsPrefix`、srv 档单起 `metrics.addr`；RPC 侧 `rpcx.{requests,request.duration,errors}`。**2026-10-08 实测**：单体 `:8080/metrics`、微服 `bff:8081/metrics`（含 `rpcx_requests_total{rpc_role="client"}`）与 `srv-order:9031/metrics`（`rpc_role="server"`）均返回 Prometheus 文本；网关/域服启动日志打出 `rpc governance: ... metrics=on`。网格列只在清单里备好了采集口（`tcp-metrics` + `excludeInboundPorts`），本轮没有集群可验 —— **不得写成 ✅** |
 | pprof | ❌ | ❌ | ❌ | 本轮不做 |
 | 告警 / 看板 | ❌ | ❌ | ❌ | 本轮不做 |
 
-> 上表是「有没有」的事实登记，不是验收项。缺口项统一记 **SKIP**，任何把 SKIP 写成 PASS 的行为按 §15 第 7 条处理。
+> 上表是「有没有」的事实登记，不是验收项。仍为缺口的项统一记 **SKIP**，任何把 SKIP 写成
+> PASS 的行为按 §15 第 7 条处理。
+>
+> **metrics 这一格本轮从 ❌ 翻成 ✅/⚠️，翻的依据是真机输出而非"代码里写了"**：
+> 判据是 `curl /metrics` 拿到 `# HELP` + 带业务标签的计数器（`rpc_role="client"` /
+> `rpc_role="server"`）、以及启动日志里的 `metrics=on`。复跑命令见 `micro/scripts/e2e.sh`
+> 的断言 ③（已并入 E2，退出码即结论）。网格列**刻意只记 ⚠️**：清单里采集口与
+> `excludeInboundPorts` 都备好了，但本轮没有起集群 —— 没验过就不写 ✅。
 
 ## 13.5 服务治理分工：哪些交给网格，哪些必须留在应用侧
 
@@ -871,10 +878,10 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 |---|---|---|
 | mTLS / 服务身份认证 | ✅ TCP 层亦可 | **交给网格**，应用侧不再自造传输加密假设 |
 | 连接级可观测（metrics / 访问日志） | ✅ 部分（span 见 §C-0c ③） | 网格补充，**不替代**应用侧 span |
-| 异常实例剔除（outlier detection） | ✅ 主机 / 连接级 | 可交网格，但阈值须与应用侧重试对齐 |
-| 负载均衡 | ⚠️ 仅 L4 连接级；Kitex 自带实例选择 | **留在应用侧**（双侧决策会互相打架） |
-| 请求级重试 / 超时 | ❌ TCP 层看不见请求 | **留在应用侧**，且严禁双侧同开 |
-| 熔断（按错误率） | ❌ Envoy 读不到业务错误码 | **留在应用侧** |
+| 异常实例剔除（outlier detection） | ✅ 主机 / 连接级 | 可交网格，但阈值须与**应用侧熔断**对齐（`xmiddleware.rpcx.circuit_breaker`） |
+| 负载均衡 | ⚠️ 仅 L4 连接级；Kitex 自带实例选择 | **留在应用侧**（双侧决策会互相打架）：`xmiddleware.rpcx.load_balancer` |
+| 请求级重试 / 超时 | ❌ TCP 层看不见请求 | **留在应用侧**，且严禁双侧同开：`xmiddleware.rpcx.retry`（缺省关） |
+| 熔断（按错误率） | ❌ Envoy 读不到业务错误码 | **留在应用侧**：`xmiddleware.rpcx.circuit_breaker`（缺省开） |
 | 限流（本地 / 全局速率） | ❌ L7 限流不可用 | **留在应用侧**（gateway 的 `ratelimit` 必须保留） |
 | 鉴权（JWT / 用户态） | ❌ 网格只做服务身份，不做用户身份 | **留在应用侧**（`auth` 保留） |
 | 灰度 / 流量切分 | ❌ 无 HTTP 属性无法按 path / header 切 | 留在应用侧，或先改协议（见下） |
@@ -882,17 +889,26 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 
 **三条硬规则（防双重治理，写死）**：
 
-1. **重试不双侧开**：应用侧配了重试，网格侧就不得再开（重试放大在故障期会雪崩）。判据：`VirtualService` 的 `retries` 为空 **或** 应用侧重试次数为 0，二者只能居其一。
+1. **重试不双侧开**：应用侧配了重试，网格侧就不得再开（重试放大在故障期会雪崩）。判据：
+   `VirtualService` 的 `retries` 为空 **或** `xmiddleware.rpcx.retry.enabled` 为 false，二者只能居其一。
+   本仓缺省取后者（重试关）—— 链路上有非幂等写，且三试 ≈ 9s 已超过入口的 `webx.timeout: 5s`。
 2. **超时逐层收敛**：gateway 超时 > bff 超时 > srv 超时（越内层越短）。反之外层先断，内层 span 会成孤儿。
+   开重试时还要多看一层：`(1 + max_attempts) × rpcx 的 RPCTimeout` 必须仍小于外层 timeout。
 3. **限流只在入口做一次**：限流只在 gateway（应用侧），sidecar 不再叠加。
+4. **治理开关必须真被读到**（本轮新增）：`xmiddleware.rpcx` 的三项若写了却没生效，症状是
+   「按默认策略跑了很久却没人发现」。装配期会把**只含已生效项**的一行摘要打进启动日志
+   （`rpc governance: retry(...) circuit_breaker(...) load_balancer=...`），对照 yaml 一眼可辨；
+   非法取值（未知 LB、`max_attempts` 越界、`error_rate` 超范围）**装配期即退**，不静默退回默认值。
 
 **若要真正吃到网格红利**：把 Kitex 传输改为 gRPC / HTTP2（Kitex 支持 gRPC 与 TTHeader over HTTP2），端口声明 `appProtocol: grpc` / `http2`，L7 治理才可用。这是**后续演进项，本轮不做**；不做就必须接受「网格本轮只提供 mTLS + 连接级可观测」这一现实，并在 `docs/verify.md` 写明——**不得宣称「治理已下沉网格」**。
 
 ```bash
 # Kitex 段不得把端口误声明为 http（会让 Istio 误判协议并静默失败）
-grep -rn "appProtocol\|name: http\|name: grpc" examples/mesh/workloads/*.yaml
-# 双重重试检查：网格侧 retries 与 micro 配置里的 retry 次数只能居其一
-grep -rn "retries" examples/mesh/ ; grep -rn "retry" examples/micro/*/config.yaml
+grep -rn "appProtocol\|name: http\|name: grpc" examples/mesh/deploy/*/*.yaml
+# 双重重试检查：网格侧 retries 与应用侧 rpcx.retry 只能居其一。
+# 注意必须锚在 xmiddleware.rpcx 段上：`retry` 在本仓还出现在 lockx（锁重试，无关）
+# 与 outbox/mqx（消费端重试）—— 宽匹配会把它们一起捞进来，判据就失去意义。
+grep -rn "retries" examples/mesh/deploy/ ; grep -rnA3 "^\s*rpcx:" examples/*/*/config.yaml examples/mesh/apps/conf/*.yaml | grep "enabled"
 ```
 
 ## 13.6 治理下沉决策：注册中心 / 配置中心 / 还有哪些
@@ -969,7 +985,7 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 | B | 微服案例（三进程/三段链/ consul） | §13.2 | | consul 实例数 + `/tmp/trace.json` |
 | C | 网格案例（清单/镜像/挂载/双链/探针） | §13.3 | | `docs/verify.md` + `kubectl` 输出 + `kubectl exec cat /app/config.yaml` |
 | C-复用 | 网格直接复用微服二进制（P1/P2/P3 + 决策 A/B/C） | §13.3 C-0b/C-0c | | `grep` 硬编码为空 + `docs/verify.md` 决策记录 |
-| OBS | 可观测基线与缺口登记 | §13.4 | ✅（metrics/pprof 记 SKIP） | 日志-链路关联已由真机确认（webx 访问日志带 trace_id）；metrics 仍为实测缺口，记 SKIP |
+| OBS | 可观测基线与缺口登记 | §13.4 | ✅（pprof / 告警 / 看板记 SKIP） | 日志-链路关联已由真机确认（webx 访问日志带 trace_id）；**metrics 于 2026-10-08 补齐并真机复验**（单体 + 微服，网格列记 ⚠️ 未复验） |
 | GOV | 治理分工（应用侧 vs 网格侧） | §13.5 | | 无双重重试 / 无 L7 虚假陈述 |
 | GOV2 | 下沉决策（注册中心 / 配置中心 / 其他） | §13.6 | | 下沉项须指出「应用侧已撤除或已换实现」 |
 
@@ -981,7 +997,17 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 4. **降级被当成通过**：consul 挂了照样起来 → 这是设计内行为（A3），但**必须**有 Warn 日志；`strict=true` 时必须反过来变成启动失败。只测一种不算过。
 5. **网格 sidecar 假完整**：sidecar 之间靠 Envoy 自身透传，链路看着严丝合缝，但 app span 全脱落（trace 数 ≥ 4）。必须同时查应用服务名与 sidecar 服务名。
 6. **dry-run 静默通过**：`bring-up.sh check` 对 PATH / minikube / istioctl / kubectl / 集群 Running / istio-system 就绪 / 镜像已 load 每一项都要逐条输出，缺失即非零退出；任一项缺失却返回 0 → FAIL。注意本机 `minikube`/`istioctl` 在 `/usr/local/bin` 而**不在默认 PATH**，`which` 找不到不等于没装——脚本里漏了 `export PATH=/usr/local/bin:$PATH` 会造成「工具齐全却被判缺失」和「真缺失却判通过」两种反向误判。
-7. **把缺口记成通过**：metrics / pprof / 日志 trace_id 关联这三类本轮**不存在**（§13.4）。`/metrics` 返回 404 是预期，记 SKIP；若为使表格好看而写 PASS，或临时加个返回空 JSON 的假端点凑数 → 一律 FAIL。
+7. **把缺口记成通过**：pprof / 告警 / 看板三类本轮**不存在**（§13.4）；网格列的 metrics
+   **只备了清单、没起集群验过**，故记 ⚠️ 而非 ✅。反过来同样成立 —— **不得伪造端点凑数**：
+   一个返回空 JSON 或 `200 {}` 的 `/metrics` 一律 FAIL。本轮把 metrics 从 ❌ 翻成 ✅ 时
+   判据是**三层**：有响应体、是 Prometheus 文本（含 `# HELP`）、且出现带业务标签的计数器
+   （`rpcx_requests_total{rpc_role="client"|"server"}`）；复跑入口是 `micro/scripts/e2e.sh`
+   的断言 ③，退出码即结论。
+   > 同族的坑：**分桶与单位错配**也算"假通过"。缺省分桶 `[0,5,10,...,10000]` 是毫秒形状，
+   > 而本仓两个直方图声明的单位是 `s` —— 不加显式分桶时所有请求挤进 `le="5"`，端点 200、
+   > 计数器也对，只有 p99 是废的。已加显式分桶与防回归用例
+   > （`rpcx/governance_test.go` / `webx/middleware/access_stats_test.go` 的
+   > `TestDurationBucketBoundsAreSecondsScale`）。
 8. **只跑一个进程就宣称微服链路通**：gateway 起来了、bff/srv 没起，`/api/ping` 也可能被 fallback 逻辑返回 200。判据必须同时看 consul 实例数（bff + srv 各 ≥1）与 Jaeger 中三个服务名同 trace，缺一不算过。
 9. **bff 端口漂移**：计划 Task 10 曾写 `8091`，本文档定稿为 `8081`。实现与文档必须单一口径；出现两个端口说明有人各写各的，配置与验收已脱节。
 10. **网格里混进 Go 代码**：`examples/mesh` 出现 `.go` 文件 = 网格走了独立代码路径，直接违反 T8。哪怕编译通过、链路也通，仍判 FAIL（因为"通"的是另一份代码，不能证明同构）。

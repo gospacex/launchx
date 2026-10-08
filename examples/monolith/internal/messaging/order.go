@@ -1,20 +1,19 @@
-// Package messaging 消息投递适配层：把 mqx 的发送包成本层的 `messaging.*` span，
-// 并把 traceparent 注入消息头完成跨进程续链。
+// Package messaging 消息投递适配层：把 mqx 的发送包成本层的 `messaging.*` span。
 //
-// 为什么必须显式注入：MQ 不像 HTTP 那样有中间件替你 Extract/Inject，
-// producer 不写 traceparent 的话，消费端拿不到上游 context，链路在投递这一跳
-// 断成两棵孤儿树（与 gateway 忘注入的现象同构，见 launchx/trace.go 的注释）。
+// 跨进程续链**不由本层做**：mqx 的四个驱动在 Send / SendBatch 发出前都会调
+// mqx.InjectTrace(ctx, msg) 写 traceparent（覆盖语义：ctx 站在哪，谁就是下游的
+// 父节点）。业务侧再写一遍不只是冗余 —— 它把"续链发生在哪里"在业务层又声明了
+// 一次，mqx 改口径时这里会静默不同步，表现为链路偶发断在消费侧。
+//
+// nsq 协议不承载 header，走 nsq 的消息无法续链（已在 mqx/propagation.go 注明）。
 package messaging
 
 import (
 	"context"
 	"fmt"
-	"net/http"
 
-	"github.com/gospacex/launchx"
 	"github.com/gospacex/mqx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/gospacex/otelx/layer"
 )
@@ -34,25 +33,11 @@ func NewOrder(producer mqx.Producer, topic string, traceOn bool) *Order {
 	return &Order{producer: producer, topic: topic, traceOn: traceOn}
 }
 
-// flatten 把 http.Header 摊平成 mqx 的消息头（多值取第一个）。
-//
-// 为什么要这层转换：注入器写的是 TextMapCarrier（多值语义），而 mqx.Message.Headers
-// 是单值 map。丢掉多余的值不算丢数据 —— traceparent / tracestate / baggage 都是单值。
-func flatten(h http.Header) map[string]string {
-	out := make(map[string]string, len(h))
-	for k, vs := range h {
-		if len(vs) > 0 {
-			out[k] = vs[0]
-		}
-	}
-	return out
-}
-
 // Publish 投递一条订单事件。
 //
 // 降级语义由调用方保证 producer 非 nil —— 本方法不吞 nil：producer 为空时
 // 返回 error 并打进 span，让"事件没发出去"在链路上可见，而不是静默丢。
-// begin 开本层 span（沿用两段式 messaging.<Op> 命名），返回「收 error 再收尾」的闭包。
+// begin 开本层 span（三段式 messaging.order.<Op>），返回「收 error 再收尾」的闭包。
 func (o *Order) begin(ctx context.Context, op string) (context.Context, layer.End) {
 	return layer.Begin(ctx, "messaging", "order", op, o.traceOn, nil)
 }
@@ -66,18 +51,21 @@ func (o *Order) Publish(ctx context.Context, key string, payload []byte) (err er
 		attribute.String("messaging.message_key", key),
 	)
 
-	headers := http.Header{}
-	// 注入走 launchx.Inject（传播器由 telemetry 步骤注册），业务侧不裸调 otel 全局。
-	launchx.Inject(ctx, propagation.HeaderCarrier(headers))
-
-	// Topic 刻意留空：producer 由 xmiddleware.mqx 配的目标 topic 构造（writer 自带
+	// Headers 刻意留空：traceparent 由 mqx 自己注入 —— 四个驱动的 Send / SendBatch
+	// 在发出前都会调 mqx.InjectTrace(ctx, msg)（kafka.go / pulsar.go / rabbitmq.go /
+	// rocketmq.go），业务侧再写一遍是重复的。
+	//
+	// 曾经这里手写 launchx.Inject 填 msg.Headers，那不只是冗余：它把"跨进程续链
+	// 发生在哪里"这件事在业务层又声明了一次，于是 mqx 改注入口径时这里会静默
+	// 不同步 —— 表现为链路偶发断在消费侧，而代码看着完全正确。
+	//
+	// Topic 同样留空：producer 由 xmiddleware.mqx 配的目标 topic 构造（writer 自带
 	// topic），kafka-go 不接受 writer 与 message 同时指定 topic
 	// ——2026-10-05 实测报 "Topic must not be specified for both Writer and Message"。
 	// 目标 topic 进 span 属性即可检索，不必写进消息体。
 	msg := &mqx.Message{
-		Key:     key,
-		Value:   payload,
-		Headers: flatten(headers),
+		Key:   key,
+		Value: payload,
 	}
 	if err = o.producer.Send(ctx, msg); err != nil {
 		err = fmt.Errorf("messaging: publish order event: %w", err)

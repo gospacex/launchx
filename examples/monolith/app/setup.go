@@ -142,7 +142,9 @@ func Setup(a *launchx.App) error {
 			logx.String("hint", "check xmiddleware.mongodbx"))
 	}
 
-	svc := service.New(repo, orderCache, orderEvents, orderIndex, snapshots, traceOn)
+	// logger 一并交给业务层：降级（事件没投出去 / 索引没写 / 快照没存）必须落日志，
+	// 不能只落在 span 上 —— trace.enabled=false 时 span 不录，降级就彻底静默了。
+	svc := service.New(repo, orderCache, orderEvents, orderIndex, snapshots, logger, traceOn)
 
 	// ---------- 业务中间件：鉴权 ----------
 	// 凭据走缓存，故只在缓存可用时装配；令牌为空则不注册 /secure 路由，

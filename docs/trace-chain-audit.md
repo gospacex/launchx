@@ -81,10 +81,13 @@ WithPropagators(launchx.Propagator()))`（`proxy.go:141-149`），provider 由
 `app/setup.go` 从 `a.Tracer().TracerProvider()` 传入 —— **必须与自造 span 同出
 一个 provider**，否则 CLIENT span 会掉进全局 noop。
 
-~~待改进 2~~ → **已修（G2）**：`micro/srv` 的限流器已从 cachex 迁到 `a.KV()`
-（`middleware/ratelimit.go`），与 mall 保持同一写法。由于 demo-srv 除限流外不再
-使用缓存，`config.yaml` 里是**整段替换**（cachex 段删、kvx 段加）而非追加 ——
-留一段配了却没人用的组件，会让「为什么看不到 cache span」变成一个猜谜题。
+~~待改进 2~~ → **已修（G2）**：限流器已从 cachex 迁到 `a.KV()`
+（`micro/srv-*/internal/middleware/ratelimit.go`，四个域服同一份写法）。
+限流计数需要原子 `Incr`，cachex 只有 Get/Set/Delete 给不出；两者分工写死为
+「kvx 管可自增状态、cachex 管可失效缓存」。原 `micro/srv`（demo-srv，除限流外
+不再用缓存）是**整段替换** cachex 段为 kvx 段而非追加 —— 留一段配了却没人用的
+组件，会让「为什么看不到 cache span」变成一个猜谜题。该单域样例已随四域拆分
+移除。
 
 ## 4. 服务网格形态（examples/mesh）
 
@@ -98,8 +101,10 @@ WithPropagators(launchx.Propagator()))`（`proxy.go:141-149`），provider 由
 
 - `configmap.yaml` 三份配置副本各带 `trace.enabled: true` 与 OTLP endpoint
   （gateway :44-48 / bff :80-84 / srv :109-116）；srv 段的 `trace.on` 覆盖
-  db / kv / mq / registry，与其实际用到的组件一致（随 micro/srv 的 cachex→kvx
-  替换同步改过，两边必须保持一致 —— 网格复制配置时最容易漏的就是这一处）。
+  db / kv / mq / registry，与其实际用到的组件一致（随原 `micro/srv` 的
+  cachex→kvx 替换同步改过，两边必须保持一致 —— 网格复制配置时最容易漏的就是
+  这一处）。注：网格清单里的 srv 段对应的是已移除的 `demo-srv`，网格形态若要
+  继续可跑，需把该段改成四个域服之一（或另起一份清单）。
 - `telemetry.yaml` 下发 `randomSamplingPercentage: 100` —— Istio 默认采样率极低，
   是「看不到 sidecar span」的头号假阴性来源。
 - `istio-operator.yaml` 的 provider 必须是 `opentelemetry`（发 W3C `traceparent`），
@@ -110,19 +115,74 @@ WithPropagators(launchx.Propagator()))`（`proxy.go:141-149`），provider 由
 所以这一跳**没有 sidecar span**。网格本轮提供的是 mTLS + 连接级可观测，
 L7 治理仍在应用侧（`mesh/README.md` §5）。
 
-## 5. mall 四微服（本轮新增，作为"句柄纪律"的正例）
+## 5. mall 四微服（作为"句柄纪律 + 分层链"的正例）
 
 四服各自 `app/setup.go` 一律从 `a.DB() / a.Cache()[name] / a.MQ() / a.KV()[name] /
-a.Lock() / a.RPCServerOptions()` 取句柄，跨域异步事件用 outbox 落库，
-`traceparent` 随 mqx 消息 header 透传（`pkg/outbox/outbox.go:248-258`），
-消费侧 Extract 续链 —— 这是"跨进程 + 跨异步边界"两头都能续的完整闭环。
+a.Lock() / a.RPCServerOptions()` 取句柄，跨域异步事件用 outbox 落库续链，三个落点分工：
+
+| 环节 | 落点 | 做什么 |
+|---|---|---|
+| 落库 | 业务事务内 `tx.Create(&outbox.Event{...})` | 把当前 `traceparent` 随事件行一起持久化 |
+| 投递 | `examples/pkg/outbox/outbox.go` 的 `sendOne` | 从事件行还原上下文，开 `messaging.outbox.send` span |
+| 注入 | `mqx.Producer.Send` → `mqx.InjectTrace` | 把当前 span 上下文写进消息 header |
+| 还原 | `mqx.Consumer.Consume` → `mqx.ExtractTrace` | 从 header 还原上下文后再交给业务 handler |
+
+"跨进程 + 跨异步边界"两头都续得上的完整闭环。
+
+> **2026-10-07 更正**：本条此前记的是「消费侧 Extract 续链」，但当时消费侧**一个
+> 订阅者都没有**，mqx 的五个驱动内也**一处 Extract / Inject 都没有**（生产侧能续链
+> 全靠 outbox 手写 header 绕过）。链路实际断在 broker 这一跳。上表的后两行是那一轮
+> 才补进 mqx 的；补完之后 outbox 里手写 `msg.Headers["traceparent"]` 那段已删除。
+
+### 5.1 进程内六层链（本轮补齐）
+
+此前四服只有 `rpc → service → repository` 三段，且 `rpc` 层把 span 名字写成了
+`service.*` —— service 层实际**没有自己的 span**，模型结构体也混在 repository
+里不带独立 layer。现已拆成六层，每层各开一节 span：
+
+```
+rpc → route → middleware → handler → service → repository → model
+```
+
+| 层 | span 名 | 本轮状态 |
+|---|---|---|
+| 传输适配 `internal/rpc` | `rpc.<entity>.<Method>` | 已有（此前误命名为 `service.*`，已纠正） |
+| 路由 `internal/route` | `route.<entity>.<Method>` | **本轮新增** |
+| 中间件 `internal/middleware` + `pkg/routing` | `middleware.<entity>.audit` / `.rate_limit` | **本轮新增**（此前限流只是 `rpc.guard` 里的一个调用） |
+| 协议适配 `internal/handler` | `handler.<entity>.<Method>` | **本轮新增** |
+| 业务编排 `internal/service` | `service.<entity>.<Op>` | **本轮补埋点**（此前完全没有） |
+| 持久 `internal/repository` | `repository.<entity>.<Op>` | **本轮补埋点**（此前只靠 dbx 的 SQL span） |
+| 数据模型 `internal/model` | —— | **本轮抽层**（零依赖，此前混在 repository） |
+
+中间件 span 是嵌套的：`route → audit → rate_limit → handler`。命中限流时
+`route` span 会带 `routing.aborted=true` 与 `routing.aborted_by=rate_limit`。
+
+service 层不再 import `kitex_gen`（pb 加字段不会渗进业务规则），pb ↔ 领域模型
+的转换只在 handler；业务失败用 `codes.Error` 带码上浮，handler 统一翻译成响应体。
+`examples/micro` 的四个 `srv-*` 是同构拷贝（服务名 `demo-*`），结论完全一致。
+
+### 5.2 句柄来源断言（本轮新增）
+
+光"写起来像用了 launchx 句柄"不够 —— 自己 `gorm.Open` 一个照样能查能写，
+唯独 SQL 不进链路，而且这种退化**没有任何报错**。所以加了可执行断言：
+
+`pkg/handlecheck.VerifyDBX(db)` 在装配期检查 `*gorm.DB` 上有没有 dbx 注册的
+`dbx:trace_before_{create,query,update,delete}` gorm 回调（`dbx/orm/gorm_tracing.go:70`），
+没有就直接让服务起不来。仅在 `trace.on.db` 为真时验：`enable_trace=false` 时
+dbx 走 `OpenNoTrace`，没有回调是配置选择，不是用错句柄。
+
+静态侧同样自证：业务代码里 `grep` 不到 `sql.Open` / `redis.NewClient` /
+`kafka.NewWriter` / `gorm.Open` / `mongo.Connect`；八个微服的 `a.DB()` 取用点
+各自只有 `app/setup.go` 一处（历史例外是 `micro/srv` 的两个单元测试用
+`gorm.Open(sqlite)` 建内存库，那是不经过 launchx 的纯仓储测试；该单域样例已随
+四域拆分移除，四个域服目前无自建连接的测试）。
 
 ## 6. 缺口清单（按建议优先级）
 
 | # | 缺口 | 位置 | 处理 | 状态 |
 |---|---|---|---|---|
 | G1 | 网关出向无标准 HTTP CLIENT span | `micro/gateway/internal/proxy/proxy.go:141` | `otelhttp.NewTransport` 包 `http.DefaultTransport`，provider 取自 `a.Tracer()` | ✅ 已修 |
-| G2 | 限流计数非原子（Get→+1→Set） | `micro/srv/internal/middleware/ratelimit.go`<br>`monolith/internal/ratelimit/counter.go` | 改用 `a.KV()` 的 `Incr` | ✅ 已修 |
+| G2 | 限流计数非原子（Get→+1→Set） | `micro/srv-*/internal/middleware/ratelimit.go`<br>`monolith/internal/ratelimit/counter.go` | 改用 `a.KV()` 的 `Incr` | ✅ 已修 |
 | G3 | 单体形态未接入 kvx / lockx | `monolith/config.yaml` | 限流迁 kvx 时一并接上；lockx 业务仍未用到，保持不配 | ✅ 已收口 |
 | G4 | 网格下 bff→srv 无 sidecar span | Kitex TCP 协议 × Envoy | 结构性限制 | ➖ 登记不改 |
 
@@ -173,10 +233,10 @@ a.Lock() / a.RPCServerOptions()` 取句柄，跨域异步事件用 outbox 落库
 - 两处计数统一走 `kvx.KVStore.Incr`。窗口 rollover 靠 key 里带窗口序号实现；
   `Incr` 首建 key 时带不上 TTL，故在自增结果为 1 时用 `Set` 把 TTL 补上
   （此刻值必然是 1，覆写不丢计数）。不补，冷 key 会永久堆在 redis 里。
-- 装配件必须**显式留痕**：计数缺失不会报错，只会不限流。micro/srv 与 monolith
+- 装配件必须**显式留痕**：计数缺失不会报错，只会不限流。四个域服与 monolith
   都在门控未命中时打 Warn；monolith 另给计数器加了 `Ready()`，让「装了没装」
   是个可判定状态，而不是靠判 nil 猜。
-- cachex 与 kvx 的分工因此写死在四个地方一致：examples/mall 四服、micro/srv、
+- cachex 与 kvx 的分工因此写死在四个地方一致：examples/mall 四服、micro 四域服、
   monolith、以及本报告 —— kvx 管可自增状态，cachex 管可失效缓存。
 
 改完的验证：`go build ./...` 零错误、`go vet` 干净、`go test ./...` 无 FAIL、
