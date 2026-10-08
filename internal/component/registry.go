@@ -16,6 +16,8 @@
 package component
 
 import (
+	"fmt"
+
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/configx"
 	"github.com/gospacex/coordx"
@@ -43,7 +45,16 @@ type Env struct {
 	// 调用方按需断言（保持"业务经 launchx 取句柄、不直引驱动"的依赖面）。
 	DB    any
 	Cache cachex.Instances
-	MQ    mqx.Producer
+	// MQ 消息生产者（发布侧）。
+	MQ mqx.Producer
+	// MQConsumer 消息消费者（订阅侧）。
+	//
+	// 为什么现在才补：早先只为「发送」构造句柄，于是 mq 这条链只能走到
+	// producer span，消费侧要么业务自己 mqx.NewConsumer（绕开 launchx、
+	// 也绕开 trace.on.mq 开关），要么根本没有消费侧 —— 表现为"消息投出去了
+	// 但链路在 broker 这一跳断成孤儿"。同一个 xmiddleware.mqx 段既解出来了
+	// broker 地址与 topic，消费侧就该同源。
+	MQConsumer mqx.Consumer
 	// Registry 注册句柄；Discover 发现句柄。coordx 把「注册」与「发现」拆成两个
 	// 接口，而 HTTP 网关（按服务名解析上游实例）和 RPC 客户端都要用发现侧，
 	// 故两个都留。降级或未配段时为零值。
@@ -55,20 +66,47 @@ type Env struct {
 	KV   kvx.Stores
 	Lock lockx.Locker
 
-	stops []func() error
+	stops []namedStop
 }
 
+// namedStop 一条带名字的组件关闭函数。
+//
+// 名字不是装饰：退出链给每一环加了有界等待（见 App.Close），卡住时只能靠名字
+// 说清「谁没退出来」。早先 AddStop 收了 name 却丢掉，超时日志就只能打出序号。
+type namedStop struct {
+	Name string
+	Fn   func() error
+}
+
+// NamedStop 供退出链取用的命名关闭项。
+type NamedStop = namedStop
+
 // AddStop 注册组件级关闭函数（反序退出链按注册逆序执行）。
+//
+// name 为空时按注册序补一个占位名——宁可有个难看的名字，也不要在超时日志里
+// 打不出任何标识。
 func (e *Env) AddStop(name string, fn func() error) {
 	if fn == nil {
 		return
 	}
-	e.stops = append(e.stops, fn)
+	if name == "" {
+		name = fmt.Sprintf("stop#%d", len(e.stops))
+	}
+	e.stops = append(e.stops, namedStop{Name: name, Fn: fn})
 }
 
 // Stops 返回关闭函数快照（反序退出链用）。
 func (e *Env) Stops() []func() error {
-	out := make([]func() error, len(e.stops))
+	out := make([]func() error, 0, len(e.stops))
+	for _, s := range e.stops {
+		out = append(out, s.Fn)
+	}
+	return out
+}
+
+// NamedStops 返回带名字的关闭项快照。退出链按它执行：卡住时要能报出组件名。
+func (e *Env) NamedStops() []NamedStop {
+	out := make([]NamedStop, len(e.stops))
 	copy(out, e.stops)
 	return out
 }

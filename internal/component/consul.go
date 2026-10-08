@@ -1,11 +1,8 @@
 package component
 
 import (
-	"context"
-
 	"github.com/gospacex/coordx"
 	_ "github.com/gospacex/coordx/consul" // 注册 consul 驱动（blank import）
-	"github.com/gospacex/logx"
 )
 
 func init() { Register("registry", buildRegistry) }
@@ -53,13 +50,15 @@ func buildRegistry(env *Env) error {
 
 	// 发现句柄：与注册同源配置。**这一步不能省** —— 网关（HTTP 反代）要按
 	// 服务名解析上游实例，靠的就是它；没有它，业务只能退化成配置里写死地址。
-	// 建不出来只记录告警，不按 strict 裁决：注册能力仍在，发现侧退化为兜底地址。
+	//
+	// 与注册侧**同口径**：失败走 degrade（即受 strict.registry 裁决），不再
+	// 「只告警 + 静默继续」。理由（2026-10-08 复核）：注册被判严格、发现永远
+	// 只告警，等于 strict.registry=true 也拦不住「配了注册中心但发现构件器建不
+	// 出来」——症状是生产里只多一行 Warn，全部出向调用退化成静态地址，
+	// 没有静态兜底时表现为 502，而排查方向还会被「注册是成功的」误导。
 	disc, derr := coordx.NewDiscover(cfg)
 	if derr != nil {
-		env.Logger.WarnContext(context.Background(),
-			"launchx: discover init failed, upstream discovery falls back to static address",
-			logx.Err(derr))
-		return nil
+		return degrade(env, "registry", ConsequenceDiscovery, derr)
 	}
 	env.Discover = disc
 	env.AddStop("registry.discover", func() error {

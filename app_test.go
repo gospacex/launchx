@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gospacex/coordx"
 	"github.com/gospacex/launchx/internal/component"
@@ -406,5 +407,70 @@ func TestSelfAddrFromConfigWithEnv(t *testing.T) {
 	}
 	if os.Getenv("LX_TEST_SELF_ADDR") == "" {
 		t.Fatal("sanity: env must be set")
+	}
+}
+
+// ======================= 退出链有界性（P0：进程必须退得出来） =======================
+
+// TestCloseNeverHangsOnBlockedStopHook 退出链每一环都有界：某一环卡死时 Close
+// 必须在该环的上限内返回，而不是跟着一起挂住。
+//
+// 为什么值得单列一条：这个缺陷的形态是「进程永远收不到 SIGTERM」——K8s 优雅期
+// 耗尽后直接 SIGKILL，而进程自己还以为在正常收尾。现实触发者（2026-10-07 实测）
+// 是 kafka-go：Reader 的 GroupID 非空即起 ConsumerGroup 协程，它阻塞在 joinGroup
+// 的网络读上且不设读 deadline，于是 Reader.Close 永久等待。这类驱动级行为
+// 修不完，只能由退出链统一兜住。
+func TestCloseNeverHangsOnBlockedStopHook(t *testing.T) {
+	app, err := Bootstrap("testdata/srv.yaml")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	blocked := make(chan struct{})
+	app.OnStopNamed("blocked-for-test", func() error {
+		<-blocked // 永不返回：模拟驱动 Close 卡死
+		return nil
+	})
+
+	limit := app.stopTimeout()
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- app.Close() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("卡住的一环不应让 Close 返回错误（超时是已处理的降级，不是失败）：%v", err)
+		}
+	case <-time.After(limit + 5*time.Second):
+		t.Fatalf("Close 跟着卡住的回调一起挂住了（%s 内没有返回）——退出链又变回无界了",
+			limit+5*time.Second)
+	}
+	if elapsed := time.Since(start); elapsed > limit+5*time.Second {
+		t.Fatalf("Close 耗时 %s，超过上限 %s", elapsed, limit)
+	}
+
+	// 超时必须留痕：否则线上只会看到「进程退出了」，看不出有一环被放弃。
+	if app.Events().IndexOf("stop.timeout.blocked-for-test") < 0 {
+		t.Fatalf("事件流里没有 stop.timeout 记录，卡住的一环被静默吞掉了：%v", app.Events().Order())
+	}
+}
+
+// TestStopHookErrorStillAggregated 确认「超时豁免」没有把真实失败一起豁免掉：
+// 回调自己报的 error 照样进聚合，只是超时不算。
+func TestStopHookErrorStillAggregated(t *testing.T) {
+	app, err := Bootstrap("testdata/srv.yaml")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	boom := errors.New("stop failed on purpose")
+	app.OnStopNamed("failing-for-test", func() error { return boom })
+
+	if err := app.Close(); err == nil {
+		t.Fatal("回调返回的 error 必须进聚合，got nil")
+	} else if !errors.Is(err, boom) {
+		t.Fatalf("聚合结果丢失原始 error：%v", err)
+	}
+	if app.Events().IndexOf("stop.timeout.failing-for-test") >= 0 {
+		t.Fatal("返回 error 的回调不应被记为超时")
 	}
 }

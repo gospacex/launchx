@@ -12,14 +12,20 @@ import (
 // 各组件降级时的后果文案。写"后果"而不是"错误"，
 // 因为降级后进程仍在跑，运维需要知道的是"接下来会发生什么"。
 const (
-	ConsequenceDB       = "数据库不可用，落库请求将 5xx"
-	ConsequenceCache    = "缓存穿透 / 限流 fail-open"
-	ConsequenceMQ       = "事件投递中断，outbox 将堆积重试"
-	ConsequenceRegistry = "服务不被发现，上游调用将 502"
-	ConsequenceSearch   = "搜索功能不可用，检索请求将报错"
-	ConsequenceMongo    = "文档库不可用，非结构化读写将报错"
-	ConsequenceKV       = "键值状态不可用，幂等键与状态位将退化为进程内态（重启即失忆）"
-	ConsequenceLock     = "分布式锁不可用，并发预占/扣减将退化成无锁路径（超卖风险）"
+	ConsequenceDB        = "数据库不可用，落库请求将 5xx"
+	ConsequenceCache     = "缓存穿透 / 限流 fail-open"
+	ConsequenceMQ        = "事件投递中断，outbox 将堆积重试"
+	ConsequenceMQConsume = "消费侧不可用，已投递事件无人处理（队列持续堆积）"
+	ConsequenceRegistry  = "服务不被发现，上游调用将 502"
+	// ConsequenceDiscovery 与 ConsequenceRegistry 的差别在**方向**：
+	// 注册是「别人找不到我」，发现是「我找不到别人」。二者同源同段
+	// （xmiddleware.coordx），故同受 strict.registry 裁决，但后果文案必须分开，
+	// 否则运维从日志里分不出该查注册目录还是该查出向配置。
+	ConsequenceDiscovery = "出向服务发现不可用，上游地址只能靠配置直连兜底（未配则 502）"
+	ConsequenceSearch    = "搜索功能不可用，检索请求将报错"
+	ConsequenceMongo     = "文档库不可用，非结构化读写将报错"
+	ConsequenceKV        = "键值状态不可用，幂等键与状态位将退化为进程内态（重启即失忆）"
+	ConsequenceLock      = "分布式锁不可用，并发预占/扣减将退化成无锁路径（超卖风险）"
 )
 
 // degrade 按 strict.<name> 裁决组件构造失败：

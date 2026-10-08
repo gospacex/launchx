@@ -33,6 +33,7 @@ const (
 	StepComponentStop      = "component.stop"
 	StepRegistryDeregister = "registry.deregister"
 	StepTracingShutdown    = "tracing.shutdown"
+	StepMetricsShutdown    = "metrics.shutdown"
 	StepLoggerClose        = "logger.close"
 )
 

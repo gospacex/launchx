@@ -13,6 +13,7 @@ package mode
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/gospacex/configx"
@@ -65,6 +66,15 @@ func ParseMode(s string) (Mode, error) {
 	return "", fmt.Errorf("%w（当前值 %q）", errIllegalMode, s)
 }
 
+// MetricsEndpoint 指标采集口的最小契约（由 App 注入）。
+//
+// 只声明一个方法：mode 不需要知道指标后端是 Prometheus 还是别的、也不需要
+// 拿到 MeterProvider（instrument 一律向 otel 全局取用）。nil 表示未启用指标。
+type MetricsEndpoint interface {
+	// Handler 返回采集口；未启用时返回 nil。
+	Handler() http.Handler
+}
+
 // AppHolders 装配的输入句柄与输出产物，是 launchx App 与本包之间唯一的数据面。
 //
 // 装配发生在 component.mount 之前，故这里只传「此刻已就绪」的句柄（配置/日志/
@@ -76,6 +86,8 @@ type AppHolders struct {
 	Logger logx.Logger
 	// Tracer telemetry provider（可为空；非空时注入 webx 与 rpcx 的埋点）。
 	Tracer otelx.Provider
+	// Metrics 指标采集口（可为空 = 未启用指标）。
+	Metrics MetricsEndpoint
 	// ServiceName 服务名，用于注册名与 tracer 名。
 	ServiceName string
 
@@ -102,6 +114,16 @@ type Out struct {
 	RegistryAddr string
 	// Registered 本档是否需要向注册中心注册自身实例（bff/srv 为 true）。
 	Registered bool
+	// RPCGovernance 出向 RPC 治理参数（重试 / 熔断 / 负载均衡）。
+	// **装配期解析并校验**，零值表示全关（见 rpc.go）。
+	RPCGovernance RPCGovernance
+	// MetricsEnabled 是否挂指标：RPC 侧中间件 + HTTP 档的 /metrics 端点。
+	// otel MeterProvider 本身由 telemetry 步骤装配（与形态无关），本字段只表达
+	// "这一档要不要把指标接出去"。
+	MetricsEnabled bool
+	// MetricsAddr 指标监听地址。**只对 srv 档有意义**：srv 没有 HTTP 面，
+	// 需要独立监听才能被采集；HTTP 档的 /metrics 由 webx 引擎自带。
+	MetricsAddr string
 }
 
 // Assemble 按 service.mode 分派装配：解析形态 → 装服务端 → 产出客户端/发现工厂。
@@ -115,7 +137,31 @@ func Assemble(h *AppHolders) error {
 	if err != nil {
 		return err
 	}
-	h.Out = Out{Mode: string(m), RegistryAddr: registryAddr(h)}
+	// 治理参数在分派之前解析：非法取值即退（不降级），见 readRPCGovernance。
+	gov, err := readRPCGovernance(h.Cfg)
+	if err != nil {
+		return err
+	}
+	metricsOn := h.Cfg.GetBool(metricsEnabledKey)
+	h.Out = Out{
+		Mode:           string(m),
+		RegistryAddr:   registryAddr(h),
+		RPCGovernance:  gov,
+		MetricsEnabled: metricsOn,
+		MetricsAddr:    strings.TrimSpace(h.Cfg.GetString(metricsAddrKey)),
+	}
+	if h.Logger != nil {
+		// 把装配期**真实的裁决结果**打出来：这三个开关"配了不生效"是一类
+		// 静默病（段键写错、开关串位都长一个样），日志与 yaml 对照一眼可见。
+		h.Logger.Info("launchx: " + rpcGovernanceSummary(gov, metricsOn))
+	}
+	// srv 档没有 HTTP 面：采集口只能自己起监听。不配地址的话指标会「只记不露」
+	// —— 面板上永远是空的，而进程一切正常。这类配置错误在本仓一律即退
+	//（与 load_balancer 越界同一口径），不降级、不静默。
+	if metricsOn && m == ModeSRV && h.Out.MetricsAddr == "" {
+		return fmt.Errorf("launchx: service.mode=srv 没有 HTTP 面，metrics.enabled=true 时必须配 metrics.addr" +
+			"（否则指标会被采集但不暴露，且没有任何报错）")
+	}
 	switch m {
 	case ModeMonolith:
 		return assembleMonolith(h)

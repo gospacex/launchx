@@ -9,7 +9,11 @@ import (
 
 func init() { Register("mq", buildMQ) }
 
-// buildMQ 构造消息生产者（yaml 段：xmiddleware.mqx.instances.<service>）。
+// buildMQ 构造消息的生产者与消费者（yaml 段：xmiddleware.mqx.instances.<service>）。
+//
+// 两侧共用同一份 cfg：broker / topic / 调用链开关必须同源，否则会出现
+// "producer 按 A topic 发、consumer 按 B topic 收" 或者 "trace.on.mq=false
+// 时 producer 不入链、消费侧却照录" 这类半边状态。
 //
 // 红线：trace.on.mq=false **不阻止** producer 的构造，只是不产 span。
 // 历史 bug 把该开关当构造开关，producer 变 nil，outbox 静默堆积到
@@ -52,6 +56,19 @@ func buildMQ(env *Env) error {
 	env.MQ = producer
 	env.AddStop("mq", func() error {
 		producer.Close() // 忽略返回值：不同驱动签名不一，统一按语句调用
+		return nil
+	})
+
+	// 消费侧独立降级：两边 NZ APPLICATION 不是一个失败模式 —— producer 挂了是
+	// "事件投不出去"，consumer 挂了是"排队的业务没人干"。合成一次失败会把后者
+	// 的后果文案盖掉，排障时看不出来到底哪一侧不可用。
+	consumer, cerr := mqx.NewConsumer(cfg)
+	if cerr != nil {
+		return degrade(env, "mq", ConsequenceMQConsume, cerr)
+	}
+	env.MQConsumer = consumer
+	env.AddStop("mq.consumer", func() error {
+		consumer.Close()
 		return nil
 	})
 	return nil

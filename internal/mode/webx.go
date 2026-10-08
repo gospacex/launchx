@@ -8,6 +8,7 @@ import (
 	"github.com/gospacex/logx"
 	"github.com/gospacex/rpcx"
 	"github.com/gospacex/webx"
+	"go.opentelemetry.io/otel"
 )
 
 // assembleMonolith 单体档：仅 HTTP 服务端，不注册自身。
@@ -73,6 +74,20 @@ func newWebx(h *AppHolders) (any, error) {
 	if h.Tracer != nil {
 		opts = append(opts, webx.WithTracer(h.Tracer.TracerProvider().Tracer(tracerName(h))))
 	}
+	// 指标：instrument 由 webx 内部持（AccessStats），这里只做两件事 ——
+	// 打开开关（否则 BindMeter 不会被调）与把采集口挂到引擎上。
+	// MeterProvider 不交接：向 otel 全局取用（telemetry 已装好），
+	// 与 tracer 同口径 —— 交接一次会让"两个 instrument 同出一源"变成
+	// 取决于装配顺序的偶然事实。
+	if h.Metrics != nil {
+		if hnd := h.Metrics.Handler(); hnd != nil {
+			opts = append(opts,
+				webx.WithMetrics(true),
+				webx.WithMeterProvider(otel.GetMeterProvider()),
+				webx.WithMetricsEndpoint(hnd),
+			)
+		}
+	}
 	app, err := webx.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("launchx: webx new: %w", err)
@@ -106,10 +121,16 @@ func clientOptionsFactory(h *AppHolders) func(service string) (any, error) {
 				logx.String("service", service))
 		}
 		return rpcx.BuildClientOptions(rpcx.ClientOptions{
-			ServiceName:  h.ServiceName,
-			RegistryAddr: addr,
-			Target:       h.Cfg.GetString("service.upstream." + service),
-			TraceEnabled: h.Cfg.GetBool("trace.enabled"),
+			ServiceName:       h.ServiceName,
+			DownstreamService: service,
+			RegistryAddr:      addr,
+			Target:            h.Cfg.GetString("service.upstream." + service),
+			TraceEnabled:      h.Cfg.GetBool("trace.enabled"),
+			MetricsEnabled:    h.Out.MetricsEnabled,
+			// 出向治理三件套：装配期已解析校验，此处只透传（见 rpc.go）。
+			Retry:          h.Out.RPCGovernance.Retry,
+			CircuitBreaker: h.Out.RPCGovernance.CircuitBreaker,
+			LoadBalancer:   h.Out.RPCGovernance.LoadBalancer,
 		}), nil
 	}
 }

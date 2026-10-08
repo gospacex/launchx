@@ -1,0 +1,30 @@
+# 出向治理全开：三件套 + 指标。用于断言「配置真的落到 kitex 客户端选项里」。
+service:
+  name: bff-gov
+  mode: bff
+  addr: 127.0.0.1:18085
+  upstream:
+    downstream-svc: 127.0.0.1:19015
+
+webx:
+  addr: 127.0.0.1:18085
+
+trace:
+  enabled: false
+
+metrics:
+  enabled: true
+  addr: 127.0.0.1:19100
+
+xmiddleware:
+  rpcx:
+    retry:
+      enabled: true
+      max_attempts: 3
+      max_duration_ms: 400
+      backoff_ms: 20
+    circuit_breaker:
+      enabled: true
+      error_rate: 0.2
+      min_sample: 30
+    load_balancer: weighted_round_robin

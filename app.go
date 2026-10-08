@@ -32,6 +32,24 @@ import (
 // serverShutdownTimeout 优雅停机排空 in-flight 请求的上限。
 const serverShutdownTimeout = 5 * time.Second
 
+// defaultStopTimeout 退出链**每一环**的等待上限。
+//
+// 为什么必须有：退出链上任何一环卡住，进程就永远收不到「SIGTERM 已优雅退出」，
+// 于是 tracing 冲刷、logger 关闭、端口释放全部执行不到 —— 在 K8s 上表现为
+// 优雅期耗尽后被 SIGKILL（等价于崩了），而进程自己还以为在正常收尾。
+// 现实案例（2026-10-07 实测，monolith E1 用例挂 20s 不退）：kafka-go 的
+// Reader 只要 GroupID 非空就会在构造时起 ConsumerGroup 协程，该协程阻塞在
+// joinGroup 的网络读上且**不设读 deadline**（connDeadline.value 为零值时
+// SetReadDeadline 等于不设）；退出时 Reader.Close → ConsumerGroup.Close →
+// wg.Wait()，于是「一个从没消费过的消费者句柄」让整个进程退不出去。
+//
+// 故这里按「每一环都限时」处理，而不是只给个别驱动打补丁：驱动多到打不完，
+// 而退出链是唯一一处能统一兜住的地方。
+const defaultStopTimeout = 5 * time.Second
+
+// stopTimeoutKey 退出链超时在 yaml 里的键（缺省走 defaultStopTimeout）。
+const stopTimeoutKey = "service.stop_timeout"
+
 // registryOpTimeout 单次注册/注销的上限。
 //
 // 注册中心不可达时不能让启动或退出无限挂住（退出挂住 = 后面的 tracing 冲刷
@@ -85,7 +103,7 @@ type App struct {
 	configPath string
 	mu         sync.Mutex
 	setups     []func(*App) error
-	stops      []func() error
+	stops      []exitHook
 	closed     bool
 
 	// 骨架产物（逐步填充）
@@ -96,6 +114,10 @@ type App struct {
 	serviceName string
 	logger      logx.Logger
 	tracer      otelx.Provider
+	// metrics 指标门面（未启用时非 nil 但 Handler 为空，见 telemetry.NewMetrics）；
+	// metricsAddr 是 srv 档自建采集口的监听地址（HTTP 档为空：采集口在引擎上）。
+	metrics     *telemetry.Metrics
+	metricsAddr string
 	comp        *component.Env
 	// graph 是 component.mount 那一步由 wire 求解产出的注册面快照。
 	// 业务取句柄走 App.DB()/Cache()/... ，这里是为排查准备的（见 Graph 注释）。
@@ -314,11 +336,32 @@ func (a *App) OnSetup(fn func(*App) error) {
 	a.setups = append(a.setups, fn)
 }
 
+// exitHook 一条业务退出回调（不叫 stopHook：那个名字已被「按服务端类型取停机
+// 钩子」的函数占用。带名字是为了退出链超时时能报出「谁没退出来」（见
+// defaultStopTimeout 的注释）：只打序号的话，一次 5s 的收尾卡顿没人查得下去。
+type exitHook struct {
+	name string
+	fn   func() error
+}
+
 // OnStop 注册退出回调，Run 收尾时按注册逆序执行（早于内置组件 Stop）。
 func (a *App) OnStop(fn func() error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.stops = append(a.stops, fn)
+	a.stops = append(a.stops, exitHook{name: fmt.Sprintf("onstop#%d", len(a.stops)), fn: fn})
+}
+
+// OnStopNamed 同 OnStop，但显式给出名字。
+//
+// 业务自己注册的退出回调（关连接池、flush 缓冲区、等 goroutine 收尾）建议用它：
+// 名字会原样出现在退出链超时的 Warn 里。
+func (a *App) OnStopNamed(name string, fn func() error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if name == "" {
+		name = fmt.Sprintf("onstop#%d", len(a.stops))
+	}
+	a.stops = append(a.stops, exitHook{name: name, fn: fn})
 }
 
 // env 返回骨架执行环境（同一实例贯穿全流程，步骤间经它传递句柄）。
@@ -390,6 +433,14 @@ func (a *App) stepTelemetry(e *pipeline.Env) error {
 	}
 	a.tracer = p
 	e.Tracer = p
+
+	// 指标与 tracer 同一步装配、同一条顺序红线：它设的是 otel 全局
+	// MeterProvider，而 HTTP / RPC 的 instrument 都在各自的 SDK 构造时向全局取用。
+	m, err := telemetry.NewMetrics(name, a.cfg.GetBool("metrics.enabled"))
+	if err != nil {
+		return err
+	}
+	a.metrics = m
 	return nil
 }
 
@@ -425,6 +476,7 @@ func (a *App) stepMode(e *pipeline.Env) error {
 		Cfg:         a.cfg,
 		Logger:      a.logger,
 		Tracer:      a.tracer,
+		Metrics:     a.metrics,
 		ServiceName: a.serviceName,
 	}
 	if err := mode.Assemble(a.holders); err != nil {
@@ -434,6 +486,7 @@ func (a *App) stepMode(e *pipeline.Env) error {
 	a.mode = Mode(out.Mode)
 	a.engine = out.Webx
 	a.rpcClientOptions = out.RPCClientOptions
+	a.metricsAddr = out.MetricsAddr
 	return nil
 }
 
@@ -666,6 +719,12 @@ func (a *App) Run() error {
 	a.mu.Lock()
 	rpc, engine := a.rpcServer, a.engine
 	a.mu.Unlock()
+	// srv 档没有 HTTP 面 ⇒ 采集口得自己起一个监听。放在起服之前：
+	// 端口被占这类问题必须在"看起来起来了"之前就暴露。HTTP 档不在此列
+	//（采集口挂在 webx 引擎上，多起一个端口只会多一处要维护的暴露面）。
+	if err := a.startMetricsListener(); err != nil {
+		return err
+	}
 	// srv 档优先：业务构造的 RPC server 是该档唯一入口。
 	for _, srv := range []any{rpc, engine} {
 		if srv == nil {
@@ -696,6 +755,34 @@ func (a *App) Run() error {
 	return nil
 }
 
+// startMetricsListener 为「没有 HTTP 面」的档起一个只服务采集口的监听。
+//
+// 三种情况直接返回 nil（都不是错误）：
+//   - 指标未启用（handler 为空）；
+//   - 本档有 HTTP 引擎（采集口挂在引擎的 MetricsPrefix 上，见 webx.registerMetrics）；
+//   - 没配 metrics.addr（srv 档且开了指标却没配地址，已在 mode.Assemble 阶段即退，
+//     走到这里说明本来就没开指标）。
+//
+// 监听挂在业务退出链上（OnStop）而不是 server.stop：它先于服务端启动，
+// 反序退出时也就晚于服务端关闭 —— 停机过程本身的指标不会被提前掐断。
+func (a *App) startMetricsListener() error {
+	a.mu.Lock()
+	m, engine, addr := a.metrics, a.engine, a.metricsAddr
+	a.mu.Unlock()
+	if m == nil || engine != nil || addr == "" {
+		return nil
+	}
+	if err := m.Serve(addr); err != nil {
+		return err
+	}
+	a.OnStopNamed("metrics", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+		defer cancel()
+		return m.Shutdown(ctx)
+	})
+	return nil
+}
+
 // setupSnapshot 返回 Setup 回调快照（启动期只读，避免持锁执行业务代码）。
 func (a *App) setupSnapshot() []func(*App) error {
 	a.mu.Lock()
@@ -710,7 +797,8 @@ func (a *App) setupSnapshot() []func(*App) error {
 // 显式序列，不用 defer：defer 会在手动 flush 之后才执行，span 已经丢了。
 //
 //	业务 OnStop（逆序）→ server.stop → component.stop（逆序）
-//	→ registry.deregister → tracing.shutdown（15s 冲刷）→ logger.close
+//	→ registry.deregister → tracing.shutdown（15s 冲刷）
+//	→ metrics.shutdown → logger.close
 //
 // 每一步都记录事件，供测试断言顺序（不靠日志文本匹配）。
 // 中间步骤失败不中断后续回收（否则会漏掉 flush），错误聚合返回。
@@ -721,17 +809,18 @@ func (a *App) Close() error {
 		return nil
 	}
 	a.closed = true
-	stops := make([]func() error, len(a.stops))
+	stops := make([]exitHook, len(a.stops))
 	copy(stops, a.stops)
 	a.mu.Unlock()
 
 	var errs []error
 	rec := func(name string) { a.events.Record(name) }
+	limit := a.stopTimeout()
 
 	// 1. 业务回调先退（此时基础设施仍可用）
 	rec("setup.stop")
 	for i := len(stops) - 1; i >= 0; i-- {
-		if err := stops[i](); err != nil {
+		if err := a.runStop(stops[i].name, stops[i].fn, limit); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -740,7 +829,7 @@ func (a *App) Close() error {
 	//    kitex Stop）。从未起服则为 nil（no-op），不往错误聚合里塞噪声。
 	rec(pipeline.StepServerStop)
 	if a.serverStop != nil {
-		if err := a.serverStop(); err != nil {
+		if err := a.runStop("server.stop", a.serverStop, limit); err != nil {
 			errs = append(errs, fmt.Errorf("server stop: %w", err))
 		}
 	}
@@ -748,9 +837,9 @@ func (a *App) Close() error {
 	// 3. 组件停止（反序：先起的后停）
 	rec(pipeline.StepComponentStop)
 	if a.comp != nil {
-		cs := a.comp.Stops()
+		cs := a.comp.NamedStops()
 		for i := len(cs) - 1; i >= 0; i-- {
-			if err := cs[i](); err != nil {
+			if err := a.runStop(cs[i].Name, cs[i].Fn, limit); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -786,11 +875,68 @@ func (a *App) Close() error {
 		}
 	}
 
-	// 6. 日志最后关（前面所有步骤都可能要打日志）
+	// 6. 指标收口：与 tracing 同理 —— 先把 MeterProvider 的聚合刷出去再关 logger。
+	//    srv 档的采集口监听在前面 OnStop("metrics") 里已关过一次，这里重复调用是
+	//    幂等的（http.Server.Shutdown 与 MeterProvider.Shutdown 都做了幂等保护）。
+	rec(pipeline.StepMetricsShutdown)
+	if a.metrics != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+		if err := a.metrics.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("metrics shutdown: %w", err))
+		}
+		cancel()
+	}
+
+	// 7. 日志最后关（前面所有步骤都可能要打日志）
 	rec(pipeline.StepLoggerClose)
 	if a.logger != nil {
 		_ = a.logger.Close()
 	}
 
 	return errors.Join(errs...)
+}
+
+// stopTimeout 退出链每一环的等待上限：yaml 的 service.stop_timeout（>0 才生效）。
+func (a *App) stopTimeout() time.Duration {
+	if a.cfg != nil {
+		if d := a.cfg.GetDuration(stopTimeoutKey); d > 0 {
+			return d
+		}
+	}
+	return defaultStopTimeout
+}
+
+// runStop 有界执行一条退出回调。
+//
+// 超时**不**进错误聚合，只 Warn + 记事件，理由：退出链的契约是「在限定时间内
+// 收尾，然后必须让进程退出」。把超时算成 error 会翻退出码（main 里 Close 出错
+// 即 os.Exit(1)），于是「一个驱动的 Close 慢了」被升级成「进程退出失败」——
+// 在 Job / CI 里直接变 crashloop，而真正的故障形态（退不出去 → 优雅期耗尽被
+// SIGKILL）已经被这里挡掉了。超时是已知且已处理的降级，所以按「放弃等待 +
+// 记账」处理：Warn 里带名字与后果，事件流里留 stop.timeout.<name>。
+//
+// 反过来，回调自己返回的 error 照旧进聚合：那是它明确报出来的失败，
+// 不是我们替它猜的。
+//
+// 被放弃的回调会留下一个 goroutine（它自己卡住了，没法取消），进程退出时由
+// 运行时一并收走 —— 这正是「宁可漏一次显式 Close，也不要漏一次退出」的取舍。
+func (a *App) runStop(name string, fn func() error, limit time.Duration) error {
+	if fn == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(limit):
+		a.events.Record("stop.timeout." + name)
+		if a.logger != nil {
+			a.logger.Warn("退出链一环超时，放弃等待继续收尾",
+				logx.String("stop", name),
+				logx.String("timeout", limit.String()),
+				logx.String("consequence", "该句柄未显式释放，进程退出时由运行时回收；请查这一环的 Close 是否阻塞"))
+		}
+		return nil
+	}
 }

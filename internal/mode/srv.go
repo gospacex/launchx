@@ -26,5 +26,8 @@ func ServerOptions(h *AppHolders) rpcx.ServerOptions {
 		Addr:         strings.TrimSpace(h.Cfg.GetString("service.addr")),
 		RegistryAddr: h.Out.RegistryAddr,
 		TraceEnabled: h.Cfg.GetBool("trace.enabled"),
+		// 服务端只挂指标（重试/熔断/负载均衡是**出向**治理，与服务端无关；
+		// 服务端的对应物是入站限流与鉴权，那是业务中间件的事）。
+		MetricsEnabled: h.Out.MetricsEnabled,
 	}
 }
