@@ -23,6 +23,7 @@ import (
 
 	"github.com/cloudwego/kitex/client"
 
+	"github.com/gospacex/launchx/examples/micro/pkg/auth"
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order"
 	orderrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order/order"
@@ -72,6 +73,14 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+
+	// 携带一份身份再发：srv 侧现在校验"边界层签发过的身份"（见 pkg/auth），
+	// 裸调会被拒回 1004。
+	//
+	// 为什么这里能签：本工具是**回归驱动**，等价于一次"已经过边界鉴权"的调用，
+	// 它验的是同一个判据（签发方 / 主体 / 时效），不是绕过鉴权 —— 绕过意味着
+	// 不带身份也能通过，而那正是闸门挡住的情形。真实链路里签发方是 bff。
+	ctx = auth.WithIdentity(ctx, auth.New(userID, userID, time.Now()))
 
 	c, err := orderrpc.NewClient("demo-order", client.WithHostPorts(addr))
 	if err != nil {

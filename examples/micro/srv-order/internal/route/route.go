@@ -19,13 +19,19 @@ import (
 
 // NewRouter 构造订单域路由表。
 //
-// 中间件顺序有讲究：审计在链首（被拒的请求也要留痕），限流在链尾
-// （只有确定要执行才计数，否则被审计拦下的请求也会消耗配额）。
-func NewRouter(limiter *middleware.RateLimiter, traceOn bool, logger logx.Logger) *routing.Router {
-	// 限流器为 nil（KV 组件未装配）时 RateLimit 中间件恒放行：
-	// 没有 KV 只是"没有自保护"，不该连带把审计也去掉。
+// 中间件顺序有讲究：
+//   - 审计在**链首**：被后面任何一节拒掉的请求都要留痕，否则"到底有没有进来过"
+//     这个问题回答不了；
+//   - 鉴权在审计之后、限流之前：先证明"你是谁"，再决定"给不给你配额"；
+//   - 限流在链尾：只有确定要执行才计数，否则被鉴权拦下的请求也会消耗配额
+//     —— 那等于让未授权流量有能力把合法用户的额度打光。
+//
+// gate 为 nil 表示鉴权未启用（路由层恒放行，见 routing.Authenticate）；
+// 是否启用由装配层按配置决定并留痕，不是这里的默认值。
+func NewRouter(limiter *middleware.RateLimiter, gate routing.Authenticator, traceOn bool, logger logx.Logger) *routing.Router {
 	chain := []routing.Middleware{
 		routing.Audit(logger),
+		routing.Authenticate(gate, logger),
 		routing.RateLimit(limiter),
 	}
 	return routing.NewRouter("order", traceOn, logger, []routing.Route{

@@ -19,13 +19,13 @@ import (
 
 // NewRouter 构造库存域路由表。
 //
-// 中间件顺序有讲究：审计在链首（被拒的请求也要留痕），限流在链尾
-// （只有确定要执行才计数，否则被审计拦下的请求也会消耗配额）。
-func NewRouter(limiter *middleware.RateLimiter, traceOn bool, logger logx.Logger) *routing.Router {
-	// 限流器为 nil（KV 组件未装配）时 RateLimit 中间件恒放行：
-	// 没有 KV 只是"没有自保护"，不该连带把审计也去掉。
+// 中间件顺序有讲究：审计在链首（被拒的请求也要留痕），鉴权居中
+// （先证明"你是谁"再决定"给不给配额"），限流在链尾（只有确定要执行才计数，
+// 否则未授权流量也能把合法用户的额度打光）。详见 srv-order/internal/route。
+func NewRouter(limiter *middleware.RateLimiter, gate routing.Authenticator, traceOn bool, logger logx.Logger) *routing.Router {
 	chain := []routing.Middleware{
 		routing.Audit(logger),
+		routing.Authenticate(gate, logger),
 		routing.RateLimit(limiter),
 	}
 	return routing.NewRouter("stock", traceOn, logger, []routing.Route{

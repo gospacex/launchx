@@ -19,16 +19,17 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx"
+	"github.com/gospacex/launchx/examples/micro/pkg/auth"
 	"github.com/gospacex/launchx/examples/micro/pkg/handlecheck"
 	pointsrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/points/points"
-	"github.com/gospacex/launchx/examples/micro/pkg/outbox"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
+	"github.com/gospacex/launchx/examples/micro/pkg/routing"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/handler"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/middleware"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/repository"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/route"
 	srvrpc "github.com/gospacex/launchx/examples/micro/srv-points/internal/rpc"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/service"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
 )
 
 // 自保护参数（固定窗口限流）。非地址类常量，故留在代码里：
@@ -61,39 +62,45 @@ func Setup(a *launchx.App) error {
 		return errors.New("srv-points: rpc server options are unavailable, check service.mode=srv in config.yaml")
 	}
 
-	name := a.Config().GetString("service.name")
+	cfg := a.Config()
+	name := cfg.GetString("service.name")
 	logger := a.Logger()
-	traceOn := a.Config().GetBool("trace.enabled")
+	traceOn := cfg.GetBool("trace.enabled")
 
-	// 业务埋点的 provider 由装配层交接，业务分层因此不必去摸 otel 全局单例
-	// （分层边界要求它不认识框架）。telemetry 未启用时 provider 为 nil，
-	// tracex 会回落到 otel 全局（no-op），行为与之前一致。
-	if tp := a.Tracer(); tp != nil {
-		tracex.UseProvider(tp.TracerProvider())
-	}
-
-	// 句柄来源断言：确认这个 *gorm.DB 是 launchx 的 dbx 交出来的，而不是
-	// 谁顺手 gorm.Open 了一个。用错句柄不报错、也能查能写，唯独 SQL 不进
-	// 链路 —— 等排障时才发现整层 repository span 是空的就晚了。
+	// ---------- 存储/中间件句柄的来源与入链确认 ----------
+	// 必须在取用句柄之后、装配分层之前做：这时句柄刚由 launchx 的 builder
+	// 交出，还没被任何业务代码包一层（包过之后就不是同一个实例了，判据失效）。
 	//
-	// 只在 trace.on.db 为真时验：enable_trace=false 时 dbx 走 OpenNoTrace，
-	// 句柄上没有 trace 回调，那是配置选择，不该让服务起不来。
-	if a.Config().GetBool("trace.on.db") {
-		if err := handlecheck.VerifyDBX(db); err != nil {
-			return errors.New("srv-points: " + err.Error())
-		}
+	// 验两件事：①句柄来源合规（不是自己开的）；②trace.on 要求入链时它真的
+	// 会产 span。两者都不满足会照样能读写，只是走着走着链路就空了一块。
+	//
+	// 覆盖面是 db / cache / kv / mq / lock 五类（此前只验 db，cache 与 kv
+	// 拿自考句柄冒充是**完全静默**的 —— 它们连"回调在不在"这种可探针的
+	// 痕迹都没有）。
+	checks, err := handlecheck.VerifyOrError(a)
+	if err != nil {
+		return errors.New("srv-points: " + err.Error())
 	}
-	logger.Info("dbx handle in use",
+	for _, c := range checks {
+		if !c.Present {
+			continue
+		}
+		logger.Info("handle verified",
+			logx.String("component", c.Component),
+			logx.String("backend", c.Backend),
+			logx.String("joins_trace", strconv.FormatBool(c.Observed)),
+			logx.String("probe", c.Probe))
+	}
+	logger.Info("layer chain assembled",
 		logx.String("service", name),
 		logx.String("dialector", handlecheck.DialectorName(db)),
-		logx.String("sql_traced", strconv.FormatBool(a.Config().GetBool("trace.on.db"))),
-		logx.String("layer_chain", "rpc>route>middleware>handler>service>repository>model"))
+		logx.String("chain", "rpc>route>auth>ratelimit>handler>service>repository>model"))
 
 	// outbox 补发器：MQ 生产者经 App.MQ() 取。未装配（或降级成 nil）时
 	// Runner 会显式 Error 而不静默跳过 —— 积分变动事件是链路终点，
 	// 丢了就没有对账依据。
 	runner := outbox.NewRunner(db, a.MQ(), logger, outbox.Config{
-		TraceOn: a.Config().GetBool("trace.on.mq"),
+		TraceOn: cfg.GetBool("trace.on.mq"),
 	})
 	runner.Start()
 	// 退出链：业务回调先于组件停止（此时 DB / MQ 仍可用，本轮补发能收尾）。
@@ -121,8 +128,33 @@ func Setup(a *launchx.App) error {
 	}
 
 	h := handler.NewPointsHandler(svc, traceOn)
-	rt := route.NewRouter(limiter, traceOn, logger)
+	// ---------- 鉴权闸门：只校验边界层透传下来的身份，不重复验签 ----------
+	// 默认**启用**：鉴权是安全默认值，关掉它必须是显式配置的结果。
+	// 这里刻意不写成 `cfg.GetBool("auth.require")` 一把梭 —— 键缺失时它返回 false，
+	// 于是"忘了配"会等价于"主动关闭"，一个拼写错误就能让整个域裸奔。
+	// 故键缺失时按启用处理并 Warn，让"我其实没配"这件事在启动日志里可见。
+	var gate routing.Authenticator
+	if cfg.IsSet("auth.require") && !cfg.GetBool("auth.require") {
+		logger.Warn("srv-points: auth gate disabled, any inbound rpc is accepted",
+			logx.String("hint", "auth.require=false is only valid inside a trusted network"))
+	} else {
+		gate = auth.Gate{Logger: logger, TTL: ticketTTL(cfg.GetDuration("auth.ticket_ttl"))}
+	}
 
-	a.SetRPCServer(pointsrpc.NewServer(&srvrpc.Server{Handler: h, Router: rt}, opts...))
+	rt := route.NewRouter(limiter, gate, traceOn, logger)
+
+	a.SetRPCServer(pointsrpc.NewServer(&srvrpc.Server{Handler: h, Router: rt, TraceOn: traceOn}, opts...))
 	return nil
+}
+
+// ticketTTL 身份票据有效期：未配或配了非正值都回落到 auth.DefaultTicketTTL。
+//
+// 不直接把 GetDuration 的返回值喂给 Gate（0 会被当成"永不过期"还是"立即过期"
+// 全看实现怎么判，语义悬空）。显式回落让"配错了"的后果是"用默认值"，
+// 而不是"鉴权行为变得无法预测"。
+func ticketTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return auth.DefaultTicketTTL
+	}
+	return d
 }

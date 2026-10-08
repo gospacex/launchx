@@ -23,9 +23,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/gospacex/launchx/examples/micro/pkg/outbox"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/model"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/otelx/layer"
 )
 
 // ErrNotFound 无记录（service 层据此翻译成 CodeProductNotFound / CodeCategoryNotFound）
@@ -84,16 +84,23 @@ func NewProductRepository(db *gorm.DB, traceOn bool) *ProductRepository {
 // DB 暴露句柄（pkg/handlecheck 断言、装配期健康检查用）
 func (r *ProductRepository) DB() *gorm.DB { return r.db }
 
-// begin 开一个 repository 层 span。
+// begin 开 repository 层 span，返回「收 error 再收尾」的闭包。
 //
-// 返回 end 闭包而不是 span：traceOn=false 时返回空闭包，调用方一律
-// `defer end()`，不必在每个方法里写 if。
-func (r *ProductRepository) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !r.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "repository", "product", op)
-	return c, func() { span.End() }
+// traceOn=false 时返回空闭包，调用方一律 `defer func() { end(err) }()`，
+// 不必在每个方法里写 if。为什么闭包要收 error：span 句柄刻意不交给调用方
+// （本层因此零 otel 依赖），代价是调用方也标不了状态 —— 收 error 由闭包
+// 代标，失败才在 Jaeger 上可见（否则「SQL 报错」与「SQL 成功」同色）。
+//
+// quiet 规则：ErrNotFound 是正常 miss，不是故障 —— 与单体示例 recordError
+// 的同一条语义，命中即豁免错误标记，避免正常未命污染错误率。
+func (r *ProductRepository) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "repository", "product", op, r.traceOn, quietNotFound)
+}
+
+// quietNotFound 「记录不存在」不是故障。两种形态都认：本层已归一化出的
+// ErrNotFound，以及 dbx/gorm 直接抛出的 ErrRecordNotFound（未归一化路径）。
+func quietNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, gorm.ErrRecordNotFound)
 }
 
 // ---------- 单表 CRUD ----------
@@ -103,11 +110,11 @@ func (r *ProductRepository) begin(ctx context.Context, op string) (context.Conte
 // 为什么在写之前先查而不是靠外键：product_db 是商品域私有库，跨域引用
 // 只存 ID，没有跨库外键可用；校验放持久层之上（service）会多一次往返，
 // 放这里则与后续写入同连接，且错误可原地包装成 ErrNotFound。
-func (r *ProductRepository) GetCategory(ctx context.Context, categoryID uint64) (*model.Category, error) {
+func (r *ProductRepository) GetCategory(ctx context.Context, categoryID uint64) (out *model.Category, err error) {
 	ctx, end := r.begin(ctx, "GetCategory")
-	defer end()
+	defer func() { end(err) }()
 	var c model.Category
-	err := r.db.WithContext(ctx).Where("id = ?", categoryID).Take(&c).Error
+	err = r.db.WithContext(ctx).Where("id = ?", categoryID).Take(&c).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("get category %d: %w", categoryID, ErrNotFound)
@@ -125,9 +132,9 @@ func (r *ProductRepository) GetCategory(ctx context.Context, categoryID uint64) 
 // 的做法是"列表不带类目名、点进详情再补"，结果前端要么多一次请求、要么
 // 显示一栏空的类目。categories 是 1:1 维度表，LEFT JOIN 不放大行数，
 // 代价只是一次索引回表 —— 比多一轮往返便宜。
-func (r *ProductRepository) ListProducts(ctx context.Context, q model.ListProductsQuery) ([]model.ProductDetail, error) {
+func (r *ProductRepository) ListProducts(ctx context.Context, q model.ListProductsQuery) (out []model.ProductDetail, err error) {
 	ctx, end := r.begin(ctx, "ListProducts")
-	defer end()
+	defer func() { end(err) }()
 	limit, offset := q.Limit, q.Offset
 	if limit <= 0 {
 		limit = 20
@@ -162,11 +169,11 @@ func (r *ProductRepository) ListProducts(ctx context.Context, q model.ListProduc
 //
 // 规格是 1:N，JOIN 会把商品行放大 N 倍，故用 COUNT(DISTINCT) 统计规格数并
 // GROUP BY 收敛回一行；结果仍走 Find 到 slice（保持"JOIN 一律 Find、禁 Scan"）。
-func (r *ProductRepository) GetProduct(ctx context.Context, productID uint64) (*model.ProductDetail, error) {
+func (r *ProductRepository) GetProduct(ctx context.Context, productID uint64) (out *model.ProductDetail, err error) {
 	ctx, end := r.begin(ctx, "GetProduct")
-	defer end()
+	defer func() { end(err) }()
 	var rows []model.ProductDetail
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
 		Table("products").
 		Select("products.id, products.title, products.price, products.status, "+
 			"products.category_id, products.created_at, "+
@@ -183,19 +190,19 @@ func (r *ProductRepository) GetProduct(ctx context.Context, productID uint64) (*
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("get product %d: %w", productID, ErrNotFound)
 	}
-	out := rows[0]
-	return &out, nil
+	out = &rows[0]
+	return out, nil
 }
 
 // CreateProductTx 多表事务 + outbox：products + product_skus + product_logs + outbox（4 张表）。
 //
 // 初始规格与商品同生共死：只建商品不铺规格，库存域来预占时找不到 sku，
 // 症状是"商品存在但永远卖不出去"。日志行同理 —— 事后无法回答"谁建的"。
-func (r *ProductRepository) CreateProductTx(ctx context.Context, in CreateProductInput) (*CreateProductOutput, error) {
+func (r *ProductRepository) CreateProductTx(ctx context.Context, in CreateProductInput) (out *CreateProductOutput, err error) {
 	ctx, end := r.begin(ctx, "CreateProductTx")
-	defer end()
-	out := &CreateProductOutput{}
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	defer func() { end(err) }()
+	out = &CreateProductOutput{}
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		p := model.Product{
 			Title:      in.Title,
 			Price:      in.Price,
@@ -251,9 +258,9 @@ func (r *ProductRepository) CreateProductTx(ctx context.Context, in CreateProduc
 // UpdateProductTx 2 表事务：products 改标题/价格/类目 + product_logs 记一笔。
 //
 // 改价是强审计动作：只改主表不落日志，事后对账无法回答"这个价是谁改的"。
-func (r *ProductRepository) UpdateProductTx(ctx context.Context, in UpdateProductInput) error {
+func (r *ProductRepository) UpdateProductTx(ctx context.Context, in UpdateProductInput) (err error) {
 	ctx, end := r.begin(ctx, "UpdateProductTx")
-	defer end()
+	defer func() { end(err) }()
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var p model.Product
 		if err := tx.Where("id = ?", in.ProductID).Take(&p).Error; err != nil {
@@ -287,11 +294,11 @@ func (r *ProductRepository) UpdateProductTx(ctx context.Context, in UpdateProduc
 //
 // 幂等：已是目标态时返回 (false, nil)，由 service 翻译成 CodeProductStatusDup
 // —— 重试/重复点击不该产生第二条日志，否则报表里的"上下架次数"会被刷高。
-func (r *ProductRepository) UpdateStatusTx(ctx context.Context, in UpdateStatusInput) (bool, error) {
+func (r *ProductRepository) UpdateStatusTx(ctx context.Context, in UpdateStatusInput) (out bool, err error) {
 	ctx, end := r.begin(ctx, "UpdateStatusTx")
-	defer end()
+	defer func() { end(err) }()
 	changed := false
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var p model.Product
 		if err := tx.Where("id = ?", in.ProductID).Take(&p).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -343,9 +350,9 @@ func (r *ProductRepository) UpdateStatusTx(ctx context.Context, in UpdateStatusI
 //
 // 三个 1:N 子表 JOIN 会互相放大行数，故三个计数一律 COUNT(DISTINCT ...)；
 // 售出数用条件 DISTINCT（只数 action='sold' 的日志），不为它单独加一次往返。
-func (r *ProductRepository) Report(ctx context.Context, q model.ProductReportQuery) ([]model.ReportRow, error) {
+func (r *ProductRepository) Report(ctx context.Context, q model.ProductReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := r.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 50

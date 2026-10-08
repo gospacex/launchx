@@ -21,9 +21,9 @@ import (
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	stockpb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/stock"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/service"
+	"github.com/gospacex/otelx/layer"
 )
 
 // StockHandler 库存域协议适配器
@@ -37,20 +37,19 @@ func NewStockHandler(svc *service.StockService, traceOn bool) *StockHandler {
 	return &StockHandler{svc: svc, traceOn: traceOn}
 }
 
-// begin 开一个 handler 层 span（traceOn=false 时返回空收尾闭包）
-func (h *StockHandler) begin(ctx context.Context, method string) (context.Context, func()) {
-	if !h.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "handler", "stock", method)
-	return c, func() { span.End() }
+// begin 开 handler 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不设豁免：handler 返回非 nil error 是传输层失败（超时 / 不可达 / 内部
+// 错误，业务拒绝已翻进响应体 Code），标红正是运维要看的信号。
+func (h *StockHandler) begin(ctx context.Context, method string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "handler", "stock", method, h.traceOn, nil)
 }
 
 // GetStock 查库存快照（联表聚合未释放预占量）
-func (h *StockHandler) GetStock(ctx context.Context, req *stockpb.GetStockReq) (*stockpb.GetStockResp, error) {
+func (h *StockHandler) GetStock(ctx context.Context, req *stockpb.GetStockReq) (out *stockpb.GetStockResp, err error) {
 	resp := &stockpb.GetStockResp{ProductId: req.GetProductId()}
 	ctx, end := h.begin(ctx, "GetStock")
-	defer end()
+	defer func() { end(err) }()
 
 	d, err := h.svc.GetStock(ctx, model.GetStockQuery{
 		ProductID: uint64(req.GetProductId()),
@@ -69,10 +68,10 @@ func (h *StockHandler) GetStock(ctx context.Context, req *stockpb.GetStockReq) (
 }
 
 // ListStocks 库存列表（联表聚合分页）
-func (h *StockHandler) ListStocks(ctx context.Context, req *stockpb.ListStocksReq) (*stockpb.ListStocksResp, error) {
+func (h *StockHandler) ListStocks(ctx context.Context, req *stockpb.ListStocksReq) (out *stockpb.ListStocksResp, err error) {
 	resp := &stockpb.ListStocksResp{}
 	ctx, end := h.begin(ctx, "ListStocks")
-	defer end()
+	defer func() { end(err) }()
 
 	rows, err := h.svc.ListStocks(ctx, model.ListStocksQuery{
 		Limit:  int(req.GetLimit()),
@@ -92,12 +91,12 @@ func (h *StockHandler) ListStocks(ctx context.Context, req *stockpb.ListStocksRe
 }
 
 // ReserveStock 预占（加锁 + 3 表事务 + outbox）
-func (h *StockHandler) ReserveStock(ctx context.Context, req *stockpb.ReserveStockReq) (*stockpb.ReserveStockResp, error) {
+func (h *StockHandler) ReserveStock(ctx context.Context, req *stockpb.ReserveStockReq) (out *stockpb.ReserveStockResp, err error) {
 	resp := &stockpb.ReserveStockResp{ProductId: req.GetProductId()}
 	ctx, end := h.begin(ctx, "ReserveStock")
-	defer end()
+	defer func() { end(err) }()
 
-	out, err := h.svc.ReserveStock(ctx, model.ReserveCmd{
+	rec, err := h.svc.ReserveStock(ctx, model.ReserveCmd{
 		OrderNo:   req.GetOrderNo(),
 		ProductID: uint64(req.GetProductId()),
 		UserID:    uint64(req.GetUserId()),
@@ -109,8 +108,8 @@ func (h *StockHandler) ReserveStock(ctx context.Context, req *stockpb.ReserveSto
 		}
 		return resp, nil
 	}
-	resp.Reserved = out.Reserved
-	resp.ReservationId = int64(out.ReservationID)
+	resp.Reserved = rec.Reserved
+	resp.ReservationId = int64(rec.ReservationID)
 	if sErr := settle(&resp.Code, &resp.Message, nil); sErr != nil {
 		return nil, sErr
 	}
@@ -118,12 +117,12 @@ func (h *StockHandler) ReserveStock(ctx context.Context, req *stockpb.ReserveSto
 }
 
 // ReleaseStock 释放预占（幂等）
-func (h *StockHandler) ReleaseStock(ctx context.Context, req *stockpb.ReleaseStockReq) (*stockpb.ReleaseStockResp, error) {
+func (h *StockHandler) ReleaseStock(ctx context.Context, req *stockpb.ReleaseStockReq) (out *stockpb.ReleaseStockResp, err error) {
 	resp := &stockpb.ReleaseStockResp{ProductId: req.GetProductId()}
 	ctx, end := h.begin(ctx, "ReleaseStock")
-	defer end()
+	defer func() { end(err) }()
 
-	out, err := h.svc.ReleaseStock(ctx, model.ReleaseCmd{
+	rec, err := h.svc.ReleaseStock(ctx, model.ReleaseCmd{
 		OrderNo:   req.GetOrderNo(),
 		ProductID: uint64(req.GetProductId()),
 		Quantity:  req.GetQuantity(),
@@ -134,7 +133,7 @@ func (h *StockHandler) ReleaseStock(ctx context.Context, req *stockpb.ReleaseSto
 		}
 		return resp, nil
 	}
-	resp.Available = out.Available
+	resp.Available = rec.Available
 	if sErr := settle(&resp.Code, &resp.Message, nil); sErr != nil {
 		return nil, sErr
 	}
@@ -142,12 +141,12 @@ func (h *StockHandler) ReleaseStock(ctx context.Context, req *stockpb.ReleaseSto
 }
 
 // ConfirmStock 确认预占（出库）
-func (h *StockHandler) ConfirmStock(ctx context.Context, req *stockpb.ConfirmStockReq) (*stockpb.ConfirmStockResp, error) {
+func (h *StockHandler) ConfirmStock(ctx context.Context, req *stockpb.ConfirmStockReq) (out *stockpb.ConfirmStockResp, err error) {
 	resp := &stockpb.ConfirmStockResp{ProductId: req.GetProductId()}
 	ctx, end := h.begin(ctx, "ConfirmStock")
-	defer end()
+	defer func() { end(err) }()
 
-	out, err := h.svc.ConfirmStock(ctx, model.ConfirmCmd{
+	rec, err := h.svc.ConfirmStock(ctx, model.ConfirmCmd{
 		OrderNo:   req.GetOrderNo(),
 		ProductID: uint64(req.GetProductId()),
 		Quantity:  req.GetQuantity(),
@@ -158,8 +157,8 @@ func (h *StockHandler) ConfirmStock(ctx context.Context, req *stockpb.ConfirmSto
 		}
 		return resp, nil
 	}
-	resp.Total = out.Total
-	resp.Available = out.Available
+	resp.Total = rec.Total
+	resp.Available = rec.Available
 	if sErr := settle(&resp.Code, &resp.Message, nil); sErr != nil {
 		return nil, sErr
 	}
@@ -167,12 +166,12 @@ func (h *StockHandler) ConfirmStock(ctx context.Context, req *stockpb.ConfirmSto
 }
 
 // AdjustStock 入库 / 盘点（2 表事务）
-func (h *StockHandler) AdjustStock(ctx context.Context, req *stockpb.AdjustStockReq) (*stockpb.AdjustStockResp, error) {
+func (h *StockHandler) AdjustStock(ctx context.Context, req *stockpb.AdjustStockReq) (out *stockpb.AdjustStockResp, err error) {
 	resp := &stockpb.AdjustStockResp{ProductId: req.GetProductId()}
 	ctx, end := h.begin(ctx, "AdjustStock")
-	defer end()
+	defer func() { end(err) }()
 
-	out, err := h.svc.AdjustStock(ctx, model.AdjustCmd{
+	rec, err := h.svc.AdjustStock(ctx, model.AdjustCmd{
 		ProductID:  uint64(req.GetProductId()),
 		Delta:      req.GetDelta(),
 		Reason:     req.GetReason(),
@@ -184,8 +183,8 @@ func (h *StockHandler) AdjustStock(ctx context.Context, req *stockpb.AdjustStock
 		}
 		return resp, nil
 	}
-	resp.Total = out.Total
-	resp.Available = out.Available
+	resp.Total = rec.Total
+	resp.Available = rec.Available
 	if sErr := settle(&resp.Code, &resp.Message, nil); sErr != nil {
 		return nil, sErr
 	}
@@ -193,10 +192,10 @@ func (h *StockHandler) AdjustStock(ctx context.Context, req *stockpb.AdjustStock
 }
 
 // Report 3 表 JOIN 报表
-func (h *StockHandler) Report(ctx context.Context, req *stockpb.ReportReq) (*stockpb.ReportResp, error) {
+func (h *StockHandler) Report(ctx context.Context, req *stockpb.ReportReq) (out *stockpb.ReportResp, err error) {
 	resp := &stockpb.ReportResp{}
 	ctx, end := h.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 
 	rows, err := h.svc.Report(ctx, model.StockReportQuery{
 		Limit: int(req.GetLimit()),

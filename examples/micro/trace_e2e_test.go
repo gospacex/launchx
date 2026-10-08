@@ -78,9 +78,30 @@ func requireChain(t *testing.T) {
 	}
 }
 
+// demoToken 边界鉴权凭据：与 bff/config.yaml 的 demo.auth_token 一致。
+//
+// bff 是唯一验凭据的地方，缺了它所有业务路径都会是 401 —— 链路断言会被
+// "鉴权没配"冒充成"链路没通"。可用 MICRO_TOKEN 覆盖；显式置空即走
+// "无凭据应被拒"的反向断言（见 auth_e2e_test.go）。
+func demoToken() string {
+	if v, ok := os.LookupEnv("MICRO_TOKEN"); ok {
+		return v
+	}
+	return "demo-token"
+}
+
+// authHeader 构造 Bearer 头。令牌为空时返回 nil（即"不带凭据"）。
+func authHeader() map[string]string {
+	tok := demoToken()
+	if tok == "" {
+		return nil
+	}
+	return map[string]string{"Authorization": "Bearer " + tok}
+}
+
 func get(t *testing.T, url string) (string, int) {
 	t.Helper()
-	return do(t, http.MethodGet, url, "", nil)
+	return do(t, http.MethodGet, url, "", authHeader())
 }
 
 func do(t *testing.T, method, url, body string, hdr map[string]string) (string, int) {
@@ -133,7 +154,7 @@ func fetchSince(t *testing.T, c *traceutil.Client, service string, since time.Ti
 func newOrderViaGateway(t *testing.T) string {
 	t.Helper()
 	body, code := do(t, http.MethodPost, gatewayBase()+"/api/order",
-		`{"user_id":1001,"product_id":1,"quantity":1}`, nil)
+		`{"user_id":1001,"product_id":1,"quantity":1}`, authHeader())
 	if code != http.StatusOK {
 		t.Fatalf("POST /api/order 返回 HTTP %d：%s（真机链路异常，不是验收失败）", code, truncate(body, 200))
 	}

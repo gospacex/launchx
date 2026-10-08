@@ -25,9 +25,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/gospacex/launchx/examples/micro/pkg/outbox"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/model"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/otelx/layer"
 )
 
 // ErrNotFound 无记录（service 层据此翻译成 CodeOrderNotFound）
@@ -79,26 +79,33 @@ func NewOrderRepository(db *gorm.DB, traceOn bool) *OrderRepository {
 // DB 暴露句柄（pkg/handlecheck 断言 / 对账用）
 func (r *OrderRepository) DB() *gorm.DB { return r.db }
 
-// begin 开一个 repository 层 span。
+// begin 开 repository 层 span，返回「收 error 再收尾」的闭包。
 //
-// 返回 end 闭包而不是 span：traceOn=false 时返回空闭包，调用方一律
-// `defer end()`，不必在每个方法里写 if。
-func (r *OrderRepository) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !r.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "repository", "order", op)
-	return c, func() { span.End() }
+// traceOn=false 时返回空闭包，调用方一律 `defer func() { end(err) }()`，
+// 不必在每个方法里写 if。为什么闭包要收 error：span 句柄刻意不交给调用方
+// （本层因此零 otel 依赖），代价是调用方也标不了状态 —— 收 error 由闭包
+// 代标，失败才在 Jaeger 上可见（否则「SQL 报错」与「SQL 成功」同色）。
+//
+// quiet 规则：ErrNotFound 是正常 miss，不是故障 —— 与单体示例 recordError
+// 的同一条语义，命中即豁免错误标记，避免正常未命污染错误率。
+func (r *OrderRepository) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "repository", "order", op, r.traceOn, quietNotFound)
+}
+
+// quietNotFound 「记录不存在」不是故障。两种形态都认：本层已归一化出的
+// ErrNotFound，以及 dbx/gorm 直接抛出的 ErrRecordNotFound（未归一化路径）。
+func quietNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, gorm.ErrRecordNotFound)
 }
 
 // ---------- 单表 CRUD ----------
 
 // GetOrderByNo 单表查询：按订单号取订单（幂等校验 / 对账入口）
-func (r *OrderRepository) GetOrderByNo(ctx context.Context, orderNo string) (*model.Order, error) {
+func (r *OrderRepository) GetOrderByNo(ctx context.Context, orderNo string) (out *model.Order, err error) {
 	ctx, end := r.begin(ctx, "GetOrderByNo")
-	defer end()
+	defer func() { end(err) }()
 	var o model.Order
-	err := r.db.WithContext(ctx).Where("order_no = ?", orderNo).Take(&o).Error
+	err = r.db.WithContext(ctx).Where("order_no = ?", orderNo).Take(&o).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("get order by no %q: %w", orderNo, ErrNotFound)
@@ -117,9 +124,9 @@ func (r *OrderRepository) GetOrderByNo(ctx context.Context, orderNo string) (*mo
 // 自己拿总额去猜。明细是 1:N，JOIN 会放大行数，故 GROUP BY 收敛回一行、
 // 计数用 COUNT(DISTINCT)；只 JOIN 了一张子表，SUM(quantity*unit_price)
 // 不会被交叉放大，可以放心直接求和。
-func (r *OrderRepository) ListOrders(ctx context.Context, q model.ListOrdersQuery) ([]model.OrderFlowRow, error) {
+func (r *OrderRepository) ListOrders(ctx context.Context, q model.ListOrdersQuery) (out []model.OrderFlowRow, err error) {
 	ctx, end := r.begin(ctx, "ListOrders")
-	defer end()
+	defer func() { end(err) }()
 	from, to, err := dateRange(q.FromDate, q.ToDate)
 	if err != nil {
 		return nil, fmt.Errorf("list orders: %w", err)
@@ -159,9 +166,9 @@ func (r *OrderRepository) ListOrders(ctx context.Context, q model.ListOrdersQuer
 //
 // 幂等：已是目标态时直接返回 nil，不重复记日志 —— 重试/重复点击不该把
 // 状态流转次数刷高（报表里的 status_change_count 会失真）。
-func (r *OrderRepository) UpdateStatusTx(ctx context.Context, in UpdateStatusInput) error {
+func (r *OrderRepository) UpdateStatusTx(ctx context.Context, in UpdateStatusInput) (err error) {
 	ctx, end := r.begin(ctx, "UpdateStatusTx")
-	defer end()
+	defer func() { end(err) }()
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var o model.Order
 		if err := tx.Where("id = ? AND user_id = ?", in.OrderID, in.UserID).Take(&o).Error; err != nil {
@@ -193,11 +200,11 @@ func (r *OrderRepository) UpdateStatusTx(ctx context.Context, in UpdateStatusInp
 //
 // user_id 条件必带：订单是用户私有数据，跨域身份透传后这里是最小授权面，
 // 少了它就能凭 order_id 遍历别人的订单。
-func (r *OrderRepository) GetOrder(ctx context.Context, q model.GetOrderQuery) (*model.OrderWithItems, error) {
+func (r *OrderRepository) GetOrder(ctx context.Context, q model.GetOrderQuery) (out *model.OrderWithItems, err error) {
 	ctx, end := r.begin(ctx, "GetOrder")
-	defer end()
+	defer func() { end(err) }()
 	var rows []model.OrderJoinRow
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
 		Table("orders").
 		Select("orders.id AS order_id, orders.user_id, orders.order_no, orders.status, "+
 			"orders.total_amount, orders.paid_amount, orders.created_at, orders.updated_at, "+
@@ -214,7 +221,7 @@ func (r *OrderRepository) GetOrder(ctx context.Context, q model.GetOrderQuery) (
 		return nil, fmt.Errorf("get order %d: %w", q.OrderID, ErrNotFound)
 	}
 	head := rows[0]
-	out := &model.OrderWithItems{Order: model.Order{
+	out = &model.OrderWithItems{Order: model.Order{
 		ID: head.OrderID, UserID: head.UserID, OrderNo: head.OrderNo, Status: head.Status,
 		TotalAmount: head.TotalAmount, PaidAmount: head.PaidAmount,
 		CreatedAt: head.CreatedAt, UpdatedAt: head.UpdatedAt,
@@ -235,11 +242,11 @@ func (r *OrderRepository) GetOrder(ctx context.Context, q model.GetOrderQuery) (
 //
 // outbox 行与业务行同事务是本包的立身之本：不同事务就会出现"订单落了、
 // 事件没落"（下游永远不知道这单存在）或"事件落了、订单回滚"（幽灵事件）。
-func (r *OrderRepository) CreateOrderTx(ctx context.Context, in CreateOrderInput) (*CreateOrderOutput, error) {
+func (r *OrderRepository) CreateOrderTx(ctx context.Context, in CreateOrderInput) (out *CreateOrderOutput, err error) {
 	ctx, end := r.begin(ctx, "CreateOrderTx")
-	defer end()
-	out := &CreateOrderOutput{OrderNo: in.OrderNo}
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	defer func() { end(err) }()
+	out = &CreateOrderOutput{OrderNo: in.OrderNo}
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		o := model.Order{
 			UserID:      in.UserID,
 			OrderNo:     in.OrderNo,
@@ -290,9 +297,9 @@ func (r *OrderRepository) CreateOrderTx(ctx context.Context, in CreateOrderInput
 // 明细/状态/退款计数用 COUNT(DISTINCT) 抵消多表 JOIN 的行放大；
 // 退款额用标量子查询单独 SUM（三个 1:N 子表交叉 JOIN 会把 SUM 放大成
 // 笛卡尔积的倍数，标量子查询是这里唯一正确的写法）。
-func (r *OrderRepository) Report(ctx context.Context, q model.OrderReportQuery) ([]model.ReportRow, error) {
+func (r *OrderRepository) Report(ctx context.Context, q model.OrderReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := r.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	from, to, err := dateRange(q.FromDate, q.ToDate)
 	if err != nil {
 		return nil, fmt.Errorf("report: %w", err)

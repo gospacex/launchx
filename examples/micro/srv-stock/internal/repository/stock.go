@@ -28,9 +28,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/gospacex/launchx/examples/micro/pkg/outbox"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/model"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/otelx/layer"
 )
 
 // 库存域哨兵错误（service 层据此翻译成 4xxx 业务码）
@@ -102,16 +102,23 @@ func NewStockRepository(db *gorm.DB, traceOn bool) *StockRepository {
 // DB 暴露句柄（pkg/handlecheck 断言、装配期健康检查用）
 func (r *StockRepository) DB() *gorm.DB { return r.db }
 
-// begin 开一个 repository 层 span。
+// begin 开 repository 层 span，返回「收 error 再收尾」的闭包。
 //
-// 返回 end 闭包而不是 span：traceOn=false 时返回空闭包，调用方一律
-// `defer end()`，不必在每个方法里写 if。
-func (r *StockRepository) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !r.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "repository", "stock", op)
-	return c, func() { span.End() }
+// traceOn=false 时返回空闭包，调用方一律 `defer func() { end(err) }()`，
+// 不必在每个方法里写 if。为什么闭包要收 error：span 句柄刻意不交给调用方
+// （本层因此零 otel 依赖），代价是调用方也标不了状态 —— 收 error 由闭包
+// 代标，失败才在 Jaeger 上可见（否则「SQL 报错」与「SQL 成功」同色）。
+//
+// quiet 规则：ErrNotFound 是正常 miss，不是故障 —— 与单体示例 recordError
+// 的同一条语义，命中即豁免错误标记，避免正常未命污染错误率。
+func (r *StockRepository) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "repository", "stock", op, r.traceOn, quietNotFound)
+}
+
+// quietNotFound 「记录不存在」不是故障。两种形态都认：本层已归一化出的
+// ErrNotFound，以及 dbx/gorm 直接抛出的 ErrRecordNotFound（未归一化路径）。
+func quietNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, gorm.ErrRecordNotFound)
 }
 
 // ---------- 联表查询 ----------
@@ -126,11 +133,11 @@ func (r *StockRepository) begin(ctx context.Context, op string) (context.Context
 // stock_reservations 是 1:N，JOIN 会把库存行放大 N 倍，故用聚合 +
 // GROUP BY 收敛回一行；结果仍走 Find 到 slice（保持"JOIN 一律 Find、
 // 禁 Scan"）。
-func (r *StockRepository) GetStock(ctx context.Context, productID uint64) (*model.StockDetail, error) {
+func (r *StockRepository) GetStock(ctx context.Context, productID uint64) (out *model.StockDetail, err error) {
 	ctx, end := r.begin(ctx, "GetStock")
-	defer end()
+	defer func() { end(err) }()
 	var rows []model.StockDetail
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
 		Table("stocks").
 		Select("stocks.product_id AS product_id, stocks.total, stocks.available, stocks.reserved, "+
 			"stocks.version, stocks.updated_at, "+
@@ -148,17 +155,17 @@ func (r *StockRepository) GetStock(ctx context.Context, productID uint64) (*mode
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("get stock %d: %w", productID, ErrNotFound)
 	}
-	out := rows[0]
-	return &out, nil
+	out = &rows[0]
+	return out, nil
 }
 
 // ListStocks 2 表 LEFT JOIN + 聚合分页（与 GetStock 共用投影）
 //
 // 列表也带预占聚合：运营看板要在列表页直接看出"哪些商品卡着未释放的预占"，
 // 逐个商品点进详情去凑这个数会退化成 N+1 次查询。
-func (r *StockRepository) ListStocks(ctx context.Context, q model.ListStocksQuery) ([]model.StockDetail, error) {
+func (r *StockRepository) ListStocks(ctx context.Context, q model.ListStocksQuery) (out []model.StockDetail, err error) {
 	ctx, end := r.begin(ctx, "ListStocks")
-	defer end()
+	defer func() { end(err) }()
 	limit, offset := q.Limit, q.Offset
 	if limit <= 0 {
 		limit = 20
@@ -170,7 +177,7 @@ func (r *StockRepository) ListStocks(ctx context.Context, q model.ListStocksQuer
 		offset = 0
 	}
 	var rows []model.StockDetail
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
 		Table("stocks").
 		Select("stocks.product_id AS product_id, stocks.total, stocks.available, stocks.reserved, "+
 			"stocks.version, stocks.updated_at, "+
@@ -196,11 +203,11 @@ func (r *StockRepository) ListStocks(ctx context.Context, q model.ListStocksQuer
 // 条件更新是防超卖的第二道闸（第一道是 lockx）：只判 RowsAffected==0 时
 // 再回查一次区分"没记录"与"不够扣"，两次判定都只在事务内发生，
 // 中间不会被别的预占插进来。
-func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (*ReserveOutput, error) {
+func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (out *ReserveOutput, err error) {
 	ctx, end := r.begin(ctx, "ReserveTx")
-	defer end()
-	out := &ReserveOutput{}
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	defer func() { end(err) }()
+	out = &ReserveOutput{}
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.Stock{}).
 			Where("product_id = ? AND available >= ?", in.ProductID, in.Quantity).
 			Updates(map[string]any{
@@ -260,11 +267,11 @@ func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (*Rese
 //
 // 幂等：流水不存在（重复释放）返回 ErrReservationNF，由 service 翻译成
 // CodeStockReservationNF —— 这是**成功**语义（已释放过了），不是错误。
-func (r *StockRepository) ReleaseTx(ctx context.Context, in ReleaseInput) (int32, error) {
+func (r *StockRepository) ReleaseTx(ctx context.Context, in ReleaseInput) (out int32, err error) {
 	ctx, end := r.begin(ctx, "ReleaseTx")
-	defer end()
+	defer func() { end(err) }()
 	var available int32
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rv model.Reservation
 		err := tx.Where("order_no = ? AND product_id = ? AND status = ?", in.OrderNo, in.ProductID, model.ReserveReserved).
 			Order("id DESC").Take(&rv).Error
@@ -320,7 +327,7 @@ func (r *StockRepository) ReleaseTx(ctx context.Context, in ReleaseInput) (int32
 // 不分开的话，"下单取消"与"已发货"在库存账上无法区分。
 func (r *StockRepository) ConfirmTx(ctx context.Context, in ConfirmInput) (total, available int32, err error) {
 	ctx, end := r.begin(ctx, "ConfirmTx")
-	defer end()
+	defer func() { end(err) }()
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rv model.Reservation
 		e := tx.Where("order_no = ? AND product_id = ? AND status = ?", in.OrderNo, in.ProductID, model.ReserveReserved).
@@ -378,7 +385,7 @@ func (r *StockRepository) ConfirmTx(ctx context.Context, in ConfirmInput) (total
 // 必须拒绝而不是留一条负库存。
 func (r *StockRepository) AdjustTx(ctx context.Context, in AdjustInput) (total, available int32, err error) {
 	ctx, end := r.begin(ctx, "AdjustTx")
-	defer end()
+	defer func() { end(err) }()
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		where := "product_id = ?"
 		args := []any{in.ProductID}
@@ -444,9 +451,9 @@ func (r *StockRepository) classifyMiss(tx *gorm.DB, productID uint64, deficit er
 // Report 3 表 LEFT JOIN 报表（stocks ⋈ stock_reservations ⋈ stock_logs）。
 //
 // 两个 1:N 子表 JOIN 会互相放大行数，故计数一律 COUNT(DISTINCT ...)。
-func (r *StockRepository) Report(ctx context.Context, q model.StockReportQuery) ([]model.ReportRow, error) {
+func (r *StockRepository) Report(ctx context.Context, q model.StockReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := r.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 50
@@ -455,7 +462,7 @@ func (r *StockRepository) Report(ctx context.Context, q model.StockReportQuery) 
 		limit = 500
 	}
 	var rows []model.ReportRow
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
 		Table("stocks").
 		Select("stocks.product_id AS product_id, stocks.total, stocks.available, stocks.reserved, " +
 			"COUNT(DISTINCT stock_reservations.id) AS reservation_count, " +

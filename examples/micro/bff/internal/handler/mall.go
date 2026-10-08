@@ -1,5 +1,5 @@
 // Package handler HTTP 层：只做参数绑定、状态码映射与响应封装，业务一律
-// 下沉到 downstream 层；每个 handler 自开 `handler.*` span。
+// 下沉到 downstream 层；每个 handler 自开 `handler.mall.<Op>` span。
 //
 // 复合编排 PlaceOrder 是全链路验收的锚点：一次 HTTP 请求把
 // 商品 → 库存 → 订单 → 积分 四个域服串进同一根 trace，
@@ -22,22 +22,41 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/bff/internal/downstream"
+	"github.com/gospacex/launchx/examples/micro/pkg/auth"
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	orderpb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order"
 	pointspb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/points"
 	productpb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/product"
 	stockpb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/stock"
+
+	"github.com/gospacex/otelx/layer"
 )
 
 // MallHandler mall 聚合 HTTP 入口。
 type MallHandler struct {
-	d      *downstream.Downstream
-	tracer trace.Tracer
+	d       *downstream.Downstream
+	traceOn bool
 }
 
 // New 构造 handler。
-func New(d *downstream.Downstream, tracer trace.Tracer) *MallHandler {
-	return &MallHandler{d: d, tracer: tracer}
+//
+// 不再收一个 trace.Tracer（与 downstream 同因）：tracer 一律向 otel 全局现取，
+// 全局 provider 由 launchx 的 telemetry 步骤注册。从装配层手里接 provider 进来，
+// 会让本层与 CLIENT span 分家的风险变成"取决于装配顺序"。
+func New(d *downstream.Downstream, traceOn bool) *MallHandler {
+	return &MallHandler{d: d, traceOn: traceOn}
+}
+
+// span 开本层 span（handler.mall.<Op>）。
+//
+// traceOn=false 时返回 noop span 而不是 nil：本层各处都要 `defer span.End()`
+// 并把 span 传给 fail / parseInt64，返回 nil 会让每一处都得判空 —— 漏一处
+// 就是 panic。noop span 的 End / RecordError / SetStatus 全是空实现。
+func (h *MallHandler) span(ctx context.Context, op string) (context.Context, trace.Span) {
+	if !h.traceOn {
+		return ctx, trace.SpanFromContext(context.Background())
+	}
+	return layer.Start(ctx, "handler", "mall", op)
 }
 
 // Ping GET /ping —— 自响应，不触达下游。
@@ -45,21 +64,21 @@ func New(d *downstream.Downstream, tracer trace.Tracer) *MallHandler {
 // 它的作用是给「服务活着且 HTTP 那一跳能成 span」留一个不依赖任何下游的判据：
 // 下游挂掉时 /ping 仍须 200。
 func (h *MallHandler) Ping(ctx context.Context, c *app.RequestContext) {
-	_, span := h.tracer.Start(ctx, "handler.Ping")
+	_, span := h.span(ctx, "Ping")
 	defer span.End()
 	c.JSON(http.StatusOK, map[string]string{"service": "demo-bff"})
 }
 
 // GetProduct GET /product/:id —— 经商品域取单个商品。
 func (h *MallHandler) GetProduct(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetProduct")
+	ctx, span := h.span(ctx, "GetProduct")
 	defer span.End()
 
 	id, ok := parseInt64(span, c, "id")
 	if !ok {
 		return
 	}
-	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+	userID := userIDOf(ctx, c, "user_id")
 
 	r, err := h.d.GetProduct(ctx, &productpb.GetProductReq{UserId: userID, ProductId: id})
 	if err != nil {
@@ -75,7 +94,7 @@ func (h *MallHandler) GetProduct(ctx context.Context, c *app.RequestContext) {
 
 // GetStock GET /stock/:product_id —— 经库存域查库存快照。
 func (h *MallHandler) GetStock(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetStock")
+	ctx, span := h.span(ctx, "GetStock")
 	defer span.End()
 
 	id, ok := parseInt64(span, c, "product_id")
@@ -96,14 +115,14 @@ func (h *MallHandler) GetStock(ctx context.Context, c *app.RequestContext) {
 
 // GetOrder GET /order/:id —— 经订单域取单个订单 + 明细。
 func (h *MallHandler) GetOrder(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetOrder")
+	ctx, span := h.span(ctx, "GetOrder")
 	defer span.End()
 
 	id, ok := parseInt64(span, c, "id")
 	if !ok {
 		return
 	}
-	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+	userID := userIDOf(ctx, c, "user_id")
 
 	r, err := h.d.GetOrder(ctx, &orderpb.GetOrderReq{OrderId: id, UserId: userID})
 	if err != nil {
@@ -119,7 +138,7 @@ func (h *MallHandler) GetOrder(ctx context.Context, c *app.RequestContext) {
 
 // GetAccount GET /points/:user_id —— 经积分域查积分账户。
 func (h *MallHandler) GetAccount(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.GetAccount")
+	ctx, span := h.span(ctx, "GetAccount")
 	defer span.End()
 
 	id, ok := parseInt64(span, c, "user_id")
@@ -159,13 +178,20 @@ type placeOrderReq struct {
 // 补偿也走同一条 trace（span 属性 biz.compensation=true），排查时整段可回放。
 // 成功后积分入账用同一 orderNo：srv-points 的唯一键使重放天然幂等。
 func (h *MallHandler) PlaceOrder(ctx context.Context, c *app.RequestContext) {
-	ctx, span := h.tracer.Start(ctx, "handler.PlaceOrder")
+	ctx, span := h.span(ctx, "PlaceOrder")
 	defer span.End()
 
 	var req placeOrderReq
 	if err := c.BindJSON(&req); err != nil {
 		fail(span, c, http.StatusBadRequest, err)
 		return
+	}
+	// 归属用户**只**取鉴权签发的身份：请求体里的 user_id 是调用方自己声明的，
+	// 信它就等于把"我是谁"交给客户端决定，鉴权白做。无身份时（auth.require=false
+	// 的本机排障）才回落到请求体。
+	req.UserId = userIDOf(ctx, c, "user_id")
+	if req.UserId <= 0 {
+		req.UserId, _ = strconv.ParseInt(c.Query("user_id"), 10, 64)
 	}
 	if req.UserId <= 0 || req.ProductID <= 0 || req.Quantity <= 0 {
 		fail(span, c, http.StatusBadRequest, errors.New("user_id/product_id/quantity must be positive"))
@@ -249,7 +275,7 @@ func (h *MallHandler) PlaceOrder(ctx context.Context, c *app.RequestContext) {
 // compensate 库存预占的补偿路径：biz.compensation=true 让它在 Jaeger 上
 // 一眼可辨。补偿失败只记进 span —— 补偿失败的善后属于对账域，不属于本次请求。
 func (h *MallHandler) compensate(ctx context.Context, span trace.Span, req placeOrderReq, orderNo string) {
-	ctx, cspan := h.tracer.Start(ctx, "handler.ReleaseStock.compensate")
+	ctx, cspan := h.span(ctx, "CompensateReleaseStock")
 	defer cspan.End()
 	cspan.SetAttributes(
 		attribute.Bool("biz.compensation", true),
@@ -339,4 +365,17 @@ func fail(span trace.Span, c *app.RequestContext, status int, err error) {
 // 幂等键按 orderNo 维度，同一单重放不会重复扣减。
 func newOrderNo() string {
 	return "bff" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+// userIDOf 取本次请求的归属用户。
+//
+// 优先级：**鉴权签发的身份 > 查询串**。查询串只在没有身份时兜底
+// （auth.require=false 的本机排障路径），有身份时一律以身份为准 ——
+// 否则客户端只要在 URL 上换个 user_id 就能读别人的订单，鉴权形同虚设。
+func userIDOf(ctx context.Context, c *app.RequestContext, queryKey string) int64 {
+	if id, ok := auth.IdentityFrom(ctx); ok && id.UserID > 0 {
+		return id.UserID
+	}
+	n, _ := strconv.ParseInt(c.Query(queryKey), 10, 64)
+	return n
 }

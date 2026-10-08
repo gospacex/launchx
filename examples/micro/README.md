@@ -5,16 +5,26 @@ hubx SDK 句柄，跨进程靠 RPC 双边的 trace suite 续链，Jaeger 上一�
 
 ## 1. 拓扑与端口
 
-| 角色 | 目录 | 服务名 | 地址 | 说明 |
-|---|---|---|---|---|
-| 网关 | `srv-gateway`…（`gateway/`） | `demo-gateway` | `127.0.0.1:8080` | 流量入口，`/api/*` 剥前缀转给 bff |
-| 聚合 | `bff/` | `demo-bff` | `127.0.0.1:8081` | HTTP 面 + 四个下游 kitex 客户端 |
-| 商品域 | `srv-product/` | `demo-product` | `127.0.0.1:9021` | 商品 CRUD、上下架、四表 JOIN 报表 |
-| 订单域 | `srv-order/` | `demo-order` | `127.0.0.1:9022` | 下单三表事务 + outbox、订单报表 |
-| 库存域 | `srv-stock/` | `demo-stock` | `127.0.0.1:9023` | 预占/释放/确认（加锁 + 三表事务） |
-| 积分域 | `srv-points/` | `demo-points` | `127.0.0.1:9024` | 入账/消费（幂等键 + 两表事务） |
+| 角色 | 目录 | 服务名 | 地址 | 采集口 | 说明 |
+|---|---|---|---|---|---|
+| 网关 | `srv-gateway`…（`gateway/`） | `demo-gateway` | `127.0.0.1:8080` | **8080**（同口） | 流量入口，`/api/*` 剥前缀转给 bff |
+| 聚合 | `bff/` | `demo-bff` | `127.0.0.1:8081` | **8081**（同口） | HTTP 面 + 四个下游 kitex 客户端 |
+| 商品域 | `srv-product/` | `demo-product` | `127.0.0.1:9021` | `9033` | 商品 CRUD、上下架、四表 JOIN 报表 |
+| 订单域 | `srv-order/` | `demo-order` | `127.0.0.1:9022` | `9031` | 下单三表事务 + outbox、订单报表 |
+| 库存域 | `srv-stock/` | `demo-stock` | `127.0.0.1:9023` | `9034` | 预占/释放/确认（加锁 + 三表事务） |
+| 积分域 | `srv-points/` | `demo-points` | `127.0.0.1:9024` | `9032` | 入账/消费（幂等键 + 两表事务） |
 
 端口段：`90xx` 是 RPC（kitex），`8080/8081` 是 HTTP。
+
+**采集口（`/metrics`）落在哪，取决于该档有没有 HTTP 面** —— 这是同一套开关的两种落法：
+
+- gateway / bff 有 webx → 直接挂在既有 HTTP 口上（`webx.MetricsPrefix`，缺省 `/metrics`），
+  **不新开端口**；
+- 四个域服是 `srv` 档、没有 HTTP 面 → 由 `metrics.addr` 单起一个只服务 `/metrics` 的监听
+  （9031-9034）。漏配 `addr` 而 `enabled=true` 时**装配期即退**：否则指标会被采集却无人能读，
+  且不报错。
+
+`examples/micro/srv`（`demo-srv`，9013）同属 srv 档，采集口是 `127.0.0.1:9030`。
 
 ## 2. 分层链（每个域服内部）
 
@@ -79,7 +89,16 @@ curl /api/order/:id
 | 验收 | 一句话判据 | 复跑 |
 |---|---|---|
 | **E2** 微服调用链跑通 | `gateway → bff → 四域服` **共享同一 traceID 且父子链正确**（不是三个并列根）；srv 侧数据层 span 亦在同一 trace | `bash scripts/chain.sh` |
+| **E2 机器判** | 上述链路 + **指标采集口**（bff `webx_requests_total` / `rpcx_requests_total`、srv-order `rpcx_requests_total`）；退出码即结论 | `bash scripts/e2e.sh` |
 | **E3** srv 下单回归 | 下单落 `order_db`、outbox 行与业务行同事务、轮询补发后 `order.completed.v1` 收到事件 | `bash scripts/chain.sh`（第 ⑤ 步） |
+
+> 出向 RPC 治理（重试 / 熔断 / 负载均衡）不在代码里，在 `bff/config.yaml` 的
+> `xmiddleware.rpcx` 段 —— 只有 bff 有出向客户端。启动日志会打出**只含已生效项**的
+> 一行摘要（`rpc governance: circuit_breaker(...) metrics=on`），拿它对着 yaml 核即可。
+>
+> ⚠️ 本机跑 `e2e.sh` 前先确认 `etcdkeeper` 容器没占着 8081（它把宿主 8081 映射给了
+> 容器 8080），否则报「端口已被占用」但 `ps` 里找不到自己的进程 —— 占用者是 Docker
+> Desktop 本身。`docker stop etcdkeeper` 即可，跑完 `docker start etcdkeeper` 恢复。
 
 **E3 的目标服务是 `srv-order`**，不是 `examples/micro/srv`。
 

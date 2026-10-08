@@ -1,0 +1,254 @@
+# =============================================================================
+# 微服案例的 k8s 部署清单（六个 Deployment + 一个 ConfigMap）
+# -----------------------------------------------------------------------------
+# 探针口径（本例最关键的一条）：
+#
+#   - gateway / bff 有 HTTP 面 → 可以用 HTTP GET /healthz/live；
+#   - **四个域服没有 HTTP 面**（kitex 私有协议），只能用 tcpSocket。
+#
+# 为什么 srv 档必须显式给探针而不是"靠 consul TTL 就够了"：
+# consul TTL 回答的是"注册中心里的这一条该不该被摘掉"，k8s 探针回答的是
+# "这个 Pod 该不该被重启"，两者不是一件事。少了后者，进程假死（accept 不报错
+# 但不再处理）时会一直留在 endpoints 里，把流量持续导进一个死 Pod。
+#
+# readinessProbe 一律比 livenessProbe 更敏感（initialDelay 更短、period 更密）：
+#  readiness 负责"能不能接流量"，早一点摘掉代价小；
+#  liveness 负责"要不要重启"，重启会丢掉进程内的 outbox 补发进度，
+#  判得太激进会制造无意义的重启风暴。
+#
+# 用法（minikube）：
+#   kubectl apply -f examples/micro/deploy/micro.yaml
+#   kubectl -n launchx-demo get pod -w
+#
+# 注意：镜像里的六个二进制与 config.yaml 缺一不可 —— configPath 是相对路径
+# "config.yaml"，进程必须在配置所在目录下启动（镜像的 WORKDIR 已经是 /app/conf）。
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: launchx-demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: micro-config
+  namespace: launchx-demo
+data:
+  # 每份 config.yaml 的键名就是进程要读的文件名（Bootstrap("config.yaml")）。
+  # 六个进程各挂一份，靠 volumeMount 的 subPath 分别落到各自的目录。
+  gateway.config.yaml: |
+    service:
+      name: demo-gateway
+      mode: gateway
+      addr: "0.0.0.0:8080"
+    webx:
+      addr: "0.0.0.0:8080"
+      timeout: 5s
+      health_prefix: /healthz
+    gateway:
+      routes:
+        - prefix: /api
+          upstream: demo-bff
+          strip: true
+          name: api
+    trace:
+      enabled: true
+      endpoint: "jaeger:4318"
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+    # 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流）。
+    # 关掉（false 或不写）即不建 provider，meter 退回 noop。
+    metrics:
+      enabled: true
+  # 其余五份按各自目录下的 config.yaml 原样填入（此处省略，避免清单与文件
+  # 各维护一份而漂移 —— 实际交付时用 `kubectl create configmap --from-file`
+  # 从目录生成，见 README §部署）。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-gateway
+  namespace: launchx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-gateway }
+  template:
+    metadata:
+      labels: { app: demo-gateway }
+    spec:
+      containers:
+        - name: gateway
+          image: launchx-demo:dev
+          command: ["/app/bin/demo-gateway"]
+          ports: [{ name: http, containerPort: 8080 }]
+          livenessProbe:
+            httpGet: { path: /healthz/live, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz/live, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-bff
+  namespace: launchx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-bff }
+  template:
+    metadata:
+      labels: { app: demo-bff }
+    spec:
+      containers:
+        - name: bff
+          image: launchx-demo:dev
+          command: ["/app/bin/demo-bff"]
+          ports: [{ name: http, containerPort: 8081 }]
+          # /healthz 与 /ping 在鉴权白名单里（见 bff/app/setup.go 的
+          # authSkipPaths）：探针不该因为凭据存储抖动而失败，否则编排系统会
+          # 因为"鉴权用的 redis 抖了一下"重启一批健康实例。
+          livenessProbe:
+            httpGet: { path: /healthz/live, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz/live, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+# 四个域服：只有 RPC 面，探针走 tcpSocket（端口 = service.addr 的端口）。
+# 顺序与 scripts/e2e.sh 的 spec 列表一致：product 9021 / order 9022 /
+# stock 9023 / points 9024。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-product
+  namespace: launchx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-product }
+  template:
+    metadata:
+      labels: { app: demo-product }
+    spec:
+      containers:
+        - name: product
+          image: launchx-demo:dev
+          command: ["/app/bin/demo-product"]
+          ports: [{ name: rpc, containerPort: 9021 }]
+          livenessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-order
+  namespace: launchx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-order }
+  template:
+    metadata:
+      labels: { app: demo-order }
+    spec:
+      containers:
+        - name: order
+          image: launchx-demo:dev
+          command: ["/app/bin/demo-order"]
+          ports: [{ name: rpc, containerPort: 9022 }]
+          livenessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-stock
+  namespace: launchx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-stock }
+  template:
+    metadata:
+      labels: { app: demo-stock }
+    spec:
+      containers:
+        - name: stock
+          image: launchx-demo:dev
+          command: ["/app/bin/demo-stock"]
+          ports: [{ name: rpc, containerPort: 9023 }]
+          livenessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-points
+  namespace: launchx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-points }
+  template:
+    metadata:
+      labels: { app: demo-points }
+    spec:
+      containers:
+        - name: points
+          image: launchx-demo:dev
+          command: ["/app/bin/demo-points"]
+          ports: [{ name: rpc, containerPort: 9024 }]
+          livenessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket: { port: rpc }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }

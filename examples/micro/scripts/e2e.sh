@@ -14,7 +14,13 @@
 #   bash examples/micro/scripts/e2e.sh            # 自起六进程（端口被占则报错退出）
 #   E2E_REUSE=1 bash examples/micro/scripts/e2e.sh  # 复用已在跑的进程，只做断言
 #
-# 退出码：0 = 两条断言均通过；非 0 = 前置 / 断言 / 进程提前退出。
+# 退出码：0 = 全部断言通过；非 0 = 前置 / 断言 / 进程提前退出。
+#
+# ⚠️ 已知本机冲突（踩过一次，报错指不到点子上）：bff 的 webx 口是 **8081**，
+#   而 dockers/docker-compose.yml 里的 `etcdkeeper` 把宿主 8081 映射给了容器 8080。
+#   两者同时存在时本脚本会报「bff 的端口 8081 已被占用」，但 `ps` 里找不到任何
+#   自己的进程 —— 占用者是 **Docker Desktop 自身**（`lsof -nP -iTCP:8081 -sTCP:LISTEN`
+#   显示 COMMAND=com.docke）。处置：`docker stop etcdkeeper`（跑完再 start 回来）。
 #
 # 踩坑记录（macOS bash 3.2）：**变量后面紧跟中文必须写成 ${name}**。
 # bash 3.2 不做多字节识别，`$name（端口` 会被解析成变量名 `${name}\xef\xbc\x88...`，
@@ -34,6 +40,18 @@ SCHEMA_SQL="$REPO_ROOT/examples/mall/scripts/schema.sql"
 GATEWAY="${GATEWAY:-http://127.0.0.1:8080}"
 USER_ID="${USER_ID:-1001}"
 SEED_ORDER_ID="${SEED_ORDER_ID:-1001}"
+# 指标采集口。bff 是 HTTP 档，/metrics 挂在自己的 webx 口（8081）上；
+# srv-order 是 srv 档（没有 HTTP 面），采集口是配置里单开的 metrics.addr。
+BFF_METRICS="${BFF_METRICS:-http://127.0.0.1:8081/metrics}"
+SRV_ORDER_METRICS="${SRV_ORDER_METRICS:-http://127.0.0.1:9031/metrics}"
+# 边界鉴权凭据：bff 是唯一验凭据的地方，gateway 只透传 Authorization 头。
+# 令牌由 bff 在启动时按 demo.auth_token 播种进缓存，故必须与那份配置一致
+#（与 scripts/chain.sh 同一口径）。bff 的 auth.require=true 时缺这个头必然 401。
+DEMO_TOKEN="${DEMO_TOKEN-demo-token}"
+AUTH=()
+if [ -n "$DEMO_TOKEN" ]; then
+  AUTH=(-H "Authorization: Bearer $DEMO_TOKEN")
+fi
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/micro-e2e.XXXXXX")"
 readonly WORKDIR
@@ -223,13 +241,19 @@ assert_ping() {
   esac
 }
 
-# 注意这里带了 ?user_id —— 原计划写的是裸 /api/order/1001，实测它会
-# 返回 401（order 域要求携带身份，防跨用户读单，见
-# docs/verify-chain.md §10：曾经把「缺 user_id」渲染成 502 造成过误诊）。
+# 注意这里带了两样东西，缺一都过不去，且失败长得不一样：
+#   - `?user_id=`：order 域要求携带身份，防跨用户读单（见 docs/verify-chain.md §10：
+#     曾经把「缺 user_id」渲染成 502 造成过误诊）；
+#   - `Authorization: Bearer <demo.auth_token>`：bff 的 `auth.require=true` 时
+#     缺这个头会在**边界**就 401（`missing bearer token`），根本到不了 order 域。
 # 断言的目标（链路真的打到 srv-order 的 db 层）没有变，变的只是入参。
 assert_order() {
   local body
-  body="$(curl -sf --noproxy '*' -m 15 "$GATEWAY/api/order/$SEED_ORDER_ID?user_id=$USER_ID" || true)"
+  # `${AUTH[@]+"${AUTH[@]}"}` 而不是 `"${AUTH[@]}"`：bash 3.2 下 `set -u` 遇到
+  # 空数组的 `"${A[@]}"` 会报 unbound variable。这层壳让 DEMO_TOKEN="" 也能跑
+  #（那条路径是刻意留的：验「没凭据会被挡」）。
+  body="$(curl -sf --noproxy '*' -m 15 ${AUTH[@]+"${AUTH[@]}"} \
+    "$GATEWAY/api/order/$SEED_ORDER_ID?user_id=$USER_ID" || true)"
   if [ -z "$body" ]; then
     fail "GET /api/order/$SEED_ORDER_ID 无响应体（网关不可达，或返回非 2xx 被 -f 吞掉）"
     return 1
@@ -239,6 +263,33 @@ assert_order() {
     *'"order_id":'*"$SEED_ORDER_ID"*) ;;
     *) fail "/api/order/$SEED_ORDER_ID 响应不含 order_id=$SEED_ORDER_ID"; return 1 ;;
   esac
+}
+
+# assert_metrics 指标采集口真的可读（本轮新增）。
+#
+# 判据分三层，缺一不算过 —— 只断言「HTTP 200」是不够的：一个返回空 JSON 的
+# 假端点同样 200（ACCEPTANCE §15 第 7 条明确把这种凑数行为判 FAIL）。
+#   1. 有响应体（-f 没吞掉）；
+#   2. 是 Prometheus 文本格式（含 `# HELP`，不是随手写的 JSON）；
+#   3. 里面出现**该进程自己的**指标名 —— HTTP 档要有 webx_requests_total，
+#      RPC 档要有 rpcx_requests_total（只看 200 会被"空壳端点"骗过）。
+assert_metrics() {
+  local label=$1 url=$2 want=$3 body
+  body="$(curl -sf --noproxy '*' -m 10 "$url" || true)"
+  if [ -z "${body}" ]; then
+    fail "${label}: ${url} 无响应（-f 吞掉了非 2xx，或采集口没起）"
+    return 1
+  fi
+  case "${body}" in
+    *'# HELP'*) ;;
+    *) fail "${label}: ${url} 不是 Prometheus 文本格式（缺 # HELP）"; return 1 ;;
+  esac
+  case "${body}" in
+    *"${want}"*) ;;
+    *) fail "${label}: ${url} 里找不到 ${want}（端点活着但没接上仪表）"; return 1 ;;
+  esac
+  printf '  ✓ %s：含 %s（%s 行）\n' "${label}" "${want}" \
+    "$(printf '%s' "${body}" | wc -l | tr -d ' ')"
 }
 
 main() {
@@ -285,8 +336,15 @@ main() {
   log "断言 ②：GET /api/order/$SEED_ORDER_ID?user_id=$USER_ID"
   assert_order
 
+  # ③ 放在业务之后：计数器只在**发生过调用**之后才会被导出（零观测的 counter
+  # 不出现在导出里），所以顺序反了会得到一个必然失败的断言。
+  log "断言 ③：指标采集口（HTTP 档 bff / RPC 档 srv-order）"
+  assert_metrics "bff(HTTP 档, /metrics 挂 webx 口)" "$BFF_METRICS" "webx_requests_total"
+  assert_metrics "bff(出向 RPC, rpc_role=client)" "$BFF_METRICS" "rpcx_requests_total"
+  assert_metrics "srv-order(RPC 档, 独立采集口)" "$SRV_ORDER_METRICS" "rpcx_requests_total"
+
   printf '\n'
-  log "E2 通过：gateway → bff → 四域服 调用链返回预期响应（退出码 0）"
+  log "E2 通过：gateway → bff → 四域服 调用链 + 指标采集口（退出码 0）"
 }
 
 main "$@"

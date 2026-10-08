@@ -29,24 +29,21 @@ import (
 	"github.com/gospacex/coordx"
 	"github.com/gospacex/launchx"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/gateway/internal/routing"
+
+	"github.com/gospacex/otelx/layer"
 )
 
 const (
-	// spanPrefix 转发 span 名前缀（不覆盖 webx 入口中间件的根 span）。
-	spanPrefix = "gateway.proxy."
 	// defaultTimeout 单次转发的整体超时。
 	defaultTimeout = 5 * time.Second
 	// upstreamScheme 上游协议：demo 全链路在可信网络内，不引入 TLS 配置面。
 	upstreamScheme = "http"
-	// fallbackTracerName tracer 为空时的回落 instrumentation 名。
-	fallbackTracerName = "gateway.proxy"
 )
 
 // hopHeaders 逐跳首部：不能透传给上游，否则连接语义会被上游误解。
@@ -115,19 +112,20 @@ type Proxy struct {
 	routes   routing.Table
 	resolver *Resolver
 	client   *http.Client
-	tracer   trace.Tracer
+	traceOn  bool
 }
 
 // New 构造转发器。
 //
-// tp 是 launchx 装配好的 provider（App.Tracer().TracerProvider()）：otelhttp 的
-// CLIENT span 与自造的转发 span 必须同出一个 provider，否则前者落到全局 noop，
-// Jaeger 上只有 gateway.proxy.<route> 一根独苗。tp 为 nil 时回落到 otel 全局
-// （缺省即 noop）—— 埋点缺失可以降级，不能让转发本身起不来。
-func New(routes routing.Table, resolver *Resolver, tp trace.TracerProvider) *Proxy {
-	if tp == nil {
-		tp = otel.GetTracerProvider()
-	}
+// 不再收一个 trace.TracerProvider：otel 的全局 provider 是**委托实现** ——
+// 构造期先取的 tracer，在 SetTracerProvider 之后仍会转发到真正的实现上。
+// 因此 otelhttp 与本层自造的 span 都跟全局走即可，两者天然同出一个 provider，
+// 不存在"CLIENT span 掉进 noop"的风险。
+//
+// 反过来，从装配层手里接过一个 provider 塞进来，会把"两个 span 同出一源"
+// 这件事变成取决于装配顺序的偶然事实 —— 一旦顺序变了，Jaeger 上只剩
+// gateway.proxy.<route> 一根独苗，而没有任何一处会报错。
+func New(routes routing.Table, resolver *Resolver, traceOn bool) *Proxy {
 	return &Proxy{
 		routes:   routes,
 		resolver: resolver,
@@ -137,15 +135,28 @@ func New(routes routing.Table, resolver *Resolver, tp trace.TracerProvider) *Pro
 			// 连接复用、空闲连接回收、代理环境变量这些都留给标准实现，这一层
 			// 只叠加观测职责 —— 顺手自建 transport 会悄悄丢掉这些行为。
 			Transport: otelhttp.NewTransport(http.DefaultTransport,
-				otelhttp.WithTracerProvider(tp),
 				// 传播器必须与库侧同源：无论最终由谁写入 traceparent，写进去的
 				// 字段集合都得和 gateway → bff / srv 的其它出向一致，
 				// 否则下游会出现"有的请求能续上、有的续不上"的偶发断链。
 				otelhttp.WithPropagators(launchx.Propagator()),
 			),
 		},
-		tracer: tp.Tracer(fallbackTracerName),
+		traceOn: traceOn,
 	}
+}
+
+// span 开转发 span（gateway.proxy.<route>）。
+//
+// 名字刻意与旧实现逐字一致：它是全链路验收判据里写死的形态（README §2 的
+// 路由表 name 字段直接进 span 名），改名会让既有判据与文档同时失效。
+//
+// traceOn=false 时返回 noop span 而不是 nil：本层各处都要 SetAttributes /
+// RecordError，返回 nil 会让每一处都得判空，漏一处就是 panic。
+func (p *Proxy) span(ctx context.Context, route string) (context.Context, trace.Span) {
+	if !p.traceOn {
+		return ctx, trace.SpanFromContext(context.Background())
+	}
+	return layer.Start(ctx, "gateway", "proxy", route)
 }
 
 // Handle 是挂到 webx 引擎上的 hertz handler：
@@ -166,7 +177,7 @@ func (p *Proxy) Handle(ctx context.Context, c *app.RequestContext) {
 
 	// 转发 span 是 webx 入口根 span 的子 span：不在这里另起根，
 	// 否则 gateway→上游会断成两根 trace。
-	ctx, span := p.tracer.Start(ctx, spanPrefix+route.Name)
+	ctx, span := p.span(ctx, route.Name)
 	defer span.End()
 	span.SetAttributes(
 		attribute.String("proxy.upstream", route.Upstream),

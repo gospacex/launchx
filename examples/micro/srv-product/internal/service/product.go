@@ -23,18 +23,17 @@ import (
 
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/kvx"
-	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
+	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/repository"
+	"github.com/gospacex/otelx/layer"
 )
 
 // productLockTTL 上下架互斥的持锁上限。
@@ -78,19 +77,20 @@ func NewProductService(
 // Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
 func (s *ProductService) Repo() *repository.ProductRepository { return s.repo }
 
-// begin 开一个 service 层 span（traceOn=false 时返回空收尾闭包）
-func (s *ProductService) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !s.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "service", "product", op)
-	return c, func() { span.End() }
+// begin 开 service 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不做 quiet 豁免：service 返回非 nil error 意味着这次业务操作没完成
+// （参数非法 / 写库失败 / 下游失败），都该在 Jaeger 上看得见 —— 与单体
+// 示例 s.end 的口径一致。预期内的业务拒绝由 handler 翻成响应体 Code，
+// 不进 error，因此不会把正常的「商品不存在」标成故障。
+func (s *ProductService) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "product", op, s.traceOn, nil)
 }
 
 // CreateProduct 建商品：校验 → 多表事务 → outbox 事件
-func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProductCmd) (*model.CreateProductResult, error) {
+func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProductCmd) (out *model.CreateProductResult, err error) {
 	ctx, end := s.begin(ctx, "CreateProduct")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.OperatorID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "operator required")
@@ -110,8 +110,8 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 		return nil, codes.Wrap(codes.CodeInternal, "load category failed", err)
 	}
 
-	tp := s.traceparentOf(ctx)
-	out, err := s.repo.CreateProductTx(ctx, repository.CreateProductInput{
+	tp := traceparent.Of(ctx, s.traceOn)
+	rec, err := s.repo.CreateProductTx(ctx, repository.CreateProductInput{
 		Title:      cmd.Title,
 		Price:      cmd.Price,
 		CategoryID: cmd.CategoryID,
@@ -142,9 +142,9 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 		return nil, codes.Wrap(codes.CodeProductWriteFailed, "create product failed", err)
 	}
 	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-		span.SetAttributes(attribute.Int64("product.id", int64(out.ProductID)))
+		span.SetAttributes(attribute.Int64("product.id", int64(rec.ProductID)))
 	}
-	return &model.CreateProductResult{ProductID: out.ProductID, SkuCount: out.SkuCount}, nil
+	return &model.CreateProductResult{ProductID: rec.ProductID, SkuCount: rec.SkuCount}, nil
 }
 
 // GetProduct 查商品详情（cachex 优先，miss 回源 DB 并回填；命中路径记热度）
@@ -152,9 +152,9 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 // 热度计数走 kvx 而非 cachex：它需要原子自增，且**不要求强一致** —— 丢了
 // 一次计数只是热度偏低，不影响正确性；反过来若为了它去动 cachex 的缓存值，
 // 读-改-写会在并发下互相覆盖。两者因此分工明确。
-func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery) (*model.ProductDetail, error) {
+func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery) (out *model.ProductDetail, err error) {
 	ctx, end := s.begin(ctx, "GetProduct")
-	defer end()
+	defer func() { end(err) }()
 
 	if q.ProductID <= 0 {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id required")
@@ -193,9 +193,9 @@ func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery
 }
 
 // UpdateProduct 改商品（2 表事务 + 缓存失效）
-func (s *ProductService) UpdateProduct(ctx context.Context, cmd model.UpdateProductCmd) error {
+func (s *ProductService) UpdateProduct(ctx context.Context, cmd model.UpdateProductCmd) (err error) {
 	ctx, end := s.begin(ctx, "UpdateProduct")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.OperatorID <= 0 {
 		return codes.New(codes.CodeUnauthorized, "operator required")
@@ -224,9 +224,9 @@ func (s *ProductService) UpdateProduct(ctx context.Context, cmd model.UpdateProd
 //
 // 幂等：已是目标态返回 CodeProductStatusDup。这是**成功**语义而非错误 ——
 // 重复点击不该报内部错误，也不该再记一条审计日志。
-func (s *ProductService) UpdateStatus(ctx context.Context, cmd model.UpdateStatusCmd) (*model.UpdateStatusResult, error) {
+func (s *ProductService) UpdateStatus(ctx context.Context, cmd model.UpdateStatusCmd) (out *model.UpdateStatusResult, err error) {
 	ctx, end := s.begin(ctx, "UpdateStatus")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.OperatorID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "operator required")
@@ -263,9 +263,9 @@ func (s *ProductService) UpdateStatus(ctx context.Context, cmd model.UpdateStatu
 // ListProducts 商品列表（2 表联查：products ⋈ categories）
 //
 // 不走缓存：列表随上下架实时变化，缓存只会拖慢一致性。
-func (s *ProductService) ListProducts(ctx context.Context, q model.ListProductsQuery) ([]model.ProductDetail, error) {
+func (s *ProductService) ListProducts(ctx context.Context, q model.ListProductsQuery) (out []model.ProductDetail, err error) {
 	ctx, end := s.begin(ctx, "ListProducts")
-	defer end()
+	defer func() { end(err) }()
 	rows, err := s.repo.ListProducts(ctx, q)
 	if err != nil {
 		return nil, codes.Wrap(codes.CodeInternal, "list products failed", err)
@@ -274,9 +274,9 @@ func (s *ProductService) ListProducts(ctx context.Context, q model.ListProductsQ
 }
 
 // Report 4 表 JOIN 报表
-func (s *ProductService) Report(ctx context.Context, q model.ProductReportQuery) ([]model.ReportRow, error) {
+func (s *ProductService) Report(ctx context.Context, q model.ProductReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := s.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	rows, err := s.repo.Report(ctx, q)
 	if err != nil {
 		return nil, codes.Wrap(codes.CodeInternal, "report products failed", err)
@@ -336,17 +336,6 @@ func (s *ProductService) invalidate(ctx context.Context, productID uint64) {
 		// 失效失败只告警：下一次读会拿到旧值，但 TTL 兜底（10 分钟）不会永久错
 		s.logger.WarnContext(ctx, "product: cache invalidate failed", logx.Err(err))
 	}
-}
-
-// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
-// 仅当调用链开时经 otel 全局传播器注入；无活动 span 时为空串。
-func (s *ProductService) traceparentOf(ctx context.Context) string {
-	if !s.traceOn {
-		return ""
-	}
-	carrier := propagation.MapCarrier(map[string]string{})
-	launchx.Inject(ctx, carrier)
-	return carrier.Get(events.TraceHeaderKey)
 }
 
 // evTraceID 事件体内嵌 trace_id（无活动 span 时为空）

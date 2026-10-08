@@ -35,18 +35,17 @@ import (
 
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/kvx"
-	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
+	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/repository"
+	"github.com/gospacex/otelx/layer"
 )
 
 // pointsLockTTL 入账/消费互斥的持锁上限。
@@ -97,13 +96,14 @@ func NewPointsService(
 // Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
 func (s *PointsService) Repo() *repository.PointsRepository { return s.repo }
 
-// begin 开一个 service 层 span（traceOn=false 时返回空收尾闭包）
-func (s *PointsService) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !s.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "service", "points", op)
-	return c, func() { span.End() }
+// begin 开 service 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不做 quiet 豁免：service 返回非 nil error 意味着这次业务操作没完成
+// （参数非法 / 写库失败 / 下游失败），都该在 Jaeger 上看得见 —— 与单体
+// 示例 s.end 的口径一致。预期内的业务拒绝由 handler 翻成响应体 Code，
+// 不进 error，因此不会把正常的「商品不存在」标成故障。
+func (s *PointsService) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "points", op, s.traceOn, nil)
 }
 
 // GetAccount 查账户（cachex 优先，miss 回源 DB 并回填）
@@ -111,9 +111,9 @@ func (s *PointsService) begin(ctx context.Context, op string) (context.Context, 
 // 回源走的是 point_accounts ⋈ point_ledgers 的联表聚合投影，缓存里存的
 // 也就是这份投影 —— 缓存值与回源值必须是同一个结构，否则"命中缓存就没有
 // 流水笔数"这种半截响应会反复出现。
-func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery) (*model.AccountDetail, error) {
+func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery) (out *model.AccountDetail, err error) {
 	ctx, end := s.begin(ctx, "GetAccount")
-	defer end()
+	defer func() { end(err) }()
 
 	if q.UserID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "user required")
@@ -146,9 +146,9 @@ func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery)
 }
 
 // Earn 入账：幂等键 → 用户锁 → 2 表事务 + outbox → 缓存失效
-func (s *PointsService) Earn(ctx context.Context, cmd model.EarnCmd) (*model.ChangeResult, error) {
+func (s *PointsService) Earn(ctx context.Context, cmd model.EarnCmd) (out *model.ChangeResult, err error) {
 	ctx, end := s.begin(ctx, "Earn")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.UserID <= 0 || cmd.Amount <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodePointsAmountInvalid, "user_id/amount/order_no invalid")
@@ -157,9 +157,9 @@ func (s *PointsService) Earn(ctx context.Context, cmd model.EarnCmd) (*model.Cha
 }
 
 // Consume 消费：幂等键 → 用户锁 → 2 表事务 + outbox → 缓存失效
-func (s *PointsService) Consume(ctx context.Context, cmd model.ConsumeCmd) (*model.ChangeResult, error) {
+func (s *PointsService) Consume(ctx context.Context, cmd model.ConsumeCmd) (out *model.ChangeResult, err error) {
 	ctx, end := s.begin(ctx, "Consume")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.UserID <= 0 || cmd.Amount <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodePointsAmountInvalid, "user_id/amount/order_no invalid")
@@ -171,9 +171,9 @@ func (s *PointsService) Consume(ctx context.Context, cmd model.ConsumeCmd) (*mod
 //
 // 不走缓存：流水要求实时，缓存只会造成对账偏差 —— 用户刚消费完就来看流水，
 // 少一条比慢一点严重得多。
-func (s *PointsService) ListLedgers(ctx context.Context, q model.ListLedgersQuery) ([]model.LedgerDetail, error) {
+func (s *PointsService) ListLedgers(ctx context.Context, q model.ListLedgersQuery) (out []model.LedgerDetail, err error) {
 	ctx, end := s.begin(ctx, "ListLedgers")
-	defer end()
+	defer func() { end(err) }()
 
 	if q.UserID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "user required")
@@ -186,9 +186,9 @@ func (s *PointsService) ListLedgers(ctx context.Context, q model.ListLedgersQuer
 }
 
 // Report 2 表 JOIN 报表
-func (s *PointsService) Report(ctx context.Context, q model.PointsReportQuery) ([]model.ReportRow, error) {
+func (s *PointsService) Report(ctx context.Context, q model.PointsReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := s.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 
 	rows, err := s.repo.Report(ctx, q)
 	if err != nil {
@@ -217,7 +217,7 @@ func (s *PointsService) apply(ctx context.Context, userID uint64, orderNo string
 	}
 	defer unlock()
 
-	tp := s.traceparentOf(ctx)
+	tp := traceparent.Of(ctx, s.traceOn)
 	out, err := s.repo.ChangeTx(ctx, repository.ChangeInput{
 		UserID:  userID,
 		OrderNo: orderNo,
@@ -333,17 +333,6 @@ func (s *PointsService) invalidate(ctx context.Context, userID uint64) {
 	if err := s.cache.Delete(ctx, accountCacheKey(userID)); err != nil {
 		s.logger.WarnContext(ctx, "points: cache invalidate failed", logx.Err(err))
 	}
-}
-
-// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
-// 仅当调用链开时经 otel 全局传播器注入；无活动 span 时为空串。
-func (s *PointsService) traceparentOf(ctx context.Context) string {
-	if !s.traceOn {
-		return ""
-	}
-	carrier := propagation.MapCarrier(map[string]string{})
-	launchx.Inject(ctx, carrier)
-	return carrier.Get(events.TraceHeaderKey)
 }
 
 // evTraceID 事件体内嵌 trace_id（无活动 span 时为空）

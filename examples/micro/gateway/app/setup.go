@@ -10,7 +10,6 @@ import (
 	"fmt"
 
 	"github.com/gospacex/webx"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/launchx/examples/micro/gateway/internal/proxy"
@@ -58,15 +57,10 @@ func Setup(a *launchx.App) error {
 		return cfg.GetString(upstreamKeyPrefix + upstream)
 	})
 
-	// provider 而不是某个 tracer：出向要同时产两种 span —— 转发 span（业务自造）
-	// 与 HTTP CLIENT span（otelhttp 包 http.Client 产出），两者必须同出一个 provider，
-	// 否则 CLIENT span 会掉进全局 noop，链路上只剩一根"网关收到请求"的孤证。
-	// 未启用 telemetry 时 App.Tracer() 为 nil，proxy.New 内部回落到 otel 全局。
-	var tp trace.TracerProvider
-	if tr := a.Tracer(); tr != nil {
-		tp = tr.TracerProvider()
-	}
-	p := proxy.New(table, resolver, tp)
+	// 不再从 App.Tracer() 手里接 provider：otel 全局是委托实现，构造期取的
+	// tracer 在 SetTracerProvider 之后照样转发到真正的实现，故 otelhttp 的
+	// CLIENT span 与本层自造的转发 span 天然同出一源。这里只需要一个开关。
+	p := proxy.New(table, resolver, a.Config().GetBool("trace.enabled"))
 	for _, r := range table.Routes() {
 		// hertz 的通配参数写作 *p；一条路由注册一个通配，命中后由
 		// proxy.Handle 按路径再匹配一次（注册与匹配共用同一张表）。

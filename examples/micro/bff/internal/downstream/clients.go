@@ -16,6 +16,8 @@ import (
 	otelcodes "go.opentelemetry.io/otel/codes" // 传输层错误标记（与业务码包 codes 区分）
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/otelx/layer"
+
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	orderpb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order"
 	orderrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order/order"
@@ -37,18 +39,31 @@ type Clients struct {
 
 // Downstream 四域下游门面：全部方法都带 span，业务码非 0 记为 span Error。
 type Downstream struct {
-	c      Clients
-	tracer trace.Tracer
+	c       Clients
+	traceOn bool
 }
 
 // New 构造四域门面。
-func New(c Clients, tracer trace.Tracer) *Downstream {
-	return &Downstream{c: c, tracer: tracer}
+//
+// 不再收一个 trace.Tracer：全生态的 tracer 取法统一为「向 otel 全局现取」
+// （otelx/layer.Tracer() 就是这么做的，且刻意不缓存成包级变量）。
+// 从装配层手里接一个 tracer 进来，会让本层与「全局 provider 由 launchx 的
+// telemetry 步骤注册」这一事实脱钩 —— 一旦装配顺序变了，这里的 span 会静默
+// 掉进另一个 provider，Jaeger 上表现为下游四服的跳凭空消失。
+func New(c Clients, traceOn bool) *Downstream {
+	return &Downstream{c: c, traceOn: traceOn}
 }
 
 // span 便捷入口：起 span + 生命周期钩子。
-func (d *Downstream) span(ctx context.Context, name string) (context.Context, trace.Span) {
-	return d.tracer.Start(ctx, name)
+//
+// traceOn=false 时返回一个 noop span 而不是 nil：调用方一律写 `defer span.End()`
+// 与 markBiz(span, ...)，返回 nil 会让这两处都得加判空 —— 而判空一旦漏写就是
+// panic，比多写三行更危险。noop span 的 End / SetStatus / RecordError 全是空实现。
+func (d *Downstream) span(ctx context.Context, domain, method string) (context.Context, trace.Span) {
+	if !d.traceOn {
+		return ctx, trace.SpanFromContext(context.Background())
+	}
+	return layer.Start(ctx, "downstream", domain, method)
 }
 
 // markBiz 领域错误不是传输故障：不下发 error，但要在本层留下可检索的失败标记，
@@ -61,7 +76,7 @@ func markBiz(span trace.Span, code int64, msg string) {
 
 // GetProduct 商品域：取单个商品（商品域内部含缓存与多表 JOIN）。
 func (d *Downstream) GetProduct(ctx context.Context, req *productpb.GetProductReq) (*productpb.GetProductResp, error) {
-	ctx, span := d.span(ctx, "downstream.product.GetProduct")
+	ctx, span := d.span(ctx, "product", "GetProduct")
 	defer span.End()
 	r, err := d.c.Product.GetProduct(ctx, req)
 	if err != nil {
@@ -75,7 +90,7 @@ func (d *Downstream) GetProduct(ctx context.Context, req *productpb.GetProductRe
 
 // GetStock 库存域：查某商品的库存快照。
 func (d *Downstream) GetStock(ctx context.Context, req *stockpb.GetStockReq) (*stockpb.GetStockResp, error) {
-	ctx, span := d.span(ctx, "downstream.stock.GetStock")
+	ctx, span := d.span(ctx, "stock", "GetStock")
 	defer span.End()
 	r, err := d.c.Stock.GetStock(ctx, req)
 	if err != nil {
@@ -89,7 +104,7 @@ func (d *Downstream) GetStock(ctx context.Context, req *stockpb.GetStockReq) (*s
 
 // ReserveStock 库存域：预占库存（锁 + 3 表事务，失败可重试的领域码在 r.Code）。
 func (d *Downstream) ReserveStock(ctx context.Context, req *stockpb.ReserveStockReq) (*stockpb.ReserveStockResp, error) {
-	ctx, span := d.span(ctx, "downstream.stock.ReserveStock")
+	ctx, span := d.span(ctx, "stock", "ReserveStock")
 	defer span.End()
 	r, err := d.c.Stock.ReserveStock(ctx, req)
 	if err != nil {
@@ -103,7 +118,7 @@ func (d *Downstream) ReserveStock(ctx context.Context, req *stockpb.ReserveStock
 
 // ReleaseStock 库存域：释放预占（补偿路径 —— 下单失败必须把它调上）。
 func (d *Downstream) ReleaseStock(ctx context.Context, req *stockpb.ReleaseStockReq) (*stockpb.ReleaseStockResp, error) {
-	ctx, span := d.span(ctx, "downstream.stock.ReleaseStock")
+	ctx, span := d.span(ctx, "stock", "ReleaseStock")
 	defer span.End()
 	r, err := d.c.Stock.ReleaseStock(ctx, req)
 	if err != nil {
@@ -117,7 +132,7 @@ func (d *Downstream) ReleaseStock(ctx context.Context, req *stockpb.ReleaseStock
 
 // CreateOrder 订单域：创建订单（多表事务 + outbox 事件）。
 func (d *Downstream) CreateOrder(ctx context.Context, req *orderpb.CreateOrderReq) (*orderpb.CreateOrderResp, error) {
-	ctx, span := d.span(ctx, "downstream.order.CreateOrder")
+	ctx, span := d.span(ctx, "order", "CreateOrder")
 	defer span.End()
 	r, err := d.c.Order.CreateOrder(ctx, req)
 	if err != nil {
@@ -131,7 +146,7 @@ func (d *Downstream) CreateOrder(ctx context.Context, req *orderpb.CreateOrderRe
 
 // GetOrder 订单域：查单个订单 + 明细。
 func (d *Downstream) GetOrder(ctx context.Context, req *orderpb.GetOrderReq) (*orderpb.GetOrderResp, error) {
-	ctx, span := d.span(ctx, "downstream.order.GetOrder")
+	ctx, span := d.span(ctx, "order", "GetOrder")
 	defer span.End()
 	r, err := d.c.Order.GetOrder(ctx, req)
 	if err != nil {
@@ -145,7 +160,7 @@ func (d *Downstream) GetOrder(ctx context.Context, req *orderpb.GetOrderReq) (*o
 
 // GetAccount 积分域：查某用户的积分账户。
 func (d *Downstream) GetAccount(ctx context.Context, req *pointspb.GetAccountReq) (*pointspb.GetAccountResp, error) {
-	ctx, span := d.span(ctx, "downstream.points.GetAccount")
+	ctx, span := d.span(ctx, "points", "GetAccount")
 	defer span.End()
 	r, err := d.c.Points.GetAccount(ctx, req)
 	if err != nil {
@@ -159,7 +174,7 @@ func (d *Downstream) GetAccount(ctx context.Context, req *pointspb.GetAccountReq
 
 // Earn 积分域：入账（幂等键 = order_no + type，重放安全）。
 func (d *Downstream) Earn(ctx context.Context, req *pointspb.EarnReq) (*pointspb.EarnResp, error) {
-	ctx, span := d.span(ctx, "downstream.points.Earn")
+	ctx, span := d.span(ctx, "points", "Earn")
 	defer span.End()
 	r, err := d.c.Points.Earn(ctx, req)
 	if err != nil {

@@ -31,18 +31,17 @@ import (
 
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/kvx"
-	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
+	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/repository"
+	"github.com/gospacex/otelx/layer"
 )
 
 // stockLockTTL 预占互斥的持锁上限。
@@ -91,13 +90,14 @@ func NewStockService(
 // Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
 func (s *StockService) Repo() *repository.StockRepository { return s.repo }
 
-// begin 开一个 service 层 span（traceOn=false 时返回空收尾闭包）
-func (s *StockService) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !s.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "service", "stock", op)
-	return c, func() { span.End() }
+// begin 开 service 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不做 quiet 豁免：service 返回非 nil error 意味着这次业务操作没完成
+// （参数非法 / 写库失败 / 下游失败），都该在 Jaeger 上看得见 —— 与单体
+// 示例 s.end 的口径一致。预期内的业务拒绝由 handler 翻成响应体 Code，
+// 不进 error，因此不会把正常的「商品不存在」标成故障。
+func (s *StockService) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "stock", op, s.traceOn, nil)
 }
 
 // GetStock 查库存快照（cachex 优先，miss 回源 DB 并回填）
@@ -109,9 +109,9 @@ func (s *StockService) begin(ctx context.Context, op string) (context.Context, f
 // 各自推进，不一致即意味着某次事务只落了一半。只对账而不自动修正 ——
 // 修正需要锁 + 事务，读路径上做会把"查询"变成"写入"，让读请求也承担
 // 写热点；这里只留告警，由人工/对账任务处置。
-func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (*model.StockDetail, error) {
+func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (out *model.StockDetail, err error) {
 	ctx, end := s.begin(ctx, "GetStock")
-	defer end()
+	defer func() { end(err) }()
 
 	if q.ProductID <= 0 {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id required")
@@ -147,9 +147,9 @@ func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (*mo
 }
 
 // ListStocks 联表分页（不走缓存：批量读命中率低，缓存反而增加失效面）
-func (s *StockService) ListStocks(ctx context.Context, q model.ListStocksQuery) ([]model.StockDetail, error) {
+func (s *StockService) ListStocks(ctx context.Context, q model.ListStocksQuery) (out []model.StockDetail, err error) {
 	ctx, end := s.begin(ctx, "ListStocks")
-	defer end()
+	defer func() { end(err) }()
 	rows, err := s.repo.ListStocks(ctx, q)
 	if err != nil {
 		return nil, codes.Wrap(codes.CodeInternal, "list stocks failed", err)
@@ -158,9 +158,9 @@ func (s *StockService) ListStocks(ctx context.Context, q model.ListStocksQuery) 
 }
 
 // ReserveStock 预占：熔断计数 → 加锁 → 3 表事务 + outbox → 缓存失效
-func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (*model.ReserveResult, error) {
+func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (out *model.ReserveResult, err error) {
 	ctx, end := s.begin(ctx, "ReserveStock")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.ProductID <= 0 || cmd.Quantity <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id/quantity/order_no required")
@@ -177,8 +177,8 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 	}
 	defer unlock()
 
-	tp := s.traceparentOf(ctx)
-	out, err := s.repo.ReserveTx(ctx, repository.ReserveInput{
+	tp := traceparent.Of(ctx, s.traceOn)
+	rec, err := s.repo.ReserveTx(ctx, repository.ReserveInput{
 		OrderNo:   cmd.OrderNo,
 		ProductID: cmd.ProductID,
 		Quantity:  cmd.Quantity,
@@ -211,19 +211,19 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 	}
 	s.invalidate(ctx, cmd.ProductID)
 	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-		span.SetAttributes(attribute.Int64("stock.reservation_id", int64(out.ReservationID)))
+		span.SetAttributes(attribute.Int64("stock.reservation_id", int64(rec.ReservationID)))
 	}
 	return &model.ReserveResult{
-		ReservationID: out.ReservationID,
+		ReservationID: rec.ReservationID,
 		Reserved:      cmd.Quantity,
-		Available:     out.Available,
+		Available:     rec.Available,
 	}, nil
 }
 
 // ReleaseStock 释放预占（幂等：流水不存在按已释放处理）
-func (s *StockService) ReleaseStock(ctx context.Context, cmd model.ReleaseCmd) (*model.ReleaseResult, error) {
+func (s *StockService) ReleaseStock(ctx context.Context, cmd model.ReleaseCmd) (out *model.ReleaseResult, err error) {
 	ctx, end := s.begin(ctx, "ReleaseStock")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.ProductID <= 0 || cmd.Quantity <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id/quantity/order_no required")
@@ -241,9 +241,9 @@ func (s *StockService) ReleaseStock(ctx context.Context, cmd model.ReleaseCmd) (
 }
 
 // ConfirmStock 确认预占（真正出库：扣 total）
-func (s *StockService) ConfirmStock(ctx context.Context, cmd model.ConfirmCmd) (*model.ConfirmResult, error) {
+func (s *StockService) ConfirmStock(ctx context.Context, cmd model.ConfirmCmd) (out *model.ConfirmResult, err error) {
 	ctx, end := s.begin(ctx, "ConfirmStock")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.ProductID <= 0 || cmd.Quantity <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id/quantity/order_no required")
@@ -261,9 +261,9 @@ func (s *StockService) ConfirmStock(ctx context.Context, cmd model.ConfirmCmd) (
 }
 
 // AdjustStock 入库 / 盘点（2 表事务）
-func (s *StockService) AdjustStock(ctx context.Context, cmd model.AdjustCmd) (*model.AdjustResult, error) {
+func (s *StockService) AdjustStock(ctx context.Context, cmd model.AdjustCmd) (out *model.AdjustResult, err error) {
 	ctx, end := s.begin(ctx, "AdjustStock")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.OperatorID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "operator required")
@@ -285,9 +285,9 @@ func (s *StockService) AdjustStock(ctx context.Context, cmd model.AdjustCmd) (*m
 }
 
 // Report 3 表 JOIN 报表
-func (s *StockService) Report(ctx context.Context, q model.StockReportQuery) ([]model.ReportRow, error) {
+func (s *StockService) Report(ctx context.Context, q model.StockReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := s.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	rows, err := s.repo.Report(ctx, q)
 	if err != nil {
 		return nil, codes.Wrap(codes.CodeInternal, "report stocks failed", err)
@@ -403,17 +403,6 @@ func (s *StockService) invalidate(ctx context.Context, productID uint64) {
 	if err := s.cache.Delete(ctx, stockCacheKey(productID)); err != nil {
 		s.logger.WarnContext(ctx, "stock: cache invalidate failed", logx.Err(err))
 	}
-}
-
-// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
-// 仅当调用链开时经 otel 全局传播器注入；无活动 span 时为空串。
-func (s *StockService) traceparentOf(ctx context.Context) string {
-	if !s.traceOn {
-		return ""
-	}
-	carrier := propagation.MapCarrier(map[string]string{})
-	launchx.Inject(ctx, carrier)
-	return carrier.Get(events.TraceHeaderKey)
 }
 
 // evTraceID 事件体内嵌 trace_id（无活动 span 时为空）

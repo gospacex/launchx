@@ -27,9 +27,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/gospacex/launchx/examples/micro/pkg/outbox"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/model"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/otelx/layer"
 )
 
 // 积分域哨兵错误（service 层据此翻译成 5xxx 业务码）
@@ -78,16 +78,23 @@ func NewPointsRepository(db *gorm.DB, traceOn bool) *PointsRepository {
 // DB 暴露句柄（pkg/handlecheck 断言、装配期健康检查用）
 func (r *PointsRepository) DB() *gorm.DB { return r.db }
 
-// begin 开一个 repository 层 span。
+// begin 开 repository 层 span，返回「收 error 再收尾」的闭包。
 //
-// 返回 end 闭包而不是 span：traceOn=false 时返回空闭包，调用方一律
-// `defer end()`，不必在每个方法里写 if。
-func (r *PointsRepository) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !r.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "repository", "points", op)
-	return c, func() { span.End() }
+// traceOn=false 时返回空闭包，调用方一律 `defer func() { end(err) }()`，
+// 不必在每个方法里写 if。为什么闭包要收 error：span 句柄刻意不交给调用方
+// （本层因此零 otel 依赖），代价是调用方也标不了状态 —— 收 error 由闭包
+// 代标，失败才在 Jaeger 上可见（否则「SQL 报错」与「SQL 成功」同色）。
+//
+// quiet 规则：ErrNotFound 是正常 miss，不是故障 —— 与单体示例 recordError
+// 的同一条语义，命中即豁免错误标记，避免正常未命污染错误率。
+func (r *PointsRepository) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "repository", "points", op, r.traceOn, quietNotFound)
+}
+
+// quietNotFound 「记录不存在」不是故障。两种形态都认：本层已归一化出的
+// ErrNotFound，以及 dbx/gorm 直接抛出的 ErrRecordNotFound（未归一化路径）。
+func quietNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, gorm.ErrRecordNotFound)
 }
 
 // ---------- 单表 CRUD ----------
@@ -96,9 +103,9 @@ func (r *PointsRepository) begin(ctx context.Context, op string) (context.Contex
 //
 // 与事务内的幂等判定（ChangeTx 里的 hasLedgerTx）分工：这一条供事务之外的
 // 对账/补偿路径用（例如 MQ 重投时先探一次，避免为已知重复的请求开事务）。
-func (r *PointsRepository) HasLedger(ctx context.Context, orderNo string, typ int32) (bool, error) {
+func (r *PointsRepository) HasLedger(ctx context.Context, orderNo string, typ int32) (out bool, err error) {
 	ctx, end := r.begin(ctx, "HasLedger")
-	defer end()
+	defer func() { end(err) }()
 	var cnt int64
 	if err := r.db.WithContext(ctx).Model(&model.Ledger{}).
 		Where("order_no = ? AND type = ?", orderNo, typ).Count(&cnt).Error; err != nil {
@@ -120,11 +127,11 @@ func (r *PointsRepository) HasLedger(ctx context.Context, orderNo string, typ in
 // 能给出极值本身，给不出"取得该极值的那一行的其它列"—— 直接 MAX(amount) 拿到
 // 的是历史最大金额而不是最后一笔。这里用相关子查询把最大时间戳求出来做条件，
 // 在同一次聚合里把同行金额取出来，不为它再开一次往返。
-func (r *PointsRepository) GetAccount(ctx context.Context, userID uint64) (*model.AccountDetail, error) {
+func (r *PointsRepository) GetAccount(ctx context.Context, userID uint64) (out *model.AccountDetail, err error) {
 	ctx, end := r.begin(ctx, "GetAccount")
-	defer end()
+	defer func() { end(err) }()
 	var rows []model.AccountDetail
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
 		Table("point_accounts").
 		Select("point_accounts.user_id AS user_id, point_accounts.balance, "+
 			"point_accounts.total_earned, point_accounts.total_spent, "+
@@ -148,8 +155,8 @@ func (r *PointsRepository) GetAccount(ctx context.Context, userID uint64) (*mode
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("get account %d: %w", userID, ErrNotFound)
 	}
-	out := rows[0]
-	return &out, nil
+	out = &rows[0]
+	return out, nil
 }
 
 // ListLedgers 2 表 LEFT JOIN 分页：按用户查流水（id 倒序，最新在前），
@@ -161,9 +168,9 @@ func (r *PointsRepository) GetAccount(ctx context.Context, userID uint64) (*mode
 // 余额为什么要在流水页带出：流水本身只有 balance_after（那时点的值），
 // 回答不了"现在还剩多少"。不 JOIN 的话调用方要再调一次 GetAccount，
 // 而流水是"这一页里每笔都要配一个数"的场景，N+1 次往返不可接受。
-func (r *PointsRepository) ListLedgers(ctx context.Context, q model.ListLedgersQuery) ([]model.LedgerDetail, error) {
+func (r *PointsRepository) ListLedgers(ctx context.Context, q model.ListLedgersQuery) (out []model.LedgerDetail, err error) {
 	ctx, end := r.begin(ctx, "ListLedgers")
-	defer end()
+	defer func() { end(err) }()
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 20
@@ -198,11 +205,11 @@ func (r *PointsRepository) ListLedgers(ctx context.Context, q model.ListLedgersQ
 //
 // 账户首次入账即开户（upsert）：积分账户是"用到了才有"，独立开户接口
 // 会让调用方多一次往返，且失败时留下"有流水没账户"的脏数据。
-func (r *PointsRepository) ChangeTx(ctx context.Context, in ChangeInput) (*ChangeOutput, error) {
+func (r *PointsRepository) ChangeTx(ctx context.Context, in ChangeInput) (out *ChangeOutput, err error) {
 	ctx, end := r.begin(ctx, "ChangeTx")
-	defer end()
-	out := &ChangeOutput{}
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	defer func() { end(err) }()
+	out = &ChangeOutput{}
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		exists, err := hasLedgerTx(tx, in.OrderNo, in.Type)
 		if err != nil {
 			return err
@@ -288,9 +295,9 @@ func (r *PointsRepository) ChangeTx(ctx context.Context, in ChangeInput) (*Chang
 // 流水是 1:N，计数用 COUNT(DISTINCT) 抵消行放大；最近变动时间用
 // MAX(created_at)（MySQL 返回 time.Time，SQLite 返回字符串，故统一
 // 用 UNIX_TIMESTAMP 风格的秒值由 SQL 侧转换）。
-func (r *PointsRepository) Report(ctx context.Context, q model.PointsReportQuery) ([]model.ReportRow, error) {
+func (r *PointsRepository) Report(ctx context.Context, q model.PointsReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := r.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 50

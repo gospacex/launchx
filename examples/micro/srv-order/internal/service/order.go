@@ -33,18 +33,17 @@ import (
 
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/kvx"
-	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
+	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/repository"
+	"github.com/gospacex/otelx/layer"
 )
 
 // orderLockTTL 同用户下单互斥的持锁上限。
@@ -88,19 +87,20 @@ func NewOrderService(
 // Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
 func (s *OrderService) Repo() *repository.OrderRepository { return s.repo }
 
-// begin 开一个 service 层 span（traceOn=false 时返回空收尾闭包）
-func (s *OrderService) begin(ctx context.Context, op string) (context.Context, func()) {
-	if !s.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "service", "order", op)
-	return c, func() { span.End() }
+// begin 开 service 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不做 quiet 豁免：service 返回非 nil error 意味着这次业务操作没完成
+// （参数非法 / 写库失败 / 下游失败），都该在 Jaeger 上看得见 —— 与单体
+// 示例 s.end 的口径一致。预期内的业务拒绝由 handler 翻成响应体 Code，
+// 不进 error，因此不会把正常的「商品不存在」标成故障。
+func (s *OrderService) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "order", op, s.traceOn, nil)
 }
 
 // CreateOrder 下单：校验 → 加用户锁 → 3 表事务 → 计数
-func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd) (*model.CreateOrderResult, error) {
+func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd) (out *model.CreateOrderResult, err error) {
 	ctx, end := s.begin(ctx, "CreateOrder")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.UserID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "user required")
@@ -128,8 +128,8 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 	}
 	defer unlock()
 
-	tp := s.traceparentOf(ctx)
-	out, err := s.repo.CreateOrderTx(ctx, repository.CreateOrderInput{
+	tp := traceparent.Of(ctx, s.traceOn)
+	rec, err := s.repo.CreateOrderTx(ctx, repository.CreateOrderInput{
 		UserID:      cmd.UserID,
 		OrderNo:     orderNo,
 		TotalAmount: total,
@@ -160,14 +160,14 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 	}
 	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
 		span.SetAttributes(
-			attribute.Int64("order.id", int64(out.OrderID)),
-			attribute.String("order.no", out.OrderNo),
+			attribute.Int64("order.id", int64(rec.OrderID)),
+			attribute.String("order.no", rec.OrderNo),
 		)
 	}
 	s.bumpUserOrders(ctx, cmd.UserID)
 	return &model.CreateOrderResult{
-		OrderID:     out.OrderID,
-		OrderNo:     out.OrderNo,
+		OrderID:     rec.OrderID,
+		OrderNo:     rec.OrderNo,
 		TotalAmount: total,
 		Status:      model.StatusCreated,
 	}, nil
@@ -178,9 +178,9 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 // 缓存的是"已被用户看到过的订单结果"，语义上是可失效的派生状态（状态流转后
 // 由 Delete 显式失效），故走 cachex；限流计数那种需要原子自增的状态走 kvx。
 // 缓存读失败（含 key 不存在）一律按 miss 处理：缓存是加速路径，不是数据源。
-func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (*model.OrderWithItems, error) {
+func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out *model.OrderWithItems, err error) {
 	ctx, end := s.begin(ctx, "GetOrder")
-	defer end()
+	defer func() { end(err) }()
 
 	if q.UserID <= 0 {
 		return nil, codes.New(codes.CodeUnauthorized, "user required")
@@ -229,9 +229,9 @@ func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (*mo
 // 当前 RPC 面未开放该方法（kitex_gen 由 IDL 生成，本域不自行加方法），
 // 因此没有对应的 handler 入口；保留它是为了给 repository 的两表事务一个
 // 正确层级的调用点，而不是让状态流转散落到装配层去。
-func (s *OrderService) UpdateStatus(ctx context.Context, cmd model.UpdateStatusCmd) error {
+func (s *OrderService) UpdateStatus(ctx context.Context, cmd model.UpdateStatusCmd) (err error) {
 	ctx, end := s.begin(ctx, "UpdateStatus")
-	defer end()
+	defer func() { end(err) }()
 
 	if cmd.UserID <= 0 {
 		return codes.New(codes.CodeUnauthorized, "user required")
@@ -255,9 +255,9 @@ func (s *OrderService) UpdateStatus(ctx context.Context, cmd model.UpdateStatusC
 }
 
 // ListOrders 只读订单流水（对账数据源，不走缓存：流水要求实时）
-func (s *OrderService) ListOrders(ctx context.Context, q model.ListOrdersQuery) ([]model.OrderFlowRow, error) {
+func (s *OrderService) ListOrders(ctx context.Context, q model.ListOrdersQuery) (out []model.OrderFlowRow, err error) {
 	ctx, end := s.begin(ctx, "ListOrders")
-	defer end()
+	defer func() { end(err) }()
 	rows, err := s.repo.ListOrders(ctx, q)
 	if err != nil {
 		if errors.Is(err, repository.ErrBadDateRange) {
@@ -271,9 +271,9 @@ func (s *OrderService) ListOrders(ctx context.Context, q model.ListOrdersQuery) 
 }
 
 // Report 4 表 JOIN 报表
-func (s *OrderService) Report(ctx context.Context, q model.OrderReportQuery) ([]model.ReportRow, error) {
+func (s *OrderService) Report(ctx context.Context, q model.OrderReportQuery) (out []model.ReportRow, err error) {
 	ctx, end := s.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 	rows, err := s.repo.Report(ctx, q)
 	if err != nil {
 		if errors.Is(err, repository.ErrBadDateRange) {
@@ -359,17 +359,6 @@ func (s *OrderService) invalidate(ctx context.Context, userID, orderID uint64) {
 	if err := s.cache.Delete(ctx, orderCacheKey(userID, orderID)); err != nil {
 		s.logger.WarnContext(ctx, "order: cache invalidate failed", logx.Err(err))
 	}
-}
-
-// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
-// 仅当调用链开时经 otel 全局传播器注入；无活动 span 时为空串。
-func (s *OrderService) traceparentOf(ctx context.Context) string {
-	if !s.traceOn {
-		return ""
-	}
-	carrier := propagation.MapCarrier(map[string]string{})
-	launchx.Inject(ctx, carrier)
-	return carrier.Get(events.TraceHeaderKey)
 }
 
 // evTraceID 事件体内嵌 trace_id（无活动 span 时为空）

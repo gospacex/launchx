@@ -16,7 +16,14 @@ set -u
 GATEWAY="${GATEWAY:-http://127.0.0.1:8080}"
 USER_ID="${USER_ID:-1001}"
 PRODUCT_ID="${PRODUCT_ID:-1}"
+# 边界鉴权凭据：bff 是唯一验凭据的地方，网关只透传 Authorization 头。
+# 令牌由 bff 在启动时按 demo.auth_token 播种进缓存，故这里必须与那份配置一致。
+# 想验"没凭据会被挡"时显式置空：DEMO_TOKEN="" bash ...
+DEMO_TOKEN="${DEMO_TOKEN-demo-token}"
 CURL=(curl -s --noproxy '*' -m 15)
+if [ -n "$DEMO_TOKEN" ]; then
+  CURL+=(-H "Authorization: Bearer $DEMO_TOKEN")
+fi
 
 step() { printf '\n=== %s ===\n' "$1"; }
 

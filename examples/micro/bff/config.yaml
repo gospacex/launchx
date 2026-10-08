@@ -45,15 +45,80 @@ trace:
 logx:
   level: info
   otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
     enable_trace: true
-    exporter: otlp
-    endpoint: "127.0.0.1:4318"
+
+# 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+# HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流），
+# RPC 客户端/服务端中间件也按这一开关挂。**关掉（false 或不写）即不建 provider**，
+# meter 退回 noop：不产生指标、不留采集口，但 Instrument 调用点仍在（不会少埋点）。
+metrics:
+  enabled: true
+# ----- 鉴权（本档是 HTTP 边界，唯一验凭据的地方）-----
+# require=false 会让所有请求免鉴权放行：只在可信网络内部排障时临时使用，
+# 上线环境必须是 true。缺这一段时装配层按 **true** 处理（安全默认值）。
+auth:
+  require: true
+  ticket_ttl: 5m            # 签发给下游域服的身份票据有效期
+
+# demo 自身的业务参数（非地址类，但同样不写死在代码里）。
+demo:
+  # 演示用静态令牌（Authorization: Bearer <token>）。
+  # 生产里这活属于签发服务，含过期轮换与吊销；demo 在启动时把它播种进缓存，
+  # 让鉴权中间件的那次缓存查询真的有东西可查。
+  auth_token: "demo-token"
+  seed_user_id: 1001        # 该令牌绑定的用户 ID
 
 # 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决。
 # 本档刻意不设 strict：consul 不在时须带病运行（降级 Warn + 进程不退出），
 # 见 ACCEPTANCE §10 降级路径。
 
 xmiddleware:
+  # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
+  # 它不是组件：三项都只在客户端选项装配那一刻起作用，故配置面收在 rpcx、
+  # 由 mode 在装配期读进 App.RPCClientOptions 产出的选项里。**零值全关**，
+  # 不写这一段 = 产生的 client.Option 与引入治理之前逐字相同。
+  rpcx:
+    # 熔断：服务级（调用方/被调方）+ 实例级两道闸。阈值写出来是为了让当前
+    # 生效值可见（不写则用 kitex 缺省，同样是 0.5 / 200）。打开它**不改成功
+    # 路径**，作用是在持续故障时快速失败，而不是继续把请求打到坏实例上。
+    circuit_breaker:
+      enabled: true
+      error_rate: 0.5      # 触发熔断的错误率阈值，取值 (0,1]
+      min_sample: 200      # 触发熔断所需的最小样本数
+    # 重试：本档**故意不开**。这条链路上有非幂等写（下单 / 扣减 / 入账），
+    # 传输层超时重试会产生重复落库；且一旦网格侧也开了 HTTP 跳重试，
+    # 故障期双侧重试会互相放大（ACCEPTANCE §13.5 硬规则 1）。
+    # 开启前先确认两件事：max_attempts ≤ 5（kitex 越界即 panic，装配期已拦）、
+    # Istio VirtualService 的 retries 为空。
+    # 再看一眼预算：单次业务调用最坏耗时 ≈ (1 + max_attempts) × RPCTimeout
+    #（rpcx 缺省 3s），三试就是 9s —— 已盖过入口的 webx.timeout(5s)，
+    # 表现为引擎先 504、而重试还在后台跑。真开重试须同时收紧 max_duration_ms。
+    retry:
+      enabled: false
+      max_attempts: 2      # 不含首次调用
+      backoff_ms: 10       # 固定退避；0 = 不退避
+    # 负载均衡：闭集 weighted_random（缺省）/ weighted_round_robin /
+    # interleaved_weighted_round_robin。刻意**不给** consistent_hash ——
+    # 它需要业务侧的 key 函数，没有默认值，配了只会把请求全打到同一实例上。
+    # 不写这一项即用 kitex 缺省（weighted_random）。
+
+  # ----- cachex：令牌凭据存储 -----
+  # 为什么 bff 要有数据层：它是**边界**，验凭据需要一处进程外的凭据存储 ——
+  # 用本地 map 会让"一次签发要能被所有 bff 实例认"这件事不成立，多实例部署时
+  # 表现为"请求随机 401"（签发落在哪个实例上，哪个实例才认）。
+  # 业务数据仍然只走下游四个域服，这里存的不是业务数据。
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      demo-bff:
+        addr: "127.0.0.1:6379"
+        db: 2                # 与四个域服的 db 0 / db 1 分开：凭据被逐出 = 全员 401
+        pool_size: 30
+
 
   # ----- coordx：注册中心 -----
   # bff 的两个用途都落在这里：把自己注册进注册中心供 gateway 发现（由 launchx

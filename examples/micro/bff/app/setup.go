@@ -6,16 +6,22 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/cloudwego/kitex/client"
+	"github.com/gospacex/configx"
+	"github.com/gospacex/logx"
+	"github.com/gospacex/traceflag"
 	"github.com/gospacex/webx"
-	"go.opentelemetry.io/otel"
 
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/launchx/examples/micro/bff/internal/downstream"
 	"github.com/gospacex/launchx/examples/micro/bff/internal/handler"
+	"github.com/gospacex/launchx/examples/micro/pkg/auth"
 	orderrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order/order"
 	pointsrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/points/points"
 	productrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/product/product"
@@ -102,15 +108,20 @@ func Setup(a *launchx.App) error {
 		return errors.New("bff: points client type assertion failed")
 	}
 
-	// tracer 同样经装配层交接：bff 的 provider 产三类 span —— handler.*（HTTP 入口）、
-	// downstream.*（本档业务层）与 CLIENT span（rpcx 的 ClientSpanMiddleware 产出，
-	// 选项里已挂，见 rpcx/options.go）。后两者必须同出一个 provider，否则 CLIENT
-	// span 掉进全局 noop，Jaeger 上只见 bff 收了请求、见不到四个 srv 各自的跳。
-	// 未启用 telemetry 时 App.Tracer() 为 nil，回落到 otel 全局（no-op）：
-	// 埋点缺失可以降级，不能让聚合层起不来。
-	tp := otel.GetTracerProvider()
-	if tr := a.Tracer(); tr != nil {
-		tp = tr.TracerProvider()
+	// 不再从 App.Tracer() 手里接 provider 往分层里塞：全生态的 tracer 取法统一为
+	// 「向 otel 全局现取」（otelx/layer 就是这么做的）。全局 provider 由 launchx 的
+	// telemetry 步骤注册，分层只要跟着全局走就不会与 CLIENT span（rpcx 产出）分家。
+	cfg := a.Config()
+	logger := a.Logger()
+	traceOn := cfg.GetBool("trace.enabled")
+
+	// ---------- 鉴权：本档是 HTTP 边界，全链路唯一验凭据的地方 ----------
+	// 四个域服不再各验一次（只在内网侧校验透传下来的身份），见 pkg/auth 包注释。
+	//
+	// 装不上鉴权**不让服务起来**：一个没有鉴权的边界层， outbound 全通、
+	// inbound 全收，出事时没有任何一道闸 —— 那比"起不来"危险得多。
+	if err := installAuth(engine, a, cfg, logger, traceOn); err != nil {
+		return err
 	}
 
 	h := handler.New(
@@ -119,8 +130,8 @@ func Setup(a *launchx.App) error {
 			Stock:   stockCli,
 			Order:   orderCli,
 			Points:  pointsCli,
-		}, tp.Tracer("downstream")),
-		tp.Tracer("bff"),
+		}, traceOn),
+		traceOn,
 	)
 
 	engine.Engine.GET("/ping", h.Ping)
@@ -130,5 +141,73 @@ func Setup(a *launchx.App) error {
 	engine.Engine.GET("/points/:user_id", h.GetAccount)
 	// 复合编排：一次请求串起四个域服 —— 全链路验收就看这一条。
 	engine.Engine.POST("/order", h.PlaceOrder)
+	return nil
+}
+
+// authSkipPrefixes 免鉴权路径前缀。
+//
+// 只有两类：存活探针与 /ping。它们存在的意义就是"在依赖全挂时仍能回答"，
+// 要求凭据会让探针在凭据存储抖动的那一刻报失败 —— 于是编排系统会因为
+// "鉴权用的 redis 抖了一下"而重启一批健康的实例，把局部故障放大成全局。
+var authSkipPaths = map[string]bool{
+	"/ping":          true,
+	"/healthz/live":  true,
+	"/healthz/ready": true,
+}
+
+// installAuth 装配边界鉴权中间件。
+//
+// 三条路径分别对应三种失败姿态，刻意不合并：
+//   - 显式关了（auth.require=false）→ Warn 后放行：这是**运维决定**，留痕即可；
+//   - 缓存不可用（拿不到凭据存储）→ **报错不起**：边界层没有凭据就是没有边界，
+//     带病起来的后果是所有请求都能穿透，且看起来一切正常；
+//   - 未配凭据（demo.auth_token 为空）→ **报错不起**：中间件会挂上但永远 401，
+//     那比"起不来"更难查（链路、限流、日志全都正常，只有业务全挂）。
+func installAuth(engine *webx.App, a *launchx.App, cfg configx.Config, logger logx.Logger, traceOn bool) error {
+	if cfg.IsSet("auth.require") && !cfg.GetBool("auth.require") {
+		logger.Warn("bff: auth disabled by config, every request is accepted",
+			logx.String("hint", "auth.require=false exposes all four domains to anyone who can reach :8081"))
+		return nil
+	}
+
+	inst := a.Cache()[cfg.GetString("service.name")]
+	if inst == nil {
+		return errors.New("bff: cache component is unavailable, auth has nowhere to look up credentials (check xmiddleware.cachex)")
+	}
+	token := cfg.GetString("demo.auth_token")
+	if token == "" {
+		return errors.New("bff: demo.auth_token is empty, auth middleware would reject every request (set it or set auth.require=false)")
+	}
+
+	store := auth.NewTokenStore(inst)
+	// 播种演示令牌：生产里这活属于签发服务（含过期轮换与吊销），demo 在启动时
+	// 写一条，让"校验时那次缓存查询"真的有东西可查。
+	//
+	// 播种期间临时关掉 cachex 的埋点：这里没有请求上下文，留下的 SET span 会
+	// 成为一根孤儿单 span trace —— 正是 Jaeger 里最容易被读成"链路断了"的噪声。
+	// 关的是组件级开关，播完立刻还原为原值（不是写死 true，避免把"全局关埋点"
+	// 的部署悄悄打开）。
+	before := traceflag.EnabledFor("cachex")
+	traceflag.SetComponent("cachex", false)
+	err := store.GrantToken(context.Background(), token, cfg.GetInt64("demo.seed_user_id"), time.Hour)
+	traceflag.SetComponent("cachex", before)
+	if err != nil {
+		return fmt.Errorf("bff: seed demo token failed: %w", err)
+	}
+
+	if logger == nil {
+		logger = logx.GetGlobal()
+	}
+	engine.Engine.Use(auth.Middleware(auth.Config{
+		Verifier: store,
+		Logger:   logger,
+		TraceOn:  traceOn,
+		TTL:      cfg.GetDuration("auth.ticket_ttl"),
+		Skip:     func(path string) bool { return authSkipPaths[strings.TrimSuffix(path, "/")] },
+	}))
+	logger.Info("bff: auth middleware installed",
+		logx.String("scheme", "Bearer"),
+		logx.String("header", auth.AuthorizationHeader),
+		logx.String("ticket_ttl", cfg.GetDuration("auth.ticket_ttl").String()))
 	return nil
 }

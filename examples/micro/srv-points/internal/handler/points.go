@@ -21,9 +21,9 @@ import (
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	pointspb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/points"
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/service"
+	"github.com/gospacex/otelx/layer"
 )
 
 // PointsHandler 积分域协议适配器
@@ -37,20 +37,19 @@ func NewPointsHandler(svc *service.PointsService, traceOn bool) *PointsHandler {
 	return &PointsHandler{svc: svc, traceOn: traceOn}
 }
 
-// begin 开一个 handler 层 span（traceOn=false 时返回空收尾闭包）
-func (h *PointsHandler) begin(ctx context.Context, method string) (context.Context, func()) {
-	if !h.traceOn {
-		return ctx, func() {}
-	}
-	c, span := tracex.Start(ctx, "handler", "points", method)
-	return c, func() { span.End() }
+// begin 开 handler 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不设豁免：handler 返回非 nil error 是传输层失败（超时 / 不可达 / 内部
+// 错误，业务拒绝已翻进响应体 Code），标红正是运维要看的信号。
+func (h *PointsHandler) begin(ctx context.Context, method string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "handler", "points", method, h.traceOn, nil)
 }
 
 // GetAccount 查积分账户（point_accounts ⋈ point_ledgers 联表聚合）
-func (h *PointsHandler) GetAccount(ctx context.Context, req *pointspb.GetAccountReq) (*pointspb.GetAccountResp, error) {
+func (h *PointsHandler) GetAccount(ctx context.Context, req *pointspb.GetAccountReq) (out *pointspb.GetAccountResp, err error) {
 	resp := &pointspb.GetAccountResp{UserId: req.GetUserId()}
 	ctx, end := h.begin(ctx, "GetAccount")
-	defer end()
+	defer func() { end(err) }()
 
 	a, err := h.svc.GetAccount(ctx, model.GetAccountQuery{
 		UserID: uint64(req.GetUserId()),
@@ -69,12 +68,12 @@ func (h *PointsHandler) GetAccount(ctx context.Context, req *pointspb.GetAccount
 }
 
 // Earn 入账（两层幂等 + 用户锁 + 2 表事务 + outbox）
-func (h *PointsHandler) Earn(ctx context.Context, req *pointspb.EarnReq) (*pointspb.EarnResp, error) {
+func (h *PointsHandler) Earn(ctx context.Context, req *pointspb.EarnReq) (out *pointspb.EarnResp, err error) {
 	resp := &pointspb.EarnResp{UserId: req.GetUserId()}
 	ctx, end := h.begin(ctx, "Earn")
-	defer end()
+	defer func() { end(err) }()
 
-	out, err := h.svc.Earn(ctx, model.EarnCmd{
+	rec, err := h.svc.Earn(ctx, model.EarnCmd{
 		UserID:  uint64(req.GetUserId()),
 		OrderNo: req.GetOrderNo(),
 		Amount:  req.GetAmount(),
@@ -86,7 +85,7 @@ func (h *PointsHandler) Earn(ctx context.Context, req *pointspb.EarnReq) (*point
 		}
 		return resp, nil
 	}
-	resp.Balance, resp.LedgerId = out.BalanceAfter, int64(out.LedgerID)
+	resp.Balance, resp.LedgerId = rec.BalanceAfter, int64(rec.LedgerID)
 	if sErr := settle(&resp.Code, &resp.Message, nil); sErr != nil {
 		return nil, sErr
 	}
@@ -94,12 +93,12 @@ func (h *PointsHandler) Earn(ctx context.Context, req *pointspb.EarnReq) (*point
 }
 
 // Consume 消费（同上反向）
-func (h *PointsHandler) Consume(ctx context.Context, req *pointspb.ConsumeReq) (*pointspb.ConsumeResp, error) {
+func (h *PointsHandler) Consume(ctx context.Context, req *pointspb.ConsumeReq) (out *pointspb.ConsumeResp, err error) {
 	resp := &pointspb.ConsumeResp{UserId: req.GetUserId()}
 	ctx, end := h.begin(ctx, "Consume")
-	defer end()
+	defer func() { end(err) }()
 
-	out, err := h.svc.Consume(ctx, model.ConsumeCmd{
+	rec, err := h.svc.Consume(ctx, model.ConsumeCmd{
 		UserID:  uint64(req.GetUserId()),
 		OrderNo: req.GetOrderNo(),
 		Amount:  req.GetAmount(),
@@ -111,7 +110,7 @@ func (h *PointsHandler) Consume(ctx context.Context, req *pointspb.ConsumeReq) (
 		}
 		return resp, nil
 	}
-	resp.Balance, resp.LedgerId = out.BalanceAfter, int64(out.LedgerID)
+	resp.Balance, resp.LedgerId = rec.BalanceAfter, int64(rec.LedgerID)
 	if sErr := settle(&resp.Code, &resp.Message, nil); sErr != nil {
 		return nil, sErr
 	}
@@ -119,10 +118,10 @@ func (h *PointsHandler) Consume(ctx context.Context, req *pointspb.ConsumeReq) (
 }
 
 // ListLedgers 流水列表（point_ledgers ⋈ point_accounts，带出账户余额）
-func (h *PointsHandler) ListLedgers(ctx context.Context, req *pointspb.ListLedgersReq) (*pointspb.ListLedgersResp, error) {
+func (h *PointsHandler) ListLedgers(ctx context.Context, req *pointspb.ListLedgersReq) (out *pointspb.ListLedgersResp, err error) {
 	resp := &pointspb.ListLedgersResp{UserId: req.GetUserId()}
 	ctx, end := h.begin(ctx, "ListLedgers")
-	defer end()
+	defer func() { end(err) }()
 
 	rows, err := h.svc.ListLedgers(ctx, model.ListLedgersQuery{
 		UserID: uint64(req.GetUserId()),
@@ -142,10 +141,10 @@ func (h *PointsHandler) ListLedgers(ctx context.Context, req *pointspb.ListLedge
 }
 
 // Report 2 表 JOIN 报表
-func (h *PointsHandler) Report(ctx context.Context, req *pointspb.ReportReq) (*pointspb.ReportResp, error) {
+func (h *PointsHandler) Report(ctx context.Context, req *pointspb.ReportReq) (out *pointspb.ReportResp, err error) {
 	resp := &pointspb.ReportResp{}
 	ctx, end := h.begin(ctx, "Report")
-	defer end()
+	defer func() { end(err) }()
 
 	rows, err := h.svc.Report(ctx, model.PointsReportQuery{
 		UserID: uint64(req.GetUserId()),

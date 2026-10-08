@@ -16,7 +16,7 @@
 // 的自身耗时里，看不出是限流慢还是审计慢；嵌套后每段各自计时，慢的那一节
 // 在火焰图上一眼可见。
 //
-// 本包只认识 tracex 与 logx，不认识 kitex —— 路由表对传输协议无感知，
+// 本包只认识 layer 与 logx，不认识 kitex —— 路由表对传输协议无感知，
 // 换 HTTP（bff / gateway）或换 RPC 都不用改这里。
 package routing
 
@@ -29,7 +29,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/gospacex/launchx/examples/micro/pkg/tracex"
+	"github.com/gospacex/otelx/layer"
 )
 
 // Kind 路由语义：读还是写。
@@ -98,6 +98,62 @@ func (m rateLimitMW) Handle(ctx context.Context, c *Call) bool {
 // RateLimit 构造限流中间件。l 为 nil 时该中间件恒放行。
 func RateLimit(l Limiter) Middleware { return rateLimitMW{limiter: l} }
 
+// Authenticator 入口身份校验器。
+//
+// 放接口而不是直接依赖 pkg/auth：routing 是公共骨架，不该因为"鉴权用的是票据
+// 透传"就把那套方案绑死进所有使用方；换 mTLS、换服务账号都能直接替换实现。
+// 两个包因此互不 import —— 鉴权方案演进时路由层一行都不用动。
+type Authenticator interface {
+	// Authenticate 判定放行；返回身份的可读形式（进日志与 span 属性）与判定结果。
+	Authenticate(ctx context.Context) (identity string, ok bool)
+}
+
+// MiddlewareNameAuth 鉴权中间件的名字。
+//
+// 为什么要导出而不是各服自己写字面量：rpc 层要按 AbortedBy 决定回什么码
+// （鉴权拒 → 1004 未授权，限流拒 → 1005 限流）。两处用各自的字符串常量，
+// 改名的那天就会静默退化成"鉴权失败也回限流码"，客户端据此重试只会撞第二次墙。
+const MiddlewareNameAuth = "auth"
+
+// authMW 鉴权中间件
+type authMW struct {
+	auth   Authenticator
+	logger logx.Logger
+}
+
+// Name 中间件名
+func (m authMW) Name() string { return MiddlewareNameAuth }
+
+// Handle 身份校验。Authenticator 为 nil（鉴权未启用）时恒放行 —— 见 Authenticate 注释。
+func (m authMW) Handle(ctx context.Context, c *Call) bool {
+	if m.auth == nil {
+		return true
+	}
+	identity, ok := m.auth.Authenticate(ctx)
+	if !ok {
+		if m.logger != nil {
+			m.logger.WarnContext(ctx, "request rejected by auth",
+				logx.String("method", c.Method),
+				logx.String("kind", c.Kind.String()),
+				logx.String("trace_id", c.TraceID))
+		}
+		return false
+	}
+	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+		span.SetAttributes(attribute.String("auth.identity", identity))
+	}
+	return true
+}
+
+// Authenticate 构造鉴权中间件。
+//
+// a 为 nil 时恒放行：鉴权是**部署选择**（内网可信环境下可以不启用），
+// 缺了它不该让服务起不来。但"不启用"必须是显式配置的结果，装配期要留 Warn，
+// 不能是"忘了配就静默裸奔"。
+func Authenticate(a Authenticator, logger logx.Logger) Middleware {
+	return authMW{auth: a, logger: logger}
+}
+
 // auditMW 审计中间件：把路由语义写进 span 属性，并落一条入口访问日志。
 //
 // 恒放行（它是观察型中间件，不是闸门）。放在链首：即使被后面的限流拒了，
@@ -150,7 +206,7 @@ type Router struct {
 
 // NewRouter 构造路由表并登记初始路由。
 //
-// entity 进 span 名的第二段（route.product.CreateProduct），与 tracex 的
+// entity 进 span 名的第二段（route.product.CreateProduct），与 layer 的
 // "<layer>.<entity>.<op>" 约定一致，四服在 Jaeger 上可按 entity 筛。
 func NewRouter(entity string, traceOn bool, logger logx.Logger, routes ...Route) *Router {
 	r := &Router{entity: entity, traceOn: traceOn, logger: logger, routes: make(map[string]Route, len(routes))}
@@ -230,7 +286,7 @@ func (r *Router) Enter(ctx context.Context, method string, subject int64) *Visit
 
 	v := &Visit{Ctx: ctx, Allowed: true}
 	if r.traceOn {
-		spanCtx, span := tracex.Start(ctx, "route", r.entity, method)
+		spanCtx, span := layer.Start(ctx, "route", r.entity, method)
 		span.SetAttributes(
 			attribute.String("routing.method", method),
 			attribute.String("routing.kind", rt.Kind.String()),
@@ -246,7 +302,7 @@ func (r *Router) Enter(ctx context.Context, method string, subject int64) *Visit
 			continue
 		}
 		if r.traceOn {
-			mwCtx, mwSpan := tracex.Start(cur, "middleware", r.entity, mw.Name())
+			mwCtx, mwSpan := layer.Start(cur, "middleware", r.entity, mw.Name())
 			cur = mwCtx
 			span := mwSpan // 闭包捕获局部变量：直接捕获循环变量会关错 span
 			v.ends = append(v.ends, func() { span.End() })
