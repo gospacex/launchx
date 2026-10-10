@@ -1,4 +1,23 @@
 -- ============================================================
+
+-- ---------------------------- 版本 ----------------------------
+-- SCHEMA_VERSION 每次改表结构都必须 +1，并且**只增不改**：
+-- DDL 一旦落地就可能被别的环境先执行过，改历史脚本等于让两个环境的同一个
+-- 版本号指向两份不同的结构 —— 那种不一致只在出事那天才被发现。
+--
+-- 本脚本整体幂等（CREATE TABLE IF NOT EXISTS + INSERT IGNORE），可以重复跑；
+-- 每跑一次会在各自库的 schema_migrations 里留一行，用来回答
+-- 「这个环境现在到底跑到哪一版了」。
+--
+-- 查版本：
+--   for db in product_db order_db stock_db points_db; do
+--     docker exec mysql mysql -uroot -prootpass -N -e \
+--       "SELECT '$db', MAX(version) FROM $db.schema_migrations"
+--   done
+--
+-- 一域一库 ⇒ 一库一份版本账：**跨域不共用一张 schema_migrations**。
+-- 共用等于把「商品域加了个字段」和「订单域改了个索引」记在同一条时间线上，
+-- 回滚时无法只回一个域。
 -- mall 示例 · 四域私有库建表脚本
 --
 -- 纪律：一域一库（product_db / order_db / stock_db / points_db），
@@ -28,6 +47,13 @@ FLUSH PRIVILEGES;
 -- ---------------------------- 商品域 ----------------------------
 CREATE DATABASE IF NOT EXISTS product_db DEFAULT CHARSET utf8mb4;
 USE product_db;
+
+-- 版本账：本库自己的迁移记录（一域一库 ⇒ 一库一份，不跨域共用）
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    VARCHAR(64) NOT NULL PRIMARY KEY,
+  applied_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本库已执行的建表脚本版本';
+INSERT IGNORE INTO schema_migrations (version) VALUES ('2026.10.07-1');
 
 CREATE TABLE IF NOT EXISTS categories (
   id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -92,6 +118,13 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE DATABASE IF NOT EXISTS order_db DEFAULT CHARSET utf8mb4;
 USE order_db;
 
+-- 版本账：本库自己的迁移记录（一域一库 ⇒ 一库一份，不跨域共用）
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    VARCHAR(64) NOT NULL PRIMARY KEY,
+  applied_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本库已执行的建表脚本版本';
+INSERT IGNORE INTO schema_migrations (version) VALUES ('2026.10.07-1');
+
 CREATE TABLE IF NOT EXISTS orders (
   id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   user_id      BIGINT UNSIGNED NOT NULL,
@@ -155,6 +188,13 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE DATABASE IF NOT EXISTS stock_db DEFAULT CHARSET utf8mb4;
 USE stock_db;
 
+-- 版本账：本库自己的迁移记录（一域一库 ⇒ 一库一份，不跨域共用）
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    VARCHAR(64) NOT NULL PRIMARY KEY,
+  applied_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本库已执行的建表脚本版本';
+INSERT IGNORE INTO schema_migrations (version) VALUES ('2026.10.07-1');
+
 CREATE TABLE IF NOT EXISTS stocks (
   id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   product_id BIGINT UNSIGNED NOT NULL,
@@ -208,6 +248,13 @@ CREATE TABLE IF NOT EXISTS outbox (
 -- ---------------------------- 积分域 ----------------------------
 CREATE DATABASE IF NOT EXISTS points_db DEFAULT CHARSET utf8mb4;
 USE points_db;
+
+-- 版本账：本库自己的迁移记录（一域一库 ⇒ 一库一份，不跨域共用）
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    VARCHAR(64) NOT NULL PRIMARY KEY,
+  applied_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本库已执行的建表脚本版本';
+INSERT IGNORE INTO schema_migrations (version) VALUES ('2026.10.07-1');
 
 CREATE TABLE IF NOT EXISTS point_accounts (
   id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

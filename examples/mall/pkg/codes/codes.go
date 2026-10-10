@@ -14,6 +14,8 @@
 // 否则「下游挂了」会被误报成「库存不足」，运维按错误码排查会对不上账。
 package codes
 
+import "errors"
+
 // Code 统一响应码结构（RPC 响应体的通用头部字段）
 type Code struct {
 	Code    int64  `json:"code"`
@@ -80,4 +82,58 @@ func OK() Code {
 // Fail 返回指定错误码，message 为空时不给调用方细节（避免把内部错误外泄）
 func Fail(code int64, message string) Code {
 	return Code{Code: code, Message: message}
+}
+
+// Error 业务错误：分层之间用 error 向上传递，由最外层（handler）统一翻译成
+// 响应体的 Code/Message。
+//
+// 为什么 service 层要返回 error 而不是自己写 resp.Code：分层链要求
+// service 不认识 pb（否则 pb 改动会顺着 import 渗进业务规则），而"业务上
+// 拒绝"又必须带码上浮。用 error 承载码值，handler 一次翻译，两层都干净。
+//
+// 与传输错误的分工：本类型 = 业务判定失败（库存不足、订单不存在…），
+// 走响应体 Code；非本类型的 error = 传输/内部失败，由 kitex 错误体表达，
+// 不翻译成业务码（否则"下游挂了"会被误报成"库存不足"）。
+type Error struct {
+	Code    int64
+	Message string
+	Cause   error
+}
+
+// Error 实现 error 接口
+func (e *Error) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause != nil {
+		return e.Message + ": " + e.Cause.Error()
+	}
+	return e.Message
+}
+
+// Unwrap 暴露根因，便于 errors.Is / errors.As 穿透到驱动错误
+func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// New 构造业务错误
+func New(code int64, message string) *Error {
+	return &Error{Code: code, Message: message}
+}
+
+// Wrap 构造带根因的业务错误（内部错误码用得多：日志要留因，响应不带因）
+func Wrap(code int64, message string, cause error) *Error {
+	return &Error{Code: code, Message: message, Cause: cause}
+}
+
+// As 从任意 error 里取出业务错误（等价于 errors.As 的便捷封装）
+func As(err error) (*Error, bool) {
+	var be *Error
+	if errors.As(err, &be) {
+		return be, true
+	}
+	return nil, false
 }

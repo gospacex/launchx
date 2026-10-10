@@ -1,0 +1,71 @@
+# ============================================================
+# mall 示例 · 网关（gateway 档）配置
+#
+# 链路起点：外部 HTTP 流量从这里进来 → /api/* 转给 srv-bff →
+# bff 经 kitex 调四个域服（srv-product / srv-order / srv-stock / srv-points）。
+#
+# 纪律：端口 / 路由表 / 上游兜底地址一律来自本文件，Go 代码不出现硬编码地址。
+# 本档不注册自身（网关注册只会让注册中心多一批无人调用的条目）：
+# coordx 段只用于**发现**。
+# ============================================================
+
+service:
+  name: srv-gateway               # 服务名 = Jaeger 的 service
+  mode: gateway                   # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:9200"          # HTTP 监听地址（mall 端口段 92xx）
+  upstream:
+    # 注册中心拿不到实例时的直连兜底目标：键名 service.upstream.<被调服务名>
+    # 与 launchx 内部读兜底目标的键一致（internal/mode/webx.go）。
+    # bff 在注册中心里的注册名是 srv-bff，故此处键用 srv-bff。
+    srv-bff: "127.0.0.1:9201"
+
+webx:
+  addr: "127.0.0.1:9200"
+  timeout: 5s
+  rate_limit_rps: 100
+  rate_limit_burst: 200
+  cors_origins: []
+  health_prefix: /healthz
+
+# 路由表：prefix 命中即转给 upstream；strip=true 表示转发前剥掉 prefix
+# （/api/order/1001 → 上游 /order/1001）。span 名为 gateway.proxy.<name>。
+gateway:
+  routes:
+    - prefix: /api
+      upstream: srv-bff
+      strip: true
+      name: mall                  # 决定 span 名 gateway.proxy.mall
+
+# 调用链：全局闸 + 组件级开关。trace.on.registry 只裁决入链，不裁决构造。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    registry: true
+
+logx:
+  level: info
+  otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
+    enable_trace: true
+# 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+# HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流），
+# RPC 客户端/服务端中间件也按这一开关挂。**关掉（false 或不写）即不建 provider**，
+# meter 退回 noop：不产生指标、不留采集口，但 Instrument 调用点仍在（不会少埋点）。
+metrics:
+  enabled: true
+
+# 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决。
+# 本档刻意不设 strict：consul 不在时须带病运行（降级 Warn + 进程不退出）。
+
+xmiddleware:
+
+  # ----- coordx：注册中心（本档只用来发现上游，不注册自身）-----
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true
+
+  # gateway 不建数据层、不接 MQ：无 sqlx / cachex / mqx / kvx / lockx 段。

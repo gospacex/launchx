@@ -1,5 +1,11 @@
 // Package service srv-points 业务编排层（积分是"钱"，幂等优先）。
 //
+// 在分层链上的位置：handler → **service** → repository → model。
+//
+// 边界纪律：本层**不 import pb、不 import kitex**。出入参一律走 model 的
+// 领域 DTO（*Cmd / *Query / *Result），pb 与领域模型之间的转换归 handler。
+// 否则 pb 加一个字段就会顺着 import 渗进业务规则，协议演进与业务演进被绑死。
+//
 // 两层幂等的取舍（本域最核心的设计）：
 //  1. 数据库唯一键 uk_order_no_type（point_ledgers）—— **事实来源**。
 //     事务内先查同键流水，命中即返回 dup；并发下两个请求同时通过检查时，
@@ -12,8 +18,12 @@
 // 绝不作为"允许写入"的依据；反过来第 1 层在每次写前都要查库，
 // 高并发下多一次往返，故两层并存而非二选一。
 //
+// 业务失败用 codes.Error 向上抛（带码），由 handler 统一翻译成响应体
+// Code/Message；本层自己不认识响应体长什么样。
+//
 // 句柄来源纪律：本层不 import gorm/redis/kafka，也不用全局单例 ——
-// DB / Cache / KV / Lock / MQ 全部由 app.Setup 从 launchx 的 App 句柄注入。
+// DB / Cache / KV / Lock / MQ 全部经 repository 与构造参数注入，
+// 换形态（srv → monolith）与换驱动都不改业务代码。
 package service
 
 import (
@@ -28,18 +38,22 @@ import (
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/mall/pkg/codes"
 	"github.com/gospacex/launchx/examples/mall/pkg/events"
-	"github.com/gospacex/launchx/examples/mall/pkg/tracex"
+	"github.com/gospacex/launchx/examples/mall/srv-points/internal/model"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/repository"
-
-	pointspb "github.com/gospacex/launchx/examples/mall/pkg/kitex_gen/points"
+	"github.com/gospacex/otelx/layer"
 )
 
-// pointsLockTTL 入账/消费互斥的持锁上限（与 lockx 配置的 10s 形成双保险）
+// pointsLockTTL 入账/消费互斥的持锁上限。
+//
+// 取 5s（远大于单事务耗时）而非配置化：这是"防并发改余额互相覆盖"的上限，
+// 不是地址、也不是业务阈值。与 lockx 配置里的 10s TTL 形成双保险 ——
+// 进程在解锁前崩溃时，锁也会在 TTL 内自动过期，不会永久锁死该用户。
 const pointsLockTTL = 5 * time.Second
 
 // accountCacheTTL 账户缓存时长（入账/消费后 Delete 失效）
@@ -80,39 +94,47 @@ func NewPointsService(
 	return &PointsService{repo: repo, cache: cache, kv: kv, lock: lock, traceOn: traceOn, logger: logger}
 }
 
-// Repo 暴露仓储（组装期健康检查 / 对账用）
+// Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
 func (s *PointsService) Repo() *repository.PointsRepository { return s.repo }
 
+// begin 开 service 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不做 quiet 豁免：service 返回非 nil error 意味着这次业务操作没完成
+// （参数非法 / 写库失败 / 下游失败），都该在 Jaeger 上看得见 —— 与单体
+// 示例 s.end 的口径一致。预期内的业务拒绝由 handler 翻成响应体 Code，
+// 不进 error，因此不会把正常的「商品不存在」标成故障。
+func (s *PointsService) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "points", op, s.traceOn, nil)
+}
+
 // GetAccount 查账户（cachex 优先，miss 回源 DB 并回填）
-func (s *PointsService) GetAccount(ctx context.Context, req *pointspb.GetAccountReq) (*pointspb.GetAccountResp, error) {
-	resp := &pointspb.GetAccountResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 {
-		c := codes.Fail(codes.CodeUnauthorized, "user required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+//
+// 回源走的是 point_accounts ⋈ point_ledgers 的联表聚合投影，缓存里存的
+// 也就是这份投影 —— 缓存值与回源值必须是同一个结构，否则"命中缓存就没有
+// 流水笔数"这种半截响应会反复出现。
+func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery) (out *model.AccountDetail, err error) {
+	ctx, end := s.begin(ctx, "GetAccount")
+	defer func() { end(err) }()
+
+	if q.UserID <= 0 {
+		return nil, codes.New(codes.CodeUnauthorized, "user required")
 	}
-	key := accountCacheKey(req.GetUserId())
+	key := accountCacheKey(q.UserID)
 	if s.cache != nil {
 		if cached, err := s.cache.Get(ctx, key); err == nil && cached != "" {
-			var a repository.Account
+			var a model.AccountDetail
 			if json.Unmarshal([]byte(cached), &a) == nil {
-				resp.Account = toPbAccount(&a)
-				resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-				return resp, nil
+				if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+					span.SetAttributes(attribute.Bool("cache.hit", true))
+				}
+				return &a, nil
 			}
 			s.logger.WarnContext(ctx, "points cache decode failed, fallback to db", logx.String("key", key))
 		}
 	}
-	a, err := s.repo.GetAccount(ctx, uint64(req.GetUserId()))
+	a, err := s.repo.GetAccount(ctx, q.UserID)
 	if err != nil {
-		if errors.Is(err, repository.ErrAccountNotFound) {
-			c := codes.Fail(codes.CodePointsAccountNF, "points account not found")
-			resp.Code, resp.Message = c.Code, c.Message
-			return resp, nil
-		}
-		c := codes.Fail(codes.CodeInternal, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		return nil, s.mapRepoErr(ctx, err)
 	}
 	if s.cache != nil {
 		if b, mErr := json.Marshal(a); mErr == nil {
@@ -121,96 +143,59 @@ func (s *PointsService) GetAccount(ctx context.Context, req *pointspb.GetAccount
 			}
 		}
 	}
-	resp.Account = toPbAccount(a)
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp, nil
+	return a, nil
 }
 
 // Earn 入账：幂等键 → 用户锁 → 2 表事务 + outbox → 缓存失效
-func (s *PointsService) Earn(ctx context.Context, req *pointspb.EarnReq) (*pointspb.EarnResp, error) {
-	resp := &pointspb.EarnResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 || req.GetAmount() <= 0 || req.GetOrderNo() == "" {
-		c := codes.Fail(codes.CodePointsAmountInvalid, "user_id/amount/order_no invalid")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+func (s *PointsService) Earn(ctx context.Context, cmd model.EarnCmd) (out *model.ChangeResult, err error) {
+	ctx, end := s.begin(ctx, "Earn")
+	defer func() { end(err) }()
+
+	if cmd.UserID <= 0 || cmd.Amount <= 0 || cmd.OrderNo == "" {
+		return nil, codes.New(codes.CodePointsAmountInvalid, "user_id/amount/order_no invalid")
 	}
-	balance, ledgerID, c := s.apply(ctx, req.GetUserId(), req.GetOrderNo(), repository.TypeEarn, req.GetAmount(), req.GetRemark())
-	resp.Balance, resp.LedgerId = balance, ledgerID
-	resp.Code, resp.Message = c.Code, c.Message
-	return resp, nil
+	return s.apply(ctx, cmd.UserID, cmd.OrderNo, model.TypeEarn, cmd.Amount, cmd.Remark)
 }
 
 // Consume 消费：幂等键 → 用户锁 → 2 表事务 + outbox → 缓存失效
-func (s *PointsService) Consume(ctx context.Context, req *pointspb.ConsumeReq) (*pointspb.ConsumeResp, error) {
-	resp := &pointspb.ConsumeResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 || req.GetAmount() <= 0 || req.GetOrderNo() == "" {
-		c := codes.Fail(codes.CodePointsAmountInvalid, "user_id/amount/order_no invalid")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+func (s *PointsService) Consume(ctx context.Context, cmd model.ConsumeCmd) (out *model.ChangeResult, err error) {
+	ctx, end := s.begin(ctx, "Consume")
+	defer func() { end(err) }()
+
+	if cmd.UserID <= 0 || cmd.Amount <= 0 || cmd.OrderNo == "" {
+		return nil, codes.New(codes.CodePointsAmountInvalid, "user_id/amount/order_no invalid")
 	}
-	balance, ledgerID, c := s.apply(ctx, req.GetUserId(), req.GetOrderNo(), repository.TypeConsume, req.GetAmount(), req.GetRemark())
-	resp.Balance, resp.LedgerId = balance, ledgerID
-	resp.Code, resp.Message = c.Code, c.Message
-	return resp, nil
+	return s.apply(ctx, cmd.UserID, cmd.OrderNo, model.TypeConsume, cmd.Amount, cmd.Remark)
 }
 
-// ListLedgers 单表分页流水（不走缓存：流水要求实时，缓存只会造成对账偏差）
-func (s *PointsService) ListLedgers(ctx context.Context, req *pointspb.ListLedgersReq) (*pointspb.ListLedgersResp, error) {
-	resp := &pointspb.ListLedgersResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 {
-		c := codes.Fail(codes.CodeUnauthorized, "user required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+// ListLedgers 流水列表（point_ledgers ⋈ point_accounts，带出账户余额）
+//
+// 不走缓存：流水要求实时，缓存只会造成对账偏差 —— 用户刚消费完就来看流水，
+// 少一条比慢一点严重得多。
+func (s *PointsService) ListLedgers(ctx context.Context, q model.ListLedgersQuery) (out []model.LedgerDetail, err error) {
+	ctx, end := s.begin(ctx, "ListLedgers")
+	defer func() { end(err) }()
+
+	if q.UserID <= 0 {
+		return nil, codes.New(codes.CodeUnauthorized, "user required")
 	}
-	rows, err := s.repo.ListLedgers(ctx, uint64(req.GetUserId()), int(req.GetLimit()))
+	rows, err := s.repo.ListLedgers(ctx, q)
 	if err != nil {
-		c := codes.Fail(codes.CodeInternal, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		return nil, codes.Wrap(codes.CodeInternal, "list points ledgers failed", err)
 	}
-	out := make([]*pointspb.PointLedger, 0, len(rows))
-	for i := range rows {
-		out = append(out, &pointspb.PointLedger{
-			Id:           int64(rows[i].ID),
-			UserId:       int64(rows[i].UserID),
-			OrderNo:      rows[i].OrderNo,
-			Type:         rows[i].Type,
-			Amount:       rows[i].Amount,
-			BalanceAfter: rows[i].BalanceAfter,
-			CreatedAt:    rows[i].CreatedAt.Unix(),
-		})
-	}
-	resp.Ledgers = out
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp, nil
+	return rows, nil
 }
 
 // Report 2 表 JOIN 报表
-func (s *PointsService) Report(ctx context.Context, req *pointspb.ReportReq) (*pointspb.ReportResp, error) {
-	resp := &pointspb.ReportResp{}
-	rows, err := s.repo.Report(ctx, uint64(req.GetUserId()), 0)
+func (s *PointsService) Report(ctx context.Context, q model.PointsReportQuery) (out []model.ReportRow, err error) {
+	ctx, end := s.begin(ctx, "Report")
+	defer func() { end(err) }()
+
+	rows, err := s.repo.Report(ctx, q)
 	if err != nil {
-		c := codes.Fail(codes.CodeInternal, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		return nil, codes.Wrap(codes.CodeInternal, "report points failed", err)
 	}
-	pbRows := make([]*pointspb.ReportRow, 0, len(rows))
-	for i := range rows {
-		row := &pointspb.ReportRow{
-			UserId:      rows[i].UserID,
-			Balance:     rows[i].Balance,
-			TotalEarned: rows[i].TotalEarned,
-			TotalSpent:  rows[i].TotalSpent,
-			LedgerCount: rows[i].LedgerCount,
-		}
-		if rows[i].LastChangeAt != nil {
-			row.LastChangeAt = rows[i].LastChangeAt.Unix()
-		}
-		pbRows = append(pbRows, row)
-	}
-	resp.Rows = pbRows
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp, nil
+	return rows, nil
 }
 
 // ---- 内部 ----
@@ -219,32 +204,30 @@ func (s *PointsService) Report(ctx context.Context, req *pointspb.ReportReq) (*p
 //
 // 抽成一个函数而不是两套复制粘贴：两条路径的差别只有 type，
 // 复制一份的代价是"将来只改一边"（比如给消费加了风控却漏了入账）。
-// 返回 (余额, 流水号, 业务码)，由 Earn/Consume 各自回填响应体。
-func (s *PointsService) apply(ctx context.Context, userID int64, orderNo string,
-	typ int32, amount int64, remark string) (int64, int64, codes.Code) {
+func (s *PointsService) apply(ctx context.Context, userID uint64, orderNo string,
+	typ int32, amount int64, remark string) (*model.ChangeResult, error) {
 
 	// 第一层幂等（kvx）：挡在加锁之前，命中即返回，且**不再查库**
 	if s.idempotentHit(ctx, orderNo, typ) {
-		c := dupCode()
-		return 0, 0, c
+		return nil, codes.New(codes.CodePointsDuplicated, "duplicated points change, ignored")
 	}
 
 	unlock, deny := s.withUserLock(ctx, userID)
 	if deny != nil {
-		return 0, 0, *deny
+		return nil, deny
 	}
 	defer unlock()
 
 	tp := s.traceparentOf(ctx)
 	out, err := s.repo.ChangeTx(ctx, repository.ChangeInput{
-		UserID:  uint64(userID),
+		UserID:  userID,
 		OrderNo: orderNo,
 		Type:    typ,
 		Amount:  amount,
 		Remark:  remark,
 		OutboxFill: func(ledgerID uint64, balanceAfter int64) (payload, traceparent string) {
 			ev := events.PointsChanged{
-				UserID:     userID,
+				UserID:     int64(userID),
 				OrderNo:    orderNo,
 				Type:       typ,
 				Amount:     amount,
@@ -255,6 +238,7 @@ func (s *PointsService) apply(ctx context.Context, userID int64, orderNo string,
 			}
 			b, mErr := events.Marshal(ev)
 			if mErr != nil {
+				// 序列化失败不阻断记账：空 payload 时 Runner 直接放弃该行
 				s.logger.WarnContext(ctx, "points event marshal failed", logx.Err(mErr))
 				return "", tp
 			}
@@ -262,26 +246,23 @@ func (s *PointsService) apply(ctx context.Context, userID int64, orderNo string,
 		},
 	})
 	if err != nil {
-		s.logger.WarnContext(ctx, "points change tx failed", logx.Err(err))
-		code, msg := s.mapRepoErr(err)
-		return 0, 0, codes.Fail(code, msg)
+		return nil, s.mapRepoErr(ctx, err)
 	}
 	// 成功后才写幂等键：失败路径不写，否则一次失败会把后续重试全挡掉
 	s.markIdempotent(ctx, orderNo, typ)
 	s.invalidate(ctx, userID)
-	return out.BalanceAfter, int64(out.LedgerID), codes.OK()
-}
-
-func dupCode() codes.Code {
-	return codes.Fail(codes.CodePointsDuplicated, "duplicated points change, ignored")
+	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+		span.SetAttributes(attribute.Int64("points.ledger_id", int64(out.LedgerID)))
+	}
+	return &model.ChangeResult{LedgerID: out.LedgerID, BalanceAfter: out.BalanceAfter}, nil
 }
 
 // withUserLock 取用户维度互斥锁，返回解锁闭包。
 //
 // 锁器为 nil（组件未装配 / 构造降级）时**显式 fail-open 并留 Warn**：
 // 后果是"同一用户并发入账/消费可能出现余额竞态"，必须在日志里说清 ——
-// 积分是钱，静默降级的事后追责无从下手。
-func (s *PointsService) withUserLock(ctx context.Context, userID int64) (func(), *codes.Code) {
+// 积分是钱，静默降级的事后追责无从下手。返回非 nil error 表示拒绝本次请求。
+func (s *PointsService) withUserLock(ctx context.Context, userID uint64) (func(), *codes.Error) {
 	noop := func() {}
 	if s.lock == nil {
 		s.logger.WarnContext(ctx, "points: locker unavailable, change runs without mutual exclusion",
@@ -292,8 +273,8 @@ func (s *PointsService) withUserLock(ctx context.Context, userID int64) (func(),
 	}
 	lk, err := s.lock.Lock(ctx, fmt.Sprintf("points:change:user:%d", userID), lockx.WithTTL(pointsLockTTL))
 	if err != nil {
-		c := codes.Fail(codes.CodeInternal, "concurrent points change in progress, retry later")
-		return noop, &c
+		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试
+		return noop, codes.Wrap(codes.CodeInternal, "concurrent points change in progress, retry later", err)
 	}
 	return func() {
 		// 解锁必须用请求 ctx：传 Background 会让 release span 失去父节点，
@@ -304,21 +285,21 @@ func (s *PointsService) withUserLock(ctx context.Context, userID int64) (func(),
 	}, nil
 }
 
-// mapRepoErr 把持久层哨兵错误翻译成业务码（集中一处，避免各路径口径不一）
-func (s *PointsService) mapRepoErr(err error) (int64, string) {
+// mapRepoErr 把持久层哨兵错误翻译成业务码并上抛。
+//
+// 翻译集中一处是刻意的：5xxx 各码的语义差异（没开户 vs 不够扣 vs 重复记账）
+// 一旦散落到各个方法里，必然出现"某条路径把 5001 报成 5002"。
+func (s *PointsService) mapRepoErr(ctx context.Context, err error) error {
 	switch {
 	case errors.Is(err, repository.ErrDuplicated):
-		c := dupCode()
-		return c.Code, c.Message
-	case errors.Is(err, repository.ErrAccountNotFound):
-		c := codes.Fail(codes.CodePointsAccountNF, "points account not found")
-		return c.Code, c.Message
+		return codes.Wrap(codes.CodePointsDuplicated, "duplicated points change, ignored", err)
+	case errors.Is(err, repository.ErrNotFound):
+		return codes.Wrap(codes.CodePointsAccountNF, "points account not found", err)
 	case errors.Is(err, repository.ErrInsufficient):
-		c := codes.Fail(codes.CodePointsInsufficient, "points insufficient")
-		return c.Code, c.Message
+		return codes.Wrap(codes.CodePointsInsufficient, "points insufficient", err)
 	default:
-		c := codes.Fail(codes.CodePointsWriteFailed, "points change failed")
-		return c.Code, c.Message
+		s.logger.WarnContext(ctx, "points: repository error", logx.Err(err))
+		return codes.Wrap(codes.CodePointsWriteFailed, "points change failed", err)
 	}
 }
 
@@ -346,7 +327,7 @@ func (s *PointsService) markIdempotent(ctx context.Context, orderNo string, typ 
 }
 
 // invalidate 删账户缓存（余额变了必须失效，否则读缓存会拿到旧余额）
-func (s *PointsService) invalidate(ctx context.Context, userID int64) {
+func (s *PointsService) invalidate(ctx context.Context, userID uint64) {
 	if s.cache == nil {
 		return
 	}
@@ -355,7 +336,8 @@ func (s *PointsService) invalidate(ctx context.Context, userID int64) {
 	}
 }
 
-// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）
+// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
+// 仅当调用链开时经 otel 全局传播器注入；无活动 span 时为空串。
 func (s *PointsService) traceparentOf(ctx context.Context) string {
 	if !s.traceOn {
 		return ""
@@ -373,25 +355,10 @@ func evTraceID(ctx context.Context) string {
 	return ""
 }
 
-func accountCacheKey(userID int64) string {
+func accountCacheKey(userID uint64) string {
 	return fmt.Sprintf("mall:points:account:%d", userID)
 }
 
 func idempotentKey(orderNo string, typ int32) string {
 	return fmt.Sprintf("mall:points:idem:%s:%d", orderNo, typ)
 }
-
-func toPbAccount(a *repository.Account) *pointspb.PointAccount {
-	if a == nil {
-		return nil
-	}
-	return &pointspb.PointAccount{
-		UserId:      int64(a.UserID),
-		Balance:     a.Balance,
-		TotalEarned: a.TotalEarned,
-		TotalSpent:  a.TotalSpent,
-	}
-}
-
-// tracexStart 业务层埋点（保留一个内部别名，避免 service 包各处重复取 tracer）
-var tracexStart = tracex.Start

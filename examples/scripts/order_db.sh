@@ -31,9 +31,17 @@ APP_USER="${MYSQL_APP_USER:-order_rw}"
 APP_PW="${HUBX_DB_PW:-hubx123}"
 
 # mysql -N -B -e "<sql>"：只出数据行，便于取值判断
+#
+# 宿主 mysql 客户端要走 **TCP**（-h 127.0.0.1 -P 3306）而不是默认 socket：
+# 库跑在 docker 里，socket 路径（/tmp/mysql.sock）在宿主上不存在，裸 `mysql -uroot`
+# 只会得到 `ERROR 2002 Can't connect ... through socket`。而且本机装了 mysql@8.4
+# （/usr/local/bin/mysql），`command -v mysql` 一定命中 —— 旧写法会**静默**选到这个
+# 连不通的客户端。故这里先做一次 `SELECT 1` 可达性探测，不通就回落 docker exec。
 mysql_client() {
-  if command -v mysql >/dev/null 2>&1; then
-    MYSQL_PWD="$ROOT_PW" mysql -uroot -N -B -e "$1"
+  if [[ "${MYSQL_CLIENT:-}" != "docker" ]] && command -v mysql >/dev/null 2>&1 \
+    && MYSQL_PWD="$ROOT_PW" mysql -h 127.0.0.1 -P "${MYSQL_PORT:-3306}" -uroot -N -B \
+      -e 'SELECT 1' >/dev/null 2>&1; then
+    MYSQL_PWD="$ROOT_PW" mysql -h 127.0.0.1 -P "${MYSQL_PORT:-3306}" -uroot -N -B -e "$1"
     return
   fi
   MYSQL_QUERY="$1" MYSQL_PWD="$ROOT_PW" "$DOCKER" exec -e MYSQL_QUERY -e MYSQL_PWD \
@@ -52,6 +60,19 @@ declare -a TABLES=(
   "refund_records|id:BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY|order_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|user_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|amount:BIGINT NOT NULL DEFAULT 0|status:VARCHAR(16) NOT NULL DEFAULT 'pending'|reason:VARCHAR(128) NOT NULL DEFAULT ''|created_at:DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP|updated_at:DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
   "outbox|id:BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY|topic:VARCHAR(64) NOT NULL DEFAULT ''|event_type:VARCHAR(64) NOT NULL DEFAULT ''|payload:TEXT NULL|traceparent:VARCHAR(128) NOT NULL DEFAULT ''|status:TINYINT NOT NULL DEFAULT 0|retry_count:INT NOT NULL DEFAULT 0|created_at:DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP|updated_at:DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
   "users|id:BIGINT NOT NULL PRIMARY KEY|name:VARCHAR(64) NOT NULL DEFAULT ''|level:VARCHAR(16) NOT NULL DEFAULT 'normal'"
+  # products / stocks 是网格案例（examples/mesh/apps）两个域的自有表。
+  # 为什么不塞进 orders 那种「并集」里做兼容：它们是**域边界**的体现 ——
+  # srv-product 只碰 products、srv-stock 只碰 stocks，两边都不认识对方的表。
+  # 列集与网格侧 model 一一对应（product 七列 / stock 七列），
+  # 缺了它们的症状是 `GET /product/1`、`GET /stock/1` 报「表不存在」，
+  # 而不是业务里的「商品不存在」(40404) —— 前者是环境级 bug，后者才是业务码。
+  "products|id:BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY|title:VARCHAR(128) NOT NULL DEFAULT ''|price:BIGINT NOT NULL DEFAULT 0|status:INT NOT NULL DEFAULT 0|category_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|created_at:DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)|updated_at:DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+  "stocks|id:BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY|product_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|total:INT NOT NULL DEFAULT 0|available:INT NOT NULL DEFAULT 0|reserved:INT NOT NULL DEFAULT 0|version:BIGINT NOT NULL DEFAULT 0|updated_at:DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+  # 积分域的两张表。**不种账户行**是有意的：读路径对「账户不存在」返回 0 余额
+  # （fail-soft，见 points/service 的 GetPoints），种一行反而会与 MQ 消费链的
+  # upsert 累加状态混在一起。
+  "points_account|id:BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY|user_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|balance:BIGINT NOT NULL DEFAULT 0|updated_at:DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+  "points_log|id:BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY|user_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|order_id:BIGINT UNSIGNED NOT NULL DEFAULT 0|delta:BIGINT NOT NULL DEFAULT 0|created_at:DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)"
 )
 
 column_exists() { # <table> <column>
@@ -63,6 +84,15 @@ column_exists() { # <table> <column>
 table_exists() { # <table>
   local n
   n="$(mysql_client "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}' AND table_name='$1';")"
+  [[ "$n" != "0" ]]
+}
+
+# 唯一索引的幂等补建。TABLES 的格式是「列名:定义」，表达不了表级约束
+# （而 ALTER TABLE ... ADD COLUMN 后面也不能直接跟 UNIQUE KEY），
+# 故索引单独走这里：MySQL 没有 CREATE INDEX IF NOT EXISTS，先查统计表。
+index_exists() { # <table> <index>
+  local n
+  n="$(mysql_client "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema='${DB_NAME}' AND table_name='$1' AND index_name='$2';")"
   [[ "$n" != "0" ]]
 }
 
@@ -105,10 +135,31 @@ cmd_up() {
     mysql_db "ALTER TABLE orders MODIFY COLUMN item VARCHAR(128) NOT NULL DEFAULT '';" || true
   fi
 
+  # stocks.product_id 与 points_account.user_id 的唯一性（网格侧 model 都标了
+  # uniqueIndex）。放在这里而不是 TABLES 里，是因为那是列清单、表达不了表级约束。
+  # 这两条不是可选的性能优化：points_account.user_id 少了唯一键，
+  # repository.AddBalance 的 `ON DUPLICATE KEY UPDATE` 无从命中，会**静默**退化成
+  # 「每加一次分插一行新账户」。幂等：已存在就跳过。
+  if table_exists stocks && ! index_exists stocks uk_stocks_product_id; then
+    mysql_db "ALTER TABLE stocks ADD UNIQUE KEY uk_stocks_product_id (product_id);"
+    echo "  ~ stocks 补唯一索引 uk_stocks_product_id(product_id)"
+  fi
+  if table_exists points_account && ! index_exists points_account uk_points_account_user_id; then
+    mysql_db "ALTER TABLE points_account ADD UNIQUE KEY uk_points_account_user_id (user_id);"
+    echo "  ~ points_account 补唯一索引 uk_points_account_user_id(user_id)"
+  fi
+
+  # 种子：**读路径**必须先有一行数据，才可能返回 2xx。
+  # 网格案例的路由矩阵（GET /order/2、/product/1、/stock/1、/points/1）就靠这几行；
+  # 缺数据的症状是业务码（20404 / 40404）而不是「接不上」—— 那是数据未初始化，
+  # 不是接线错误，所以这一步是环境就绪的一部分，不是可选的演示数据。
   mysql_db "CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${APP_PW}';
 GRANT SELECT, INSERT, UPDATE, DELETE ON ${DB_NAME}.* TO '${APP_USER}'@'%';
 FLUSH PRIVILEGES;
-INSERT IGNORE INTO users (id, name, level) VALUES (1, 'alice', 'gold'), (2, 'bob', 'normal');"
+INSERT IGNORE INTO users (id, name, level) VALUES (1, 'alice', 'gold'), (2, 'bob', 'normal');
+INSERT IGNORE INTO orders (id, user_id, order_no, status, total_amount) VALUES (2, 1, 'SEED-2', 'created', 100);
+INSERT IGNORE INTO products (id, title, price, status, category_id) VALUES (1, 'demo product', 100, 1, 1);
+INSERT IGNORE INTO stocks (id, product_id, total, available, reserved, version) VALUES (1, 1, 100, 100, 0, 0);"
   echo "  = 建表 ${created} 张 / 补列 ${altered} 处 / 授权与种子已就绪"
   cmd_check
 }
@@ -132,7 +183,7 @@ cmd_check() {
   local n
   n="$(mysql_client "SELECT COUNT(*) FROM ${DB_NAME}.users;")"
   if (( rc == 0 )); then
-    echo "  ✓ 6 表列全齐（orders/order_items/order_status_log/refund_records/outbox/users），users=${n}"
+    echo "  ✓ 10 表列全齐（orders/order_items/order_status_log/refund_records/outbox/users + 网格四域自有表 products/stocks/points_account/points_log），users=${n}"
   fi
   return "$rc"
 }

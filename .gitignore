@@ -1,3 +1,11 @@
 .workbuddy/
 examples/**/bin/
 .DS_Store
+
+# 编译产物（run-e2e.sh 会重建）
+/ordercli
+
+# 代理运行时残留
+.claude/
+.omc/
+.sddflow/

@@ -1,15 +1,24 @@
 // Package service srv-order 业务编排层。
 //
-// CreateOrder 编排：
-//  1. 参数校验（UserId≤0 → 1004；明细空/数量非法 → 1001）
+// 在分层链上的位置：handler → **service** → repository → model。
+//
+// 边界纪律：本层**不 import pb、不 import kitex**。出入参一律走 model 的
+// 领域 DTO（*Cmd / *Query / *Result），pb 与领域模型之间的转换归 handler。
+// 否则 pb 加一个字段就会顺着 import 渗进业务规则，协议演进与业务演进被绑死。
+//
+// 业务失败用 codes.Error 向上抛（带码），由 handler 统一翻译成响应体
+// Code/Message；本层自己不认识响应体长什么样。
+//
+// 句柄来源纪律：本层不 import gorm/redis/kafka，也不用全局单例 ——
+// DB / Cache / KV / Lock / MQ 全部经 repository 与构造参数注入，
+// 换形态（srv → monolith）与换驱动都不改业务代码。
+//
+// 编排总览（与重构前一致）：
+//  1. 参数校验（user ≤ 0 → 1004；明细空/数量非法 → 1001）
 //  2. 同用户并发互斥（lockx；锁器缺失时 fail-open 并留 Warn，见 withUserLock）
 //  3. 本地事务 orders + order_items + outbox（事件体 pkg/events.OrderCompleted）
 //  4. 后台 outbox.Runner 3s 补发（幂等：status 0→1；traceparent 随
 //     mqx Message.Headers 透传，仅当调用链开）
-//
-// 句柄来源纪律：本层不 import gorm/redis/kafka，也不用全局单例 ——
-// DB / KV / Lock / MQ 全部由 app.Setup 从 launchx 的 App 句柄注入，
-// 这样换形态（srv → monolith）与换驱动都不改业务代码。
 package service
 
 import (
@@ -23,18 +32,19 @@ import (
 	"time"
 
 	"github.com/gospacex/cachex"
+	"github.com/gospacex/kvx"
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/mall/pkg/codes"
 	"github.com/gospacex/launchx/examples/mall/pkg/events"
-	"github.com/gospacex/launchx/examples/mall/pkg/tracex"
+	"github.com/gospacex/launchx/examples/mall/srv-order/internal/model"
 	"github.com/gospacex/launchx/examples/mall/srv-order/internal/repository"
-
-	orderpb "github.com/gospacex/launchx/examples/mall/pkg/kitex_gen/order"
+	"github.com/gospacex/otelx/layer"
 )
 
 // orderLockTTL 同用户下单互斥的持锁上限。
@@ -44,7 +54,7 @@ import (
 // 即使进程在解锁前崩溃，锁也会在 TTL 内自动过期，不会永久阻塞该用户下单。
 const orderLockTTL = 5 * time.Second
 
-// orderCacheTTL 订单详情在 KV 里的缓存时长
+// orderCacheTTL 订单详情在 cachex 里的缓存时长（状态流转后显式 Delete 失效）
 const orderCacheTTL = 5 * time.Minute
 
 // OrderService 订单业务编排
@@ -52,72 +62,86 @@ type OrderService struct {
 	repo *repository.OrderRepository
 	// cache 订单详情缓存（nil 表示缓存组件未装配/已降级 → 直查 DB）
 	cache cachex.Cache
+	// kv 下单笔数计数（nil 表示 KV 组件未装配 → 计数降级为 no-op）
+	kv kvx.KVStore
 	// lock 同用户并发下单互斥（nil 表示锁组件未装配 → fail-open，见 withUserLock）
 	lock    lockx.Locker
 	traceOn bool
 	logger  logx.Logger
 }
 
-// NewOrderService 构造（cache/lock 允许 nil，见字段注释）
-func NewOrderService(repo *repository.OrderRepository, cache cachex.Cache, lock lockx.Locker, traceOn bool, logger logx.Logger) *OrderService {
+// NewOrderService 构造（cache / kv / lock 允许 nil，见字段注释）
+func NewOrderService(
+	repo *repository.OrderRepository,
+	cache cachex.Cache,
+	kv kvx.KVStore,
+	lock lockx.Locker,
+	traceOn bool,
+	logger logx.Logger,
+) *OrderService {
 	if logger == nil {
 		logger = logx.GetGlobal()
 	}
-	return &OrderService{repo: repo, cache: cache, lock: lock, traceOn: traceOn, logger: logger}
+	return &OrderService{repo: repo, cache: cache, kv: kv, lock: lock, traceOn: traceOn, logger: logger}
 }
 
-// Repo 暴露仓储（组装期健康检查 / 对账用）
+// Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
 func (s *OrderService) Repo() *repository.OrderRepository { return s.repo }
 
-// CreateOrder 下单：校验 → 加用户锁 → 3 表事务 → KV 回填
-func (s *OrderService) CreateOrder(ctx context.Context, req *orderpb.CreateOrderReq) (*orderpb.CreateOrderResp, error) {
-	resp := &orderpb.CreateOrderResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 {
-		c := codes.Fail(codes.CodeUnauthorized, "user required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+// begin 开 service 层 span，返回「收 error 再收尾」的闭包。
+//
+// 不做 quiet 豁免：service 返回非 nil error 意味着这次业务操作没完成
+// （参数非法 / 写库失败 / 下游失败），都该在 Jaeger 上看得见 —— 与单体
+// 示例 s.end 的口径一致。预期内的业务拒绝由 handler 翻成响应体 Code，
+// 不进 error，因此不会把正常的「商品不存在」标成故障。
+func (s *OrderService) begin(ctx context.Context, op string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "service", "order", op, s.traceOn, nil)
+}
+
+// CreateOrder 下单：校验 → 加用户锁 → 3 表事务 → 计数
+func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd) (out *model.CreateOrderResult, err error) {
+	ctx, end := s.begin(ctx, "CreateOrder")
+	defer func() { end(err) }()
+
+	if cmd.UserID <= 0 {
+		return nil, codes.New(codes.CodeUnauthorized, "user required")
 	}
-	items := req.GetItems()
-	if len(items) == 0 {
-		c := codes.Fail(codes.CodeOrderItemsEmpty, "items required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+	if len(cmd.Items) == 0 {
+		return nil, codes.New(codes.CodeOrderItemsEmpty, "items required")
 	}
-	for _, it := range items {
-		if it.GetProductId() <= 0 || it.GetQuantity() <= 0 || it.GetUnitPrice() < 0 {
-			c := codes.Fail(codes.CodeInvalidParam, "invalid item")
-			resp.Code, resp.Message = c.Code, c.Message
-			return resp, nil
+	for _, it := range cmd.Items {
+		if it.ProductID <= 0 || it.Quantity <= 0 || it.UnitPrice < 0 {
+			return nil, codes.New(codes.CodeInvalidParam, "invalid item")
 		}
 	}
 
-	// 总额 = Σ quantity × unit_price（分）
+	// 总额 = Σ quantity × unit_price（分）。服务端算而不收调用方传值：
+	// 总额是后续对账与积分入账的依据，让客户端带进来等于把可篡改字段写进账本。
 	var total int64
-	for _, it := range items {
-		total += int64(it.GetQuantity()) * it.GetUnitPrice()
+	for _, it := range cmd.Items {
+		total += int64(it.Quantity) * it.UnitPrice
 	}
 
 	orderNo := newOrderNo()
-	unlock, deny := s.withUserLock(ctx, req.GetUserId())
+	unlock, deny := s.withUserLock(ctx, cmd.UserID)
 	if deny != nil {
-		resp.Code, resp.Message = deny.Code, deny.Message
-		return resp, nil
+		return nil, deny
 	}
 	defer unlock()
 
-	evTraceparent := s.traceparentOf(ctx)
-	out, err := s.repo.CreateOrderTx(ctx, repository.CreateOrderInput{
-		UserID:      uint64(req.GetUserId()),
+	tp := s.traceparentOf(ctx)
+	rec, err := s.repo.CreateOrderTx(ctx, repository.CreateOrderInput{
+		UserID:      cmd.UserID,
 		OrderNo:     orderNo,
 		TotalAmount: total,
-		Items:       toRepoItems(items),
-		OutboxFill: func(orderID uint64) (payload, tp string) {
+		Items:       toRepoItems(cmd.Items),
+		OutboxFill: func(orderID uint64) (payload, traceparent string) {
 			ev := events.OrderCompleted{
 				OrderID:    int64(orderID),
 				OrderNo:    orderNo,
-				UserID:     req.GetUserId(),
+				UserID:     int64(cmd.UserID),
 				Amount:     total,
-				Items:      toEventItems(items),
+				Items:      toEventItems(cmd.Items),
 				SchemaVer:  events.SchemaVer1,
 				TraceID:    evTraceID(ctx),
 				OccurredAt: time.Now().UnixMilli(),
@@ -126,23 +150,28 @@ func (s *OrderService) CreateOrder(ctx context.Context, req *orderpb.CreateOrder
 			if mErr != nil {
 				// 序列化失败不阻断下单主流程：空 payload 时 Runner 直接放弃该行
 				s.logger.WarnContext(ctx, "order event marshal failed", logx.Err(mErr))
-				return "", evTraceparent
+				return "", tp
 			}
-			return string(b), evTraceparent
+			return string(b), tp
 		},
 	})
 	if err != nil {
 		s.logger.WarnContext(ctx, "create order tx failed", logx.Err(err))
-		c := codes.Fail(codes.CodeInternal, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		return nil, codes.Wrap(codes.CodeInternal, "create order failed", err)
 	}
-
-	resp.OrderId = int64(out.OrderID)
-	resp.OrderNo = out.OrderNo
-	resp.TotalAmount = total
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp, nil
+	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int64("order.id", int64(rec.OrderID)),
+			attribute.String("order.no", rec.OrderNo),
+		)
+	}
+	s.bumpUserOrders(ctx, cmd.UserID)
+	return &model.CreateOrderResult{
+		OrderID:     rec.OrderID,
+		OrderNo:     rec.OrderNo,
+		TotalAmount: total,
+		Status:      model.StatusCreated,
+	}, nil
 }
 
 // GetOrder 查单个订单 + 明细（cachex 缓存优先，miss 回源 DB 并回填）
@@ -150,36 +179,37 @@ func (s *OrderService) CreateOrder(ctx context.Context, req *orderpb.CreateOrder
 // 缓存的是"已被用户看到过的订单结果"，语义上是可失效的派生状态（状态流转后
 // 由 Delete 显式失效），故走 cachex；限流计数那种需要原子自增的状态走 kvx。
 // 缓存读失败（含 key 不存在）一律按 miss 处理：缓存是加速路径，不是数据源。
-func (s *OrderService) GetOrder(ctx context.Context, req *orderpb.GetOrderReq) (*orderpb.GetOrderResp, error) {
-	resp := &orderpb.GetOrderResp{UserId: req.GetUserId(), OrderId: req.GetOrderId()}
-	if req.GetUserId() <= 0 {
-		c := codes.Fail(codes.CodeUnauthorized, "user required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out *model.OrderWithItems, err error) {
+	ctx, end := s.begin(ctx, "GetOrder")
+	defer func() { end(err) }()
+
+	if q.UserID <= 0 {
+		return nil, codes.New(codes.CodeUnauthorized, "user required")
 	}
-	userID, orderID := uint64(req.GetUserId()), uint64(req.GetOrderId())
-	key := orderCacheKey(userID, orderID)
+	if q.OrderID <= 0 {
+		return nil, codes.New(codes.CodeInvalidParam, "order_id required")
+	}
+	key := orderCacheKey(q.UserID, q.OrderID)
 
 	if s.cache != nil {
 		if cached, err := s.cache.Get(ctx, key); err == nil && cached != "" {
-			var ow repository.OrderWithItems
+			var ow model.OrderWithItems
 			if json.Unmarshal([]byte(cached), &ow) == nil {
-				return fillOrderResp(resp, &ow), nil
+				if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+					span.SetAttributes(attribute.Bool("cache.hit", true))
+				}
+				return &ow, nil
 			}
 			s.logger.WarnContext(ctx, "order cache decode failed, fallback to db", logx.String("key", key))
 		}
 	}
 
-	ow, err := s.repo.GetOrder(ctx, orderID, userID)
+	ow, err := s.repo.GetOrder(ctx, q)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
-			c := codes.Fail(codes.CodeOrderNotFound, "order not found")
-			resp.Code, resp.Message = c.Code, c.Message
-			return resp, nil
+			return nil, codes.Wrap(codes.CodeOrderNotFound, "order not found", err)
 		}
-		c := codes.Fail(codes.CodeInternal, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		return nil, codes.Wrap(codes.CodeInternal, "load order failed", err)
 	}
 	if s.cache != nil {
 		if b, mErr := json.Marshal(ow); mErr == nil {
@@ -189,67 +219,70 @@ func (s *OrderService) GetOrder(ctx context.Context, req *orderpb.GetOrderReq) (
 			}
 		}
 	}
-	return fillOrderResp(resp, ow), nil
+	return ow, nil
+}
+
+// UpdateStatus 订单状态流转（2 表事务 + 缓存失效）
+//
+// 状态与日志必须同事务推进，且要顺带把详情缓存失效掉 —— 这两件事都不属于
+// repository（它不该知道缓存），故放在本层。
+//
+// 当前 RPC 面未开放该方法（kitex_gen 由 IDL 生成，本域不自行加方法），
+// 因此没有对应的 handler 入口；保留它是为了给 repository 的两表事务一个
+// 正确层级的调用点，而不是让状态流转散落到装配层去。
+func (s *OrderService) UpdateStatus(ctx context.Context, cmd model.UpdateStatusCmd) (err error) {
+	ctx, end := s.begin(ctx, "UpdateStatus")
+	defer func() { end(err) }()
+
+	if cmd.UserID <= 0 {
+		return codes.New(codes.CodeUnauthorized, "user required")
+	}
+	if cmd.OrderID <= 0 || cmd.To == "" {
+		return codes.New(codes.CodeInvalidParam, "invalid status param")
+	}
+	if err := s.repo.UpdateStatusTx(ctx, repository.UpdateStatusInput{
+		OrderID: cmd.OrderID,
+		UserID:  cmd.UserID,
+		To:      cmd.To,
+	}); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return codes.Wrap(codes.CodeOrderNotFound, "order not found", err)
+		}
+		s.logger.WarnContext(ctx, "update order status tx failed", logx.Err(err))
+		return codes.Wrap(codes.CodeInternal, "update order status failed", err)
+	}
+	s.invalidate(ctx, cmd.UserID, cmd.OrderID)
+	return nil
 }
 
 // ListOrders 只读订单流水（对账数据源，不走缓存：流水要求实时）
-func (s *OrderService) ListOrders(ctx context.Context, req *orderpb.ListOrdersReq) (*orderpb.ListOrdersResp, error) {
-	resp := &orderpb.ListOrdersResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 {
-		c := codes.Fail(codes.CodeUnauthorized, "user required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
-	}
-	flows, err := s.repo.ListOrders(ctx, uint64(req.GetUserId()), req.GetFromDate(), req.GetToDate(), int(req.GetLimit()))
+func (s *OrderService) ListOrders(ctx context.Context, q model.ListOrdersQuery) (out []model.OrderFlowRow, err error) {
+	ctx, end := s.begin(ctx, "ListOrders")
+	defer func() { end(err) }()
+	rows, err := s.repo.ListOrders(ctx, q)
 	if err != nil {
-		c := codes.Fail(codes.CodeInvalidParam, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		if errors.Is(err, repository.ErrBadDateRange) {
+			// 日期区间是调用方传错，回 1001 让他改参数再来，而不是报内部错误
+			return nil, codes.Wrap(codes.CodeInvalidParam, "invalid date range", err)
+		}
+		return nil, codes.Wrap(codes.CodeInternal, "list orders failed", err)
 	}
-	pbFlows := make([]*orderpb.OrderFlow, 0, len(flows))
-	for i := range flows {
-		pbFlows = append(pbFlows, &orderpb.OrderFlow{
-			Id:          int64(flows[i].ID),
-			UserId:      int64(flows[i].UserID),
-			OrderNo:     flows[i].OrderNo,
-			Status:      flows[i].Status,
-			TotalAmount: flows[i].TotalAmount,
-			CreatedAt:   flows[i].CreatedAt.Unix(),
-		})
-	}
-	resp.Flows = pbFlows
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp, nil
+	s.auditTotals(ctx, rows)
+	return rows, nil
 }
 
 // Report 4 表 JOIN 报表
-func (s *OrderService) Report(ctx context.Context, req *orderpb.ReportReq) (*orderpb.ReportResp, error) {
-	resp := &orderpb.ReportResp{UserId: req.GetUserId()}
-	if req.GetUserId() <= 0 {
-		c := codes.Fail(codes.CodeUnauthorized, "user required")
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
-	}
-	rows, err := s.repo.Report(ctx, uint64(req.GetUserId()), req.GetFromDate(), req.GetToDate())
+func (s *OrderService) Report(ctx context.Context, q model.OrderReportQuery) (out []model.ReportRow, err error) {
+	ctx, end := s.begin(ctx, "Report")
+	defer func() { end(err) }()
+	rows, err := s.repo.Report(ctx, q)
 	if err != nil {
-		c := codes.Fail(codes.CodeInvalidParam, err.Error())
-		resp.Code, resp.Message = c.Code, c.Message
-		return resp, nil
+		if errors.Is(err, repository.ErrBadDateRange) {
+			return nil, codes.Wrap(codes.CodeInvalidParam, "invalid date range", err)
+		}
+		return nil, codes.Wrap(codes.CodeInternal, "report orders failed", err)
 	}
-	pbRows := make([]*orderpb.ReportRow, 0, len(rows))
-	for i := range rows {
-		pbRows = append(pbRows, &orderpb.ReportRow{
-			OrderNo:           rows[i].OrderNo,
-			Status:            rows[i].Status,
-			TotalAmount:       rows[i].TotalAmount,
-			RefundAmount:      rows[i].RefundAmount,
-			ItemCount:         rows[i].ItemCount,
-			StatusChangeCount: rows[i].StatusChangeCount,
-		})
-	}
-	resp.Rows = pbRows
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp, nil
+	return rows, nil
 }
 
 // ---- 内部 ----
@@ -258,8 +291,8 @@ func (s *OrderService) Report(ctx context.Context, req *orderpb.ReportReq) (*ord
 //
 // 锁器为 nil（组件未装配 / 构造降级）时**显式 fail-open 并留 Warn**：
 // 这种降级不会报错，只表现为"极高并发下同一用户可能下出重复单"，
-// 若静默继续，事后无法回答"当时有没有加锁"。返回值非 nil 时表示拒绝本次请求。
-func (s *OrderService) withUserLock(ctx context.Context, userID int64) (func(), *codes.Code) {
+// 若静默继续，事后无法回答"当时有没有加锁"。返回非 nil error 表示拒绝本次请求。
+func (s *OrderService) withUserLock(ctx context.Context, userID uint64) (func(), *codes.Error) {
 	noop := func() {}
 	if s.lock == nil {
 		s.logger.WarnContext(ctx, "order: locker unavailable, create-order runs without mutual exclusion",
@@ -272,18 +305,61 @@ func (s *OrderService) withUserLock(ctx context.Context, userID int64) (func(), 
 	if err != nil {
 		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试，
 		// 不能笼统报 internal（会被当成需要人工介入的故障）。
-		c := codes.Fail(codes.CodeOrderConcurrent, "concurrent order in progress, retry later")
-		return noop, &c
+		return noop, codes.Wrap(codes.CodeOrderConcurrent, "concurrent order in progress, retry later", err)
 	}
 	return func() {
-		// 解锁必须用请求 ctx（闭包捕获的外层变量）：这里传过 context.Background()，
-		// lockx 的 release span 因此失去父节点，每次解锁都在 Jaeger 上另起一根
-		// 孤儿单 span trace。解锁发生在请求生命周期内，ctx 没有被取消的风险。
+		// 解锁必须用请求 ctx：这里传过 context.Background()，lockx 的 release
+		// span 因此失去父节点，每次解锁都在 Jaeger 上另起一根孤儿单 span trace。
+		// 解锁发生在请求生命周期内，ctx 没有被取消的风险。
 		if uErr := lk.Unlock(ctx); uErr != nil {
 			// 解锁失败不阻断业务：锁有 TTL，最坏情况是短暂阻塞而非死锁
 			s.logger.WarnContext(ctx, "order: unlock failed (lock will expire by ttl)", logx.Err(uErr))
 		}
 	}, nil
+}
+
+// bumpUserOrders 用户下单笔数计数（kvx 原子自增；KV 缺失时静默降级）。
+//
+// 与限流计数一样走 kvx，但**不参与业务判定**：计数失败既不告警也不重试，
+// 笔数只是运营信号，不该在它上面产生故障面。
+func (s *OrderService) bumpUserOrders(ctx context.Context, userID uint64) {
+	if s.kv == nil || userID <= 0 {
+		return
+	}
+	if _, err := s.kv.Incr(ctx, fmt.Sprintf("orders:user:%d", userID)); err != nil {
+		s.logger.WarnContext(ctx, "order: user order counter incr failed", logx.Err(err))
+	}
+}
+
+// auditTotals 对账：明细合计应当等于订单总额。
+//
+// 列表 JOIN 明细就是为这件事 —— 两者不等说明下单时总额算错、或明细事后被
+// 改过。只记一条汇总告警不逐行刷屏，也绝不拦截：对账差异要人来看，
+// 不能让列表因此查不出来。
+func (s *OrderService) auditTotals(ctx context.Context, rows []model.OrderFlowRow) {
+	var bad int
+	for i := range rows {
+		if rows[i].ItemCount > 0 && rows[i].ItemAmount != rows[i].TotalAmount {
+			bad++
+		}
+	}
+	if bad > 0 {
+		s.logger.WarnContext(ctx, "order: item amount does not match order total",
+			logx.Int("mismatched", bad),
+			logx.Int("total", len(rows)),
+			logx.String("hint", "sum(order_items.quantity*unit_price) != orders.total_amount"))
+	}
+}
+
+// invalidate 删详情缓存（状态流转后必须失效，否则读缓存会拿到旧状态）
+func (s *OrderService) invalidate(ctx context.Context, userID, orderID uint64) {
+	if s.cache == nil {
+		return
+	}
+	// 失效失败只告警：下一次读会拿到旧值，但 TTL 兜底（5 分钟）不会永久错
+	if err := s.cache.Delete(ctx, orderCacheKey(userID, orderID)); err != nil {
+		s.logger.WarnContext(ctx, "order: cache invalidate failed", logx.Err(err))
+	}
 }
 
 // traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
@@ -316,54 +392,28 @@ func orderCacheKey(userID, orderID uint64) string {
 	return fmt.Sprintf("mall:order:%d:%d", userID, orderID)
 }
 
-func fillOrderResp(resp *orderpb.GetOrderResp, ow *repository.OrderWithItems) *orderpb.GetOrderResp {
-	resp.OrderNo = ow.Order.OrderNo
-	resp.Status = ow.Order.Status
-	resp.TotalAmount = ow.Order.TotalAmount
-	resp.PaidAmount = ow.Order.PaidAmount
-	resp.Items = toPbItems(ow.Items)
-	resp.Code, resp.Message = codes.OK().Code, codes.OK().Message
-	return resp
-}
-
-func toRepoItems(items []*orderpb.OrderItem) []repository.OrderItem {
-	out := make([]repository.OrderItem, 0, len(items))
+func toRepoItems(items []model.OrderItemCmd) []model.OrderItem {
+	out := make([]model.OrderItem, 0, len(items))
 	for _, it := range items {
-		out = append(out, repository.OrderItem{
-			ProductID:   uint64(it.GetProductId()),
-			ProductName: it.GetName(),
-			Quantity:    int(it.GetQuantity()),
-			UnitPrice:   it.GetUnitPrice(),
+		out = append(out, model.OrderItem{
+			ProductID:   it.ProductID,
+			ProductName: it.Name,
+			Quantity:    it.Quantity,
+			UnitPrice:   it.UnitPrice,
 		})
 	}
 	return out
 }
 
-func toEventItems(items []*orderpb.OrderItem) []events.OrderItem {
+func toEventItems(items []model.OrderItemCmd) []events.OrderItem {
 	out := make([]events.OrderItem, 0, len(items))
 	for _, it := range items {
 		out = append(out, events.OrderItem{
-			ProductID: it.GetProductId(),
-			Name:      it.GetName(),
-			Quantity:  int(it.GetQuantity()),
-			UnitPrice: it.GetUnitPrice(),
+			ProductID: int64(it.ProductID),
+			Name:      it.Name,
+			Quantity:  it.Quantity,
+			UnitPrice: it.UnitPrice,
 		})
 	}
 	return out
 }
-
-func toPbItems(items []repository.OrderItem) []*orderpb.OrderItem {
-	out := make([]*orderpb.OrderItem, 0, len(items))
-	for i := range items {
-		out = append(out, &orderpb.OrderItem{
-			ProductId: int64(items[i].ProductID),
-			Name:      items[i].ProductName,
-			Quantity:  int32(items[i].Quantity),
-			UnitPrice: items[i].UnitPrice,
-		})
-	}
-	return out
-}
-
-// tracexStart 业务层埋点（保留一个内部别名，避免 service 包各处重复取 tracer）
-var tracexStart = tracex.Start

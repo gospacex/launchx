@@ -1,0 +1,103 @@
+# ============================================================
+# mall 示例 · 聚合层（bff 档）配置
+#
+# bff 是四个域服的唯一 HTTP 入口：路由 → downstream（kitex 客户端）→ srv。
+# 端口 / 下游目标一律来自本文件，业务 Go 代码不出现任何硬编码地址。
+#
+# 本档注册进 consul 由 launchx 按 mode 自己做（地址取 service.self.addr），
+# 业务侧不调 Register / Deregister。
+#
+# 运行前导出库密码：export HUBX_DB_PW=hubx123（本档无库，仅保持口径一致）
+# ============================================================
+
+service:
+  name: srv-bff                  # 服务名 = Jaeger 的 service，也是 consul 注册名
+  mode: bff                      # 四档之一：monolith / bff / srv / gateway
+  addr: "127.0.0.1:9201"         # HTTP 监听地址（mall 端口段 92xx）
+  self:
+    # 注册进 consul 的自身地址。launchx 按 service.self.addr → service.addr
+    # 顺序取第一个非空值；值支持 ${ENV}（configsrc 对 GetString 施加
+    # os.ExpandEnv），容器内外地址不一致时显式设置即可。
+    addr: "${SRV_BFF_SELF_ADDR}"
+  upstream:
+    # 注册中心不可用时的直连兜底目标：launchx 读 service.upstream.<被调服务名>。
+    # 注册中心配了就走发现、本值不生效 —— 上游地址只留一个来源。
+    srv-product: "127.0.0.1:9101"
+    srv-stock:   "127.0.0.1:9103"
+    srv-order:   "127.0.0.1:9102"
+    srv-points:  "127.0.0.1:9104"
+
+webx:
+  addr: "127.0.0.1:9201"
+  timeout: 5s
+  rate_limit_rps: 100
+  rate_limit_burst: 200
+  cors_origins: []
+  health_prefix: /healthz
+
+# 调用链：全局闸 + 组件级开关。trace.on.registry 只裁决 coordx 的入链；
+# bff 的核心链路证据在 RPC 双边 suite（rpcx 的 server/client span middleware
+# 随 RPCServer/RPCClientOptions 注入，不经本开关裁决）。
+trace:
+  enabled: true
+  endpoint: "127.0.0.1:4318"   # jaeger OTLP/HTTP
+  on:
+    registry: true
+
+logx:
+  level: info
+  otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
+    enable_trace: true
+# 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+# HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流），
+# RPC 客户端/服务端中间件也按这一开关挂。**关掉（false 或不写）即不建 provider**，
+# meter 退回 noop：不产生指标、不留采集口，但 Instrument 调用点仍在（不会少埋点）。
+metrics:
+  enabled: true
+
+# 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决。
+# 本档刻意不设 strict：consul 不在时须带病运行（降级到直连兜底 + Warn）。
+
+xmiddleware:
+  # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
+  # 它不是组件：三项都只在客户端选项装配那一刻起作用，故配置面收在 rpcx、
+  # 由 mode 在装配期读进 App.RPCClientOptions 产出的选项里。**零值全关**，
+  # 不写这一段 = 产生的 client.Option 与引入治理之前逐字相同。
+  rpcx:
+    # 熔断：服务级（调用方/被调方）+ 实例级两道闸。阈值写出来是为了让当前
+    # 生效值可见（不写则用 kitex 缺省，同样是 0.5 / 200）。打开它**不改成功
+    # 路径**，作用是在持续故障时快速失败，而不是继续把请求打到坏实例上。
+    circuit_breaker:
+      enabled: true
+      error_rate: 0.5      # 触发熔断的错误率阈值，取值 (0,1]
+      min_sample: 200      # 触发熔断所需的最小样本数
+    # 重试：本档**故意不开**。这条链路上有非幂等写（下单 / 扣减 / 入账），
+    # 传输层超时重试会产生重复落库；且一旦网格侧也开了 HTTP 跳重试，
+    # 故障期双侧重试会互相放大（ACCEPTANCE §13.5 硬规则 1）。
+    # 开启前先确认两件事：max_attempts ≤ 5（kitex 越界即 panic，装配期已拦）、
+    # Istio VirtualService 的 retries 为空。
+    # 再看一眼预算：单次业务调用最坏耗时 ≈ (1 + max_attempts) × RPCTimeout
+    #（rpcx 缺省 3s），三试就是 9s —— 已盖过入口的 webx.timeout(5s)，
+    # 表现为引擎先 504、而重试还在后台跑。真开重试须同时收紧 max_duration_ms。
+    retry:
+      enabled: false
+      max_attempts: 2      # 不含首次调用
+      backoff_ms: 10       # 固定退避；0 = 不退避
+    # 负载均衡：闭集 weighted_random（缺省）/ weighted_round_robin /
+    # interleaved_weighted_round_robin。刻意**不给** consistent_hash ——
+    # 它需要业务侧的 key 函数，没有默认值，配了只会把请求全打到同一实例上。
+    # 不写这一项即用 kitex 缺省（weighted_random）。
+
+  # ----- coordx：注册中心 -----
+  # bff 的两个用途都落在这里：把自己注册进注册中心供 gateway 发现（由 launchx
+  # 按 mode 做），以及 App.RPCClientOptions 里的 coordx resolver（发现四个 srv）。
+  coordx:
+    driver: consul
+    addr: "127.0.0.1:8500"
+    enable_trace: true
+
+  # bff 不建数据层：无 sqlx / cachex / mqx / kvx / lockx 段。
+  # 数据的唯一入口是四个下游域服 —— 聚合层不碰库是分层纪律，不是能力缺失。
