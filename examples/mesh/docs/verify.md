@@ -407,6 +407,10 @@ kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
 | 2 | 19:02 | 7/7 PASS | `b4c3850f` | `2aab670a` |
 | 3 | 19:02 | 7/7 PASS | `6ce73903` | `b470f1ef` |
 | 4 | 19:10 | 7/7 PASS | `07281b9d` | `ca4b175a` |
+| 5 | **10-10 12:40** | **8/8 PASS**（矩阵新增 +cache 行） | `cb816620` | `e94be917` |
+
+第 5 次是集群重建（k8s v1.33.1）+ §8 三处修复后的完整复跑；+cache 行要求首读回源，
+复跑前需清 apps 组缓存键 `mesh:product:detail:1`（**不是** micro 组的 `hot:product:1`）。
 
 四次 traceID **各不相同**，且异步链 traceID 每次都与当次 `POST /order` 行一致 ——
 这条防的是「第一次 PASS 是陈旧 trace 凑出来的」：若第二次结果不稳定，说明
