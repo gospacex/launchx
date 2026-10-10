@@ -37,8 +37,15 @@ tidy:
 
 image: build
 	@command -v minikube >/dev/null 2>&1 || { echo "missing minikube" >&2; exit 1; }
+	# 基础镜像必须先进 minikube daemon：daemon 在本机网络下访问不了 docker.io
+	# （见 Dockerfile 注释），buildkit 的 FROM 元数据解析**不走本地镜像回退**，
+	# 不预载必然 timeout。宿主也没有 alpine:3.20 时给出提示，不静默降级。
+	@minikube image ls 2>/dev/null | grep -q 'alpine:3.20' \
+		|| minikube image load alpine:3.20 \
+		|| { echo "宿主缺 alpine:3.20 —— 先 docker pull（或从可用镜像源 tag）再重跑" >&2; exit 1; }
+	# DOCKER_BUILDKIT=0：legacy builder 直接用 daemon 本地镜像，不做联网元数据解析。
 	@set -e; eval "$$(minikube docker-env)"; \
-		$(DOCKER) build -f Dockerfile -t $(IMAGE) . ; \
+		DOCKER_BUILDKIT=0 $(DOCKER) build -f Dockerfile -t $(IMAGE) . ; \
 		echo "  built $(IMAGE)"
 	@minikube image ls | grep "$(IMAGE)" || true
 

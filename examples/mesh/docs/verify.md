@@ -1,10 +1,12 @@
-# 网格形态真机验收证据（T10 / T11 / E5 / T12 / T13）
+# 网格形态真机验收证据（T10 / T11 / E5 / T12 / T13 / metrics）
 
 本文件是 `examples/ACCEPTANCE.md` §11b 的**证据落盘**，不是操作手册（操作看 `../README.md`、
 `../scripts/bring-up.sh`）。所有数字来自本机实测，可复跑。
 
-- 验收时间：2026-10-05 20:40–21:15（UTC+8）；**§6 的 T13 为 2026-10-08 18:56–19:02 追加**
-- 结论：**T10 PASS / E5 PASS（OFF↔ON 可复现）/ T11 SKIP（见 §3，说明为何不伪造）/ T13 PASS（7/7，见 §6）**
+- 验收时间：2026-10-05 20:40–21:15（UTC+8）；**§6 的 T13 为 2026-10-08 18:56–19:02 追加**；
+  **§7 metrics 复验与 §8 环境漂移修复为 2026-10-10 12:20–12:45 追加**
+- 结论：**T10 PASS / E5 PASS（OFF↔ON 可复现）/ T11 SKIP（见 §3，说明为何不伪造）/
+  T13 PASS（10-10 复跑 8/8，见 §6）/ metrics 采集口 PASS（4/4，见 §7）**
 
 ---
 
@@ -437,10 +439,13 @@ echo "rc=$?"     # 期望 1（非零 = 判据生效）
 
 ---
 
-## 7. 指标采集口（2026-10-08 新增：**配置就绪，未起集群复验**）
+## 7. 指标采集口（2026-10-10 **真机复验通过，4/4**）
 
-口径先说清楚：**本节只记录"清单与配置里备好了什么"，不含真机证据。**
-本轮没有起 minikube，故 ACCEPTANCE §13.4 的网格列记 **⚠️**，不记 ✅。
+本节原为 2026-10-08 的「配置就绪，未复验」登记；**2026-10-10 12:20–12:45 起集群逐条实测，
+四条判据全部通过**，ACCEPTANCE §13.4 网格列随之由 ⚠️ 翻为 ✅。
+
+- 复验环境：minikube `v1.36.0`（k8s server **v1.33.1**，与 §0 的 v1.28.0 不同，见 §8.1）/
+  istio `1.30.1` / `VARIANT=apps` / Jaeger `all-in-one:1.63.0`（ES 后端）
 
 ### 7.1 两种落法（取决于该档有没有 HTTP 面）
 
@@ -448,13 +453,6 @@ echo "rc=$?"     # 期望 1（非零 = 判据生效）
 |---|---|---|
 | `bff`（HTTP 面） | **复用入口跳那一个端口** 8081 | `metrics.enabled: true`，不配 `addr` |
 | 四域 `srv`（无 HTTP 面） | 单起监听 `0.0.0.0:9031-9034` | `metrics.enabled: true` + `metrics.addr` |
-
-判据（在本机已验，集群里同样适用）：
-
-```bash
-kubectl -n launchx-mesh exec deploy/bff -- curl -s localhost:8081/metrics | head
-# 四域是从 Pod 外抓：需经上面的采集口，且端口名必须是 tcp-metrics（见 7.2）
-```
 
 ### 7.2 一处**必须多写**（反向项，唯一一处）
 
@@ -475,9 +473,69 @@ annotations:
 则必须叫 **`tcp-metrics`** —— 写成 `http-metrics` 会被 L7 接管，正好撞上上面那条
 ALLOW 策略，Prometheus 拿 403 而不是指标。
 
-### 7.3 未复验清单（起集群后要逐条确认）
+### 7.3 复验判据与实测结果（2026-10-10，全过）
 
-1. `kubectl -n launchx-mesh exec deploy/srv-order -- curl -s localhost:9031/metrics` 有输出；
-2. 从集群内一个**非网格** Pod（或宿主经 port-forward）抓 9031，确认没被 sidecar 拦；
-3. `bff:8081/metrics` 里出现 `rpcx_requests_total{rpc_role="client"}`（证明应用侧指标没被网格吞掉）；
-4. 直方图分桶是秒级（`le="0.001"` 起），不是 OTel 缺省的 `le="5"` 一档到底。
+> 取数方式：app 容器是刻意不装包的 alpine（**没有 curl**），Pod 内判据一律经
+> 同 Pod 的 `istio-proxy` 容器发（proxyv2 自带 curl 8.5，共享网络命名空间）。
+
+1. **Pod 内采集口有输出** ✅
+   `kubectl -n launchx-mesh exec deploy/srv-order -c istio-proxy -- curl -s localhost:9031/metrics`
+   返回 `rpc_server_duration`（kitex server 侧）等 79 行 Prometheus 文本。
+2. **网格外抓取不被 sidecar 拦** ✅
+   宿主 `kubectl port-forward svc/srv-order 19031:9031` → `curl 127.0.0.1:19031/metrics`
+   拿到同样 79 行（`excludeInboundPorts: 9031` + 端口名 `tcp-metrics` 生效）；
+   **对照**：同法 port-forward 9022（RPC 口）直接连接失败（HTTP=000）——ALLOW 策略对
+   网格外身份确实在拦，说明 9031 的放行是排除注解的功劳，不是策略没生效。
+3. **应用侧指标没被网格吞掉** ✅
+   `bff:8081/metrics` 出现 `rpcx_requests_total{rpc_role="client"}`：
+   `CreateOrder→srv-order 4 / GetAccount→srv-points 4 / GetOrder→srv-order 4 /
+   GetProduct→srv-product 8`（计数与 verify 打流量次数逐次吻合）。
+4. **直方图分桶是秒级** ✅
+   `rpcx_request_duration_seconds_bucket` 分桶 `le="0.001"` 起：
+   `0.001 / 0.0025 / 0.005 / 0.01 / 0.025 / 0.05 / 0.1 / 0.25 / 0.5 / 1 / 2.5 / 5 / 10 / +Inf`。
+   注意别拿 `rpc_server_duration`（`le="5"` 起）当反例 —— 那是 kitex-contrib
+   第三方埋点的 OTel 缺省毫秒桶，不是本判据的对象；判据只管 rpcx 自己的
+   `rpcx_request_duration_seconds`（`_seconds` 后缀即单位声明）。
+
+---
+
+## 8. 环境漂移修复记录（2026-10-10，留给后来人）
+
+本轮复验前集群是**重建过的**（k8s v1.28.0 → v1.33.1），连环踩了三个新坑，
+两个已修进脚本/Makefile，一个属外部环境污染：
+
+### 8.1 原生 sidecar 让探针检测误判「未注入」→ 全 502（脚本已修）
+
+k8s ≥1.29 起 Istio 的 `istio-proxy` 以**原生 sidecar** 形态落在
+`spec.initContainers`（不再是 `spec.containers`）。`bring-up.sh` 的 `mesh_curl`
+探针检测只查 `.spec.containers[*].name` → 永远找不到 → 回退宿主直连 →
+宿主解析不了集群域名，每条路由都 502。已修：jsonpath 同时查两处
+（`{.spec.containers[*].name} {.spec.initContainers[*].name}`），新旧集群都兼容。
+
+### 8.2 istio-system 被同机另一个网格案例污染 → sidecar span 全灭
+
+本轮 istiod 起来后业务全通但**一条 sidecar span 都没有**（T13 矩阵 0/8）。
+根因：minikube 里的 istio-system 是**另一套网格案例**（`service_mesh/`）装的，
+meshConfig 的 extensionProvider 叫 `otel-tracing` 指向 `jaeger.mesh-external`，
+与本案例 Telemetry 引用的 provider `jaeger`（→ `host-middleware.launchx-mesh:4317`）
+**名字对不上**，istiod 静默不生成 OTLP cluster（与 §4.1 同族）。
+修法：`istioctl install -y -f deploy/istio/operator.yaml` 重放即收敛（幂等）。
+教训：`bring-up.sh install` 的「istio-system 已存在则跳过」只挡重复安装，
+**挡不住配置漂移** —— 共享集群里探到 sidecar span 全灭时先核对
+`kubectl -n istio-system get cm istio -o jsonpath='{.data.mesh}'` 的 provider 名。
+
+### 8.3 Jaeger 的 ES 后端退出 → `/api/services` 500
+
+`elasticsearch` 容器 Exited(137)（19 小时前，OOM 类），Jaeger 查询全 500
+（`no Elasticsearch node available`）。`docker start elasticsearch` 后集群 **red**
+（单节点 102 个 unassigned 副本分片），`PUT /jaeger-*/_settings
+{"index":{"number_of_replicas":0}}` 后 yellow 恢复查询。
+注意 `hot:product:*` 是 micro/mall 组的缓存键；apps 组的详情缓存键是
+**`mesh:product:detail:<id>`**（`service/product.go key()`），清缓存别清错前缀。
+
+### 8.4 顺带修掉：buildkit 的 FROM 元数据解析不走本地回退
+
+`make image` 在 minikube daemon 里 buildkit 构建，`FROM alpine:3.20` 的**元数据解析**
+联网（docker.io 在本机不可达），即使 daemon 本地已有该镜像也**不回退**，必然 timeout。
+已在 `apps/Makefile` 的 image 目标固化为两步：`minikube image load alpine:3.20`
+预载 + `DOCKER_BUILDKIT=0` 走 legacy builder（直接用本地镜像）。

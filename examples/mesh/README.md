@@ -143,6 +143,9 @@ rpcx 走 Kitex 默认的 **TTHeader over TCP**（私有协议），Istio 对未�
 | sidecar span 与应用 span 分两条 trace | 用了 `zipkin` provider（发 B3 头） | 必须 `opentelemetry` provider（发 W3C `traceparent`） |
 | `istioctl install --set ...tracing.sampling` 直接 panic | 1.30 的 `tracing` 是数组，与 map 语义写路径冲突 | 用 `-f deploy/istio/operator.yaml` + Telemetry API |
 | bff→srv 这一跳没有 sidecar span | Kitex 私有协议经 `tcp_proxy`，Envoy 看不见请求 | **不是 bug**，见 §5；T10 分两段断言 |
+| verify 每条路由 502，日志回退「宿主直连」 | k8s ≥1.29 原生 sidecar：istio-proxy 在 `initContainers`，旧版检测只查 `containers` | 已修进 `bring-up.sh`（两处都查）；详见 `docs/verify.md` §8.1 |
+| 业务全通但 sidecar span 全灭（矩阵 0/8） | 共享集群的 meshConfig 被**别的案例**污染，Telemetry 引用的 provider 名不存在 | 重放 `istioctl install -y -f deploy/istio/operator.yaml`；核对 `cm/istio` 的 provider 名，详见 `docs/verify.md` §8.2 |
+| `make image` 卡 `FROM alpine:3.20` timeout | buildkit 元数据解析联网且**不走本地回退** | 已固化进 `apps/Makefile`：`minikube image load` 预载 + `DOCKER_BUILDKIT=0`，详见 `docs/verify.md` §8.4 |
 
 ## 7. 验收落点
 

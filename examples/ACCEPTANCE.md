@@ -849,7 +849,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | 日志 ↔ 链路关联（trace_id 落日志字段） | ✅ | ✅ | ✅ | **2026-10-05 真机确认**：webx 访问日志自带 `trace_id` / `span_id` / `request_id`（`webx/middleware/logging.go:34`），实测 `{"trace_id":"993a319f…","span_id":"f464c7d2…","method":"POST","path":"/orders","status":201}`，与 Jaeger 中该请求的 traceID 一致 |
 | HTTP 健康端点 | ✅ `/healthz/live` + `/healthz/ready` | gateway/bff ✅；srv ❌ | 由 k8s 探针替代 | `webx/webx.go:130`（`HealthPrefix` 默认 `/healthz`，`webx/config.go:51`；**裸前缀路径无 handler**） |
 | 注册与健康检查 | 不注册 | consul TTL + 心跳 | consul + k8s 双层 | coordx |
-| metrics / Prometheus | ✅ | ✅ | ⚠️ 配置就绪，**未真机复验** | 落点：`internal/telemetry.NewMetrics` 建 MeterProvider（拉取式，`otel/exporters/prometheus`）→ HTTP 档挂 `webx.MetricsPrefix`、srv 档单起 `metrics.addr`；RPC 侧 `rpcx.{requests,request.duration,errors}`。**2026-10-08 实测**：单体 `:8080/metrics`、微服 `bff:8081/metrics`（含 `rpcx_requests_total{rpc_role="client"}`）与 `srv-order:9031/metrics`（`rpc_role="server"`）均返回 Prometheus 文本；网关/域服启动日志打出 `rpc governance: ... metrics=on`。网格列只在清单里备好了采集口（`tcp-metrics` + `excludeInboundPorts`），本轮没有集群可验 —— **不得写成 ✅** |
+| metrics / Prometheus | ✅ | ✅ | ✅（**2026-10-10 真机复验**，4/4） | 落点：`internal/telemetry.NewMetrics` 建 MeterProvider（拉取式，`otel/exporters/prometheus`）→ HTTP 档挂 `webx.MetricsPrefix`、srv 档单起 `metrics.addr`；RPC 侧 `rpcx.{requests,request.duration,errors}`。**2026-10-08 实测**：单体 `:8080/metrics`、微服 `bff:8081/metrics`（含 `rpcx_requests_total{rpc_role="client"}`）与 `srv-order:9031/metrics`（`rpc_role="server"`）均返回 Prometheus 文本；网关/域服启动日志打出 `rpc governance: ... metrics=on`。**2026-10-10 网格列实测**（证据 `mesh/docs/verify.md` §7.3）：srv-order `9031/metrics` Pod 内 79 行、宿主 port-forward 抓取不被 sidecar 拦（对照 9022 被 ALLOW 策略拒）、bff `8081/metrics` 含 `rpcx_requests_total{rpc_role="client"}` 且计数与流量吻合、`rpcx_request_duration_seconds` 分桶 `le="0.001"` 起 |
 | pprof | ❌ | ❌ | ❌ | 本轮不做 |
 | 告警 / 看板 | ❌ | ❌ | ❌ | 本轮不做 |
 
@@ -859,8 +859,9 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 > **metrics 这一格本轮从 ❌ 翻成 ✅/⚠️，翻的依据是真机输出而非"代码里写了"**：
 > 判据是 `curl /metrics` 拿到 `# HELP` + 带业务标签的计数器（`rpc_role="client"` /
 > `rpc_role="server"`）、以及启动日志里的 `metrics=on`。复跑命令见 `micro/scripts/e2e.sh`
-> 的断言 ③（已并入 E2，退出码即结论）。网格列**刻意只记 ⚠️**：清单里采集口与
-> `excludeInboundPorts` 都备好了，但本轮没有起集群 —— 没验过就不写 ✅。
+> 的断言 ③（已并入 E2，退出码即结论）。网格列曾记 ⚠️（2026-10-08 清单备好但无集群可验），
+> **2026-10-10 起集群逐条复验 4/4 通过后翻 ✅**（命令与输出见 `mesh/docs/verify.md` §7.3，
+> 复验过程中修掉的三个环境漂移坑见同文件 §8）。
 
 ## 13.5 服务治理分工：哪些交给网格，哪些必须留在应用侧
 

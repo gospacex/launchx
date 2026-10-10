@@ -300,7 +300,10 @@ mesh_curl() {
     [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
   fi
   for pod in $(kubectl -n "$NS" get pods -o name 2>/dev/null | sed 's|pod/||'); do
-    if [[ "$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null)" == *istio-proxy* ]]; then
+    # initContainers 也要查：k8s ≥1.29 的**原生 sidecar**形态下 istio-proxy 落在
+    # spec.initContainers（本机集群重建到 v1.33.1 后实测如此；v1.28 时代在 containers），
+    # 只查 containers 会误判「没有注入」并回退宿主直连，全部请求 502。
+    if [[ "$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[*].name} {.spec.initContainers[*].name}' 2>/dev/null)" == *istio-proxy* ]]; then
       want="$pod"; break
     fi
   done
