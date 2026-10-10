@@ -24,6 +24,12 @@ spec:
     - name: tcp-rpc
       port: 9013
       targetPort: 9013
+    # 采集口。端口名用 `tcp-`（L4）而不是 `http-`：/metrics 是普通 HTTP/1.1，
+    # 但声明成 http-* 会让 sidecar 按 L7 接管，从而落进 50-authz.yaml 的
+    # `action: ALLOW`（只放行 sa/bff）—— Prometheus 一律 403。
+    - name: tcp-metrics
+      port: 9030
+      targetPort: 9030
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -48,6 +54,8 @@ spec:
           ports:
             - name: rpc
               containerPort: 9013
+            - name: metrics
+              containerPort: 9030
           env:
             - name: POD_IP
               valueFrom:

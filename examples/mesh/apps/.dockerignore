@@ -1,0 +1,17 @@
+# ⚠️ **绝不能排除 `bin/`** —— Dockerfile 唯一一条 `COPY` 就是 `COPY bin/ /app/bin/`。
+# 曾经这里照抄 .gitignore（bin/ 是构建产物）写了 `bin/`，结果构建期报
+#   ERROR: failed to calculate checksum ... "/bin": not found
+# 且**不提示是 .dockerignore 的锅**。两个文件的语义不同：.gitignore 排除产物，
+# .dockerignore 这里恰恰要**只送**产物。
+# 对照 `examples/docker/.dockerignore` 是空文件，同样因为要 COPY bin/。
+cmd/
+conf/
+internal/
+pkg/
+go.mod
+go.sum
+Makefile
+README.md
+Dockerfile
+.dockerignore
+.gitignore

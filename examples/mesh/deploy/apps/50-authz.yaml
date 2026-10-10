@@ -1,0 +1,73 @@
+# 传输层身份：四域 srv 只接受来自 bff 的调用。
+#
+# 这正是 micro 的 `pkg/auth/auth.go:61` 自己承认「防不住内网里的恶意调用
+#（那需要 mTLS）」的那一半 —— 由 Istio 的身份（SPIFFE）补上。
+# 应用侧仍需保留按业务字段的鉴权（谁能退谁的款），那是 AuthorizationPolicy 看不到的。
+#
+# ⚠️ 这条规则认的是**调用方**的 SPIFFE principal，即 `sa/bff`：
+#   必须保证 bff Pod 跑在名为 `bff` 的 ServiceAccount 下 —— 已在 `30-bff.yaml`
+#   里显式建了 `ServiceAccount: bff` 并写了 `serviceAccountName: bff`。
+#   缺了它，实际 principal 是 `.../sa/default`，四条 ALLOW 全部匹配不上
+#   ⇒ 四域对 bff 一律 403，且 `istioctl analyze` **报不出**（纯运行期行为）。
+#
+# 四份写在同一文件的 `---` 分隔下：AuthorizationPolicy 的 `selector` 是单个
+# 资源一个，四域就得四份（不能一条规则覆盖四个 workload）。
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: srv-order-from-bff-only
+  namespace: launchx-mesh
+spec:
+  selector:
+    matchLabels:
+      app: srv-order
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/launchx-mesh/sa/bff"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: srv-points-from-bff-only
+  namespace: launchx-mesh
+spec:
+  selector:
+    matchLabels:
+      app: srv-points
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/launchx-mesh/sa/bff"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: srv-product-from-bff-only
+  namespace: launchx-mesh
+spec:
+  selector:
+    matchLabels:
+      app: srv-product
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/launchx-mesh/sa/bff"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: srv-stock-from-bff-only
+  namespace: launchx-mesh
+spec:
+  selector:
+    matchLabels:
+      app: srv-stock
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/launchx-mesh/sa/bff"]

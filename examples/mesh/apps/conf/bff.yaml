@@ -1,0 +1,106 @@
+# =============================================================================
+# bff（apps 组）—— HTTP 边界档配置
+# -----------------------------------------------------------------------------
+# 纪律：地址一律来自本文件，Go 代码零硬编码。
+#
+# 与 micro 的 bff/config.yaml 的系统性差异只有三处（业务字段一字未动）：
+#   1. **无注册中心配置段**（xmiddleware 下只有 cachex）：apps 不注册也不发现，
+#      服务发现交 K8s Service + Istio EDS。判据是 conf/ 里搜不到注册中心驱动段
+#      （bring-up.sh check 会跑这条 grep）；
+#   2. `service.upstream.<域>` 从「注册中心不可用时的直连兜底」变成**唯一**
+#      地址来源：RegistryAddr 为空 ⇒ rpcx.BuildClientOptions 走 Target 分支 ⇒
+#      client.WithHostPorts ⇒ kitex 的 dns resolver 去解析 Service 名。
+#      写错 FQDN 的症状是入口 502 且四域一条 span 都没有；
+#   3. 宿主中间件地址走宿主门面名 host-middleware（见
+#      deploy/shared/20-host-middleware.yaml：换宿主 IP 只改那一处 Endpoints）。
+#
+# 本机起服时把 host-middleware.* 与下面四个 FQDN 换成回环地址即可 ——
+# 属**临时改动，不得落回文件**（Task 15 的地址自检会拦裸本机地址）。
+# =============================================================================
+service:
+  name: bff # 服务名 = Jaeger 的 service，也是 cachex 的实例名
+  mode: bff # 四档之一：monolith / bff / srv / gateway
+  addr: "0.0.0.0:8081" # 容器内必须监听全地址：绑回环地址时 Pod 外不可达
+  upstream:
+    srv-order: "srv-order.launchx-mesh.svc.cluster.local:9022"
+    srv-points: "srv-points.launchx-mesh.svc.cluster.local:9024"
+    srv-product: "srv-product.launchx-mesh.svc.cluster.local:9021"
+    srv-stock: "srv-stock.launchx-mesh.svc.cluster.local:9023"
+
+webx:
+  addr: "0.0.0.0:8081"
+  timeout: 5s
+  rate_limit_rps: 100 # 入口自保护：按 client IP 令牌桶（Envoy 同维度可替代）
+  rate_limit_burst: 200
+  cors_origins: []
+  health_prefix: /healthz # webx 自带 /healthz/{live,ready}，业务不自建
+
+# 调用链：全局闸 + 组件级开关（后者只裁决**组件 span** 的产出）。
+# bff 只有一个组件句柄 cache，且它必须在册：handles 自检对
+# 「句柄在 + 该组件开关开」才去核对入链有效性（Diverged 判据）。
+trace:
+  enabled: true
+  endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+  on:
+    cache: true
+
+logx:
+  level: info
+  otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
+    enable_trace: true
+
+# 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+# HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流），
+# RPC 客户端/服务端中间件也按这一开关挂。**关掉（false 或不写）即不建 provider**，
+# meter 退回 noop：不产生指标、不留采集口，但 Instrument 调用点仍在（不会少埋点）。
+metrics:
+  enabled: true
+# 刻意**不设** strict：bff 的硬前提只有凭据缓存，缺了由 app.Setup 显式报错
+# （handles.VerifyOrError(a, "cache")），不靠 strict 兜。
+# 也**不设** auth 段：apps 的传输层身份下沉给 Istio（RequestAuthentication +
+# AuthorizationPolicy），应用侧对匿名请求 fail-open（identity 层只做 best-effort
+# 反查、供下游限流分桶），故这里没有 require 这类开关可配。
+xmiddleware:
+  # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
+  # 它不是组件：三项都只在客户端选项装配那一刻起作用，故配置面收在 rpcx、
+  # 由 mode 在装配期读进 App.RPCClientOptions 产出的选项里。**零值全关**，
+  # 不写这一段 = 产生的 client.Option 与引入治理之前逐字相同。
+  rpcx:
+    # 熔断：服务级（调用方/被调方）+ 实例级两道闸。阈值写出来是为了让当前
+    # 生效值可见（不写则用 kitex 缺省，同样是 0.5 / 200）。打开它**不改成功
+    # 路径**，作用是在持续故障时快速失败，而不是继续把请求打到坏实例上。
+    circuit_breaker:
+      enabled: true
+      error_rate: 0.5      # 触发熔断的错误率阈值，取值 (0,1]
+      min_sample: 200      # 触发熔断所需的最小样本数
+    # 重试：本档**故意不开**。这条链路上有非幂等写（下单 / 扣减 / 入账），
+    # 传输层超时重试会产生重复落库；且一旦网格侧也开了 HTTP 跳重试，
+    # 故障期双侧重试会互相放大（ACCEPTANCE §13.5 硬规则 1）。
+    # 开启前先确认两件事：max_attempts ≤ 5（kitex 越界即 panic，装配期已拦）、
+    # Istio VirtualService 的 retries 为空。
+    # 再看一眼预算：单次业务调用最坏耗时 ≈ (1 + max_attempts) × RPCTimeout
+    #（rpcx 缺省 3s），三试就是 9s —— 已盖过入口的 webx.timeout(5s)，
+    # 表现为引擎先 504、而重试还在后台跑。真开重试须同时收紧 max_duration_ms。
+    retry:
+      enabled: false
+      max_attempts: 2      # 不含首次调用
+      backoff_ms: 10       # 固定退避；0 = 不退避
+    # 负载均衡：闭集 weighted_random（缺省）/ weighted_round_robin /
+    # interleaved_weighted_round_robin。刻意**不给** consistent_hash ——
+    # 它需要业务侧的 key 函数，没有默认值，配了只会把请求全打到同一实例上。
+    # 不写这一项即用 kitex 缺省（weighted_random）。
+  # ----- cachex：边界凭据存储（token → user_id），bff 唯一的数据面 -----
+  # 为什么边界要有进程外存储：用本地 map 会让「一次签发要能被所有 bff 实例认」
+  # 不成立，多实例部署时表现为「请求随机 401」。这里存的不是业务数据
+  #（业务数据只在下游四域），故与「bff 不用 DB()」的口径不冲突。
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      bff: # 实例名须与 service.name 一致（setup.go 按它取实例）
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        db: 2 # 与其他域的 0/1/3 分开：凭据被逐出 = 全员 401
+        pool_size: 30

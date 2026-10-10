@@ -32,6 +32,14 @@
   python3 trace-audit.py --service demo-monolith --lookback 1h
   python3 trace-audit.py --service demo-gateway,demo-bff,demo-srv --lookback 1h --json /tmp/audit.json
   python3 trace-audit.py --service demo-gateway,demo-bff,demo-srv --lookback 30m --mesh
+
+路由矩阵（--mesh + --route-matrix，判「入口 → bff → 目标域业务层」逐路由成立）：
+  python3 trace-audit.py --route-matrix route-matrix-apps.txt --lookback 3m --mesh
+  逐行断言：窗口内存在该路由的根 span 且其 trace 同时含目标域 service.<域>.* span
+  与 sidecar span（component=proxy + upstream_cluster）。任一行不成立即退出 1。
+  --service 省略时默认取 bff + 四域并集（业务 span 在 srv 侧，只查 bff 会被
+  健康探针的 trace 挤掉）。
+
 退出码：0 = 全部 trace 通过；1 = 有 trace 不通过；2 = 连不上 Jaeger / 无 trace。
 """
 
@@ -146,8 +154,8 @@ def audit_trace(trace, mesh_ns=None):
                 exempt = "错误路径（根 span 标记 error）"
         # E3 错误路径（另一种形态）：error 标记只打在**出错的那一层**
         #   （handler/service）上，根 span 依然干净 —— 实测 POST /orders 传错字段
-        #   返回 400 时，根 span 的 tags 是空 dict，只有 handler.CreateOrder 与
-        #   service.CreateOrder 带 error=True/otel.status_code=ERROR。只查根 span
+        #   返回 400 时，根 span 的 tags 是空 dict，只有 handler.order.CreateOrder 与
+        #   service.order.CreateOrder 带 error=True/otel.status_code=ERROR。只查根 span
         #   的 E1 抓不到，于是这类「校验失败、根本没到数据层」的 trace 会被误判
         #   成 R2 缺 repository 层。判据：任一 span 出错 **且** 确实没触达数据层。
         any_err = any(
@@ -270,10 +278,374 @@ def audit_trace(trace, mesh_ns=None):
     return "business", detail, fails
 
 
+# ---------------------------------------------------------------------------
+# 路由矩阵判据（--route-matrix）
+# ---------------------------------------------------------------------------
+# 存在性判据（「打一条 URL，trace 里有 sidecar span 就 PASS」）证明不了入口的
+# 六条路由各自通到了对应域的业务逻辑：六条路由全接到 order 域、或 handler 是空
+# 实现，它都会绿。矩阵判据把「存在」升级为「逐路由的目标域业务 span 存在」。
+
+MATRIX_DEFAULT_SERVICES = ["bff", "srv-order", "srv-points", "srv-product", "srv-stock"]
+
+
+def is_proxy_span(span):
+    """Envoy span 的认证书：`component=proxy` + `upstream_cluster`。
+
+    为什么矩阵判据不沿用「服务名以 .<ns> 结尾」那条：apps 组的入口跳**跨命名空间**
+    —— istio-ingressgateway 在 istio-system，它的服务名里根本没有 launchx-mesh，
+    按后缀筛就只剩 bff 的 inbound 一跳，「覆盖 >= 2 跳」永远差一跳（实测）。
+    tag 才是 Envoy 自己的签名，两端都认得出来。
+    """
+    t = span_tags(span)
+    return t.get("component") == "proxy" and bool(t.get("upstream_cluster"))
+
+
+def parse_matrix(path):
+    """解析矩阵文件。行格式（# 开头为注释，字段 | 分隔）：
+
+    路径|方法|目标域|期望 service span 前缀|请求体(可选)
+    +async|<域>|<消费侧 span 前缀>[|<生产侧 span 前缀>]
+    +cache|<域>|<路径>|<方法>|<命中侧须有的 span 前缀>|<回源侧 span 前缀(空格分隔)>
+    """
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if parts[0] == "+cache":
+                # 缓存命中判据：同一路由连续读两次，较旧那条必须回源（含 miss 段
+                # 列出的 span），较新那条必须**不含**它们 —— 命中缓存时不会再有
+                # db.query / repository.* 这类回源 span。
+                if len(parts) < 6:
+                    raise ValueError(
+                        f"{path}:{lineno} +cache 行需 6 段："
+                        "+cache|<域>|<路径>|<方法>|<命中侧 span>|<回源 span(空格分隔)>"
+                    )
+                rows.append(
+                    {
+                        "kind": "cache",
+                        "lineno": lineno,
+                        "route": parts[2],
+                        "method": parts[3],
+                        "domain": parts[1],
+                        "span": parts[4],
+                        "miss": parts[5].split(),
+                        "pair": None,
+                        "body": "",
+                    }
+                )
+                continue
+            if parts[0] == "+async":
+                if len(parts) < 3:
+                    raise ValueError(
+                        f"{path}:{lineno} +async 行至少 3 段：+async|<域>|<消费侧 span 前缀>"
+                    )
+                # 3 段时生产侧按域推导（POST /order 的下单 span）；4 段则显式给出
+                produce = parts[3] if len(parts) > 3 and parts[3] else f"service.{parts[1]}.CreateOrder"
+                rows.append(
+                    {
+                        "kind": "async",
+                        "lineno": lineno,
+                        "route": "+async",
+                        "method": "-",
+                        "domain": parts[1],
+                        "span": parts[2],
+                        "pair": produce,
+                    }
+                )
+                continue
+            if len(parts) < 4:
+                raise ValueError(
+                    f"{path}:{lineno} 至少 4 段：路径|方法|目标域|期望 span 前缀"
+                )
+            rows.append(
+                {
+                    "kind": "http",
+                    "lineno": lineno,
+                    "route": parts[0],
+                    "method": parts[1],
+                    "domain": parts[2],
+                    "span": parts[3],
+                    "body": parts[4] if len(parts) > 4 else "",
+                }
+            )
+    if not rows:
+        raise ValueError(f"{path} 里没有任何矩阵行")
+    return rows
+
+
+def route_aliases(path):
+    """路由的等价写法。
+
+    `/api` 前缀会被 Istio VirtualService 的 rewrite 剥掉，所以外部是
+    `/api/order/2`、应用侧看到的是 `/order/2`；micro 组没有 rewrite，两种都要认。
+    查询串一律剥掉（span 名与 http.url 都不带 query 进判据）。
+    """
+    p = path.split("?", 1)[0]
+    alts = {p}
+    if p.startswith("/api"):
+        alts.add(p[len("/api"):])
+    return alts
+
+
+def match_route(view, path, method):
+    """把一条 trace 绑到矩阵的一行路由上，命中则返回该次请求的 (status)。"""
+    alts, m = route_aliases(path), method.upper()
+    for e in view["http"]:
+        if e["path"] in alts and e["method"] == m:
+            return e.get("status")
+    # 回退：应用侧 span 名（无 sidecar 的形态，如本地直连跑的五进程 ——
+    # 那种情况下没有 Envoy 打 tag，根 span 就是 `GET /order/2`）。
+    ops = {f"{m} {a}" for a in alts}
+    if any(o in ops for o in view["ops"]):
+        return None
+    return False  # 未命中（与「命中但状态未知」的 None 区分开）
+
+
+def http_entries(trace):
+    """抽出入向 HTTP 的 (方法, 路径, 状态) —— 路由绑定**只能**靠它。
+
+    ⚠️ 实测反直觉点：网格形态下 trace 的**根 span 是 Envoy 的 proxy span**
+    （`bff.launchx-mesh.svc.cluster.local:8081/api*`），应用 span
+    （`GET /order/2`）是它的子节点 —— 因为入口那一跳由 ingressgateway 开链。
+    所以「根 span 名 == 路由」这个直觉在网格下根本不成立，早期版本据此判
+    「窗口内没有该路由的 trace」，六行全 FAIL 而真正的问题一个没有。
+    URL 与状态码都只在 Envoy 的 tag 上（应用侧的 webx 根 span 只打 http.method），
+    —— 换句话说：**HTTP 状态这一列，只有走网格才验得成。**
+    """
+    out = []
+    for s in trace["spans"]:
+        t = span_tags(s)
+        url = t.get("http.url") or t.get("http.target") or ""
+        if not url:
+            continue
+        url = url.split("?", 1)[0]
+        path = urllib.parse.urlsplit(url).path or url
+        out.append(
+            {
+                "method": (t.get("http.method") or "").upper(),
+                "path": path,
+                "status": t.get("http.status_code") or t.get("http.response.status_code"),
+            }
+        )
+    return out
+
+
+def trace_view(trace):
+    spans = trace["spans"]
+    roots = [s for s in spans if parent_id(s) is None]
+    proxy = [s for s in spans if is_proxy_span(s)]
+    return {
+        "raw": trace,
+        "traceID": trace["traceID"],
+        "ops": [s["operationName"] for s in spans],
+        "root_op": roots[0]["operationName"] if len(roots) == 1 else None,
+        "root_tags": span_tags(roots[0]) if len(roots) == 1 else {},
+        "start": min(s["startTime"] for s in spans),
+        "proxy_hops": sorted({span_tags(s)["upstream_cluster"] for s in proxy}),
+        "http": http_entries(trace),
+    }
+
+
+def http_status_of(view):
+    for key in ("http.status_code", "http.response.status_code"):
+        if key in view["root_tags"]:
+            return view["root_tags"][key]
+    return None
+
+
+def eval_row(row, views, now_us):
+    """返回 dict：ok / http / span / hops / traceID / age / 缺失原因列表。"""
+    # `-` = 该路由刻意不触达任何域（如 /ping 是存活性自响应），不设 span 期望；
+    # 但「窗口内有这条路由的 trace」与「该 trace 有 sidecar span」照判 ——
+    # 它仍然证明入口这一跳走了网格。
+    def wanted(x):
+        return None if x in ("-", "", "n/a") else x
+
+    if row["kind"] == "cache":
+        # 缓存命中判据：**只按时间取最后两条同路由的 trace** 做对比，不靠
+        # 「哪条是第一次」这种记数 —— 窗口里可能有更早的历史 trace，全取会
+        # 把上一轮的读混进来。
+        cands = sorted(
+            [v for v in views if match_route(v, row["route"], row["method"]) is not False],
+            key=lambda v: v["start"],
+        )
+        if len(cands) < 2:
+            return {
+                "ok": False,
+                "http": "-",
+                "span": "MISS",
+                "hops": 0,
+                "traceID": "-",
+                "age": None,
+                "why": [
+                    f"窗口内该路由只有 {len(cands)} 条 trace，缓存命中判据需要 ≥2 条"
+                    f"（同一路由连读两次：前一次回源并回填、后一次命中缓存）"
+                ],
+            }
+        older, newer = cands[-2], cands[-1]
+        want = wanted(row["span"])
+        miss_spans = row["miss"]
+        # 回源侧：较旧那条必须**至少含一个**回源 span（证明真的回源了）。
+        older_miss = sorted(
+            {m for m in miss_spans if any(o.startswith(m) for o in older["ops"])}
+        )
+        # 命中侧：较新那条**一个都不许有**。
+        newer_miss = sorted(
+            {m for m in miss_spans if any(o.startswith(m) for o in newer["ops"])}
+        )
+        biz_ok = want is None or any(o.startswith(want) for o in newer["ops"])
+        hops_ok = len(newer["proxy_hops"]) > 0
+        hit = match_route(newer, row["route"], row["method"])
+        code = (hit if hit not in (None, False) else None) or http_status_of(newer)
+        status_ok = True if code is None else str(code).startswith("2")
+        ok = bool(older_miss) and not newer_miss and biz_ok and hops_ok and status_ok
+        why = []
+        if not older_miss:
+            why.append(
+                f"前一次读没有回源 span（期望含 {' / '.join(miss_spans)} 之一）"
+                "—— 缓存可能一直是热的，本轮没验到回源"
+            )
+        if newer_miss:
+            why.append(
+                f"后一次读仍含回源 span {' '.join(newer_miss)} —— 缓存未命中"
+            )
+        if not biz_ok:
+            why.append(f"命中侧 trace 内没有以 {want} 开头的 span")
+        if not hops_ok:
+            why.append("命中侧 trace 内没有 sidecar span（component=proxy）")
+        if not status_ok:
+            why.append(f"命中侧 HTTP 状态非 2xx：{code}")
+        return {
+            "ok": ok,
+            "http": "n/a" if code is None else str(code),
+            "span": "✓命中" if not newer_miss else "MISS",
+            "pair": "✓回源" if older_miss else "MISS",
+            "hops": len(newer["proxy_hops"]),
+            "traceID": newer["traceID"],
+            "age": (now_us - newer["start"]) / 1e6 / 60,
+            "why": why,
+            "raw": newer["raw"],
+        }
+
+    if row["kind"] == "async":
+        cands = sorted(views, key=lambda v: -v["start"])
+        want_pair = wanted(row["pair"])
+        want = wanted(row["span"])
+    else:
+        cands = sorted(
+            [v for v in views if match_route(v, row["route"], row["method"]) is not False],
+            key=lambda v: -v["start"],
+        )
+        want_pair = None
+        want = wanted(row["span"])
+
+    if not cands:
+        why = (
+            f"窗口内没有该路由的 trace（期望入向 http.url 为 "
+            f"{' / '.join(sorted(route_aliases(row['route'])))} 且 http.method={row['method']}）"
+            if row["kind"] != "async"
+            else f"窗口内没有含 {row['pair']} 的 trace"
+        )
+        return {
+            "ok": False,
+            "http": "-",
+            "span": "MISS",
+            "hops": 0,
+            "traceID": "-",
+            "age": None,
+            "why": [why],
+        }
+
+    best, best_score = None, None
+    for v in cands:
+        span_ok = want is None or any(o.startswith(want) for o in v["ops"])
+        pair_ok = (want_pair is None) or any(o.startswith(want_pair) for o in v["ops"])
+        hops_ok = len(v["proxy_hops"]) > 0
+        # 状态码优先取**入向那一跳**自己的（Envoy 打在 http.url 同一条 span 上）；
+        # 拿不到再退到根 span 的 tag；都没有才记 n/a。
+        hit = None if row["kind"] == "async" else match_route(v, row["route"], row["method"])
+        code = (hit if hit not in (None, False) else None) or http_status_of(v)
+        # 根 span 没有 http.status_code 标签是 webx 的既有口径（实测只打
+        # http.method），记为 n/a 且不判失败 —— 真出错时下游 span 根本不会出现，
+        # 由 span_ok 兜住。
+        status_ok = True if code is None else str(code).startswith("2")
+        ok = span_ok and pair_ok and hops_ok and status_ok
+        score = (ok, span_ok, hops_ok, status_ok, v["start"])
+        if best_score is None or score > best_score:
+            best_score, best = score, v
+            detail = {
+                "ok": ok,
+                "http": "n/a" if code is None else str(code),
+                "span": "✓" if span_ok else "MISS",
+                "pair": "✓" if pair_ok else "MISS",
+                "hops": len(v["proxy_hops"]),
+                "traceID": v["traceID"],
+                "age": (now_us - v["start"]) / 1e6 / 60,
+                "why": [],
+                "raw": v["raw"],
+            }
+            if not span_ok:
+                detail["why"].append(f"trace 内没有以 {want} 开头的 span")
+            if not pair_ok:
+                detail["why"].append(
+                    f"trace 内没有以 {want_pair} 开头的 span（异步链生产侧）"
+                )
+            if not hops_ok:
+                detail["why"].append("trace 内没有 sidecar span（component=proxy）")
+            if not status_ok:
+                detail["why"].append(f"根 span HTTP 状态非 2xx：{code}")
+            if ok:
+                break
+    return detail
+
+
+def run_matrix(rows, views, now_us, mesh_ns=None):
+    print("\n=== 路由矩阵判据（入口 → bff → 目标域业务层 + sidecar）===")
+    print(f"{'#':<3}{'路由':<26}{'方法':<7}{'HTTP':<7}{'域 span':<9}{'sidecar':<9}{'trace':<10}年龄")
+    fails = 0
+    for row in rows:
+        r = eval_row(row, views, now_us)
+        mark = "PASS" if r["ok"] else "FAIL"
+        if not r["ok"]:
+            fails += 1
+        age = "-" if r["age"] is None else f"{r['age']:.1f}m"
+        if row["kind"] == "http":
+            label = row["route"]
+        elif row["kind"] == "cache":
+            label = f"+cache({row['route']})"
+        else:
+            label = f"+async({row['span']})"
+        print(
+            f"{row['lineno']:<3}{label[:25]:<26}{row['method']:<7}{r['http']:<7}"
+            f"{r['span']:<9}{(str(r['hops']) + ' 跳'):<9}{r['traceID'][:8]:<10}{age}"
+            f"  {mark}"
+        )
+        for w in r["why"]:
+            print(f"      ✗ {w}")
+        # 附加：对命中的这条 trace 再跑一遍 R1–R6（不计入矩阵判定，只提示）。
+        # 矩阵判的是「入口链条通不通」，R1–R6 判的是「单条 trace 的树是否完整」，
+        # 两者不是一个问题，别互相顶替。
+        if r["ok"] and r.get("raw") is not None:
+            kind, _detail, r_fails = audit_trace(r["raw"], mesh_ns=mesh_ns)
+            if kind == "business" and r_fails:
+                print(f"      ! R1–R6 附加检查（不计入矩阵）：{'; '.join(r_fails)}")
+    print(f"矩阵：{len(rows) - fails}/{len(rows)} 行通过")
+    return fails
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:16686")
-    ap.add_argument("--service", required=True, help="逗号分隔，如 demo-gateway,demo-bff")
+    ap.add_argument("--service", help="逗号分隔，如 demo-gateway,demo-bff；"
+                                      "给 --route-matrix 时可省略（默认 bff + 四域）")
+    ap.add_argument(
+        "--route-matrix",
+        metavar="FILE",
+        help="路由矩阵文件；给出后启用矩阵判据（逐路由断言目标域业务 span）",
+    )
     ap.add_argument("--lookback", default="1h")
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--json", help="把明细写到该文件")
@@ -287,6 +659,54 @@ def main():
     )
     args = ap.parse_args()
 
+    if args.route_matrix:
+        try:
+            rows = parse_matrix(args.route_matrix)
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: 矩阵文件不可用：{exc}", file=sys.stderr)
+            return 2
+        services = (
+            [s.strip() for s in args.service.split(",") if s.strip()]
+            if args.service
+            else list(MATRIX_DEFAULT_SERVICES)
+        )
+        # 健康检查的 trace 每 10s 一条，50 条的默认 limit 会被它们占满、把业务 trace
+        # 挤出去（实测：bff 拉 50 条全是 /healthz），矩阵模式必须拉得更宽。
+        limit = max(args.limit, 100)
+        views, seen, empty = [], set(), []
+        for svcname in services:
+            try:
+                traces = fetch_traces(args.base, svcname, args.lookback, limit)
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR: 拉取 {svcname} 失败：{exc}", file=sys.stderr)
+                return 2
+            n0 = len(views)
+            if not traces:
+                # 单个服务没 trace 不直接判死：业务路由可能还没打到它，由矩阵行自己
+                # 报「没有该路由的 trace」更精确；只有**全都**没有才说明 Jaeger 没数据。
+                empty.append(svcname)
+                continue
+            for t in traces:
+                if t["traceID"] in seen:
+                    continue
+                seen.add(t["traceID"])
+                views.append(trace_view(t))
+            print(f"  service={svcname}：取回 {len(traces)} 条，去重后新增 {len(views) - n0} 条")
+        if empty:
+            print(f"  ! 以下服务在窗口内无 trace：{empty}")
+        if not views:
+            print(f"ERROR: 所有服务在 {args.lookback} 内都没有 trace", file=sys.stderr)
+            return 2
+        print(f"合计 {len(views)} 条 trace 参与矩阵判定（lookback={args.lookback}）")
+        fails = run_matrix(rows, views, int(time.time() * 1_000_000), mesh_ns=args.mesh)
+        if fails:
+            print(f"\n结论：FAIL（矩阵 {fails} 行不通过）")
+            return 1
+        print("\n结论：PASS")
+        return 0
+
+    if not args.service:
+        ap.error("缺少 --service（或改用 --route-matrix）")
     services = [s.strip() for s in args.service.split(",") if s.strip()]
     all_details, all_fails, crud_seen, join_seen = [], {}, set(), False
     seen = set()  # 跨服务拉取会重复返回同一条 trace（各进程都在里面），按 traceID 去重

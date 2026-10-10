@@ -1,10 +1,10 @@
-# 网格形态真机验收证据（T10 / T11 / E5 / T12）
+# 网格形态真机验收证据（T10 / T11 / E5 / T12 / T13）
 
 本文件是 `examples/ACCEPTANCE.md` §11b 的**证据落盘**，不是操作手册（操作看 `../README.md`、
 `../scripts/bring-up.sh`）。所有数字来自本机实测，可复跑。
 
-- 验收时间：2026-10-05 20:40–21:15（UTC+8）
-- 结论：**T10 PASS / E5 PASS（OFF↔ON 可复现）/ T11 SKIP（见 §3，说明为何不伪造）**
+- 验收时间：2026-10-05 20:40–21:15（UTC+8）；**§6 的 T13 为 2026-10-08 18:56–19:02 追加**
+- 结论：**T10 PASS / E5 PASS（OFF↔ON 可复现）/ T11 SKIP（见 §3，说明为何不伪造）/ T13 PASS（7/7，见 §6）**
 
 ---
 
@@ -266,3 +266,218 @@ python3 scripts/trace-audit.py --service demo-gateway --lookback 2m --mesh
 ```
 
 期望：`网格入链：N/N 条业务 trace 含 sidecar span` 且 `结论：PASS`。
+
+---
+
+## 6. T13 —— apps 组（网格原生）：入口链条**路由矩阵**
+
+本节是 `mesh-entry-chain` spec 的判据落盘。与 §1 的 T10 判据（「**任意**一条业务 trace
+含 sidecar span」）不同，本节逐**路由**判定 —— 前者挡不住「六条路由全接到 order 域」
+这一类接线错误，后者能。
+
+- 验收时间：**2026-10-08 18:56 / 19:02 / 19:02（UTC+8，连跑三次）**
+- 结论：**PASS（7/7 行）**，三次连跑结果一致（见 §6.5）
+- 版本口径：minikube `v1.36.0` / kubectl `v1.28.0` / istioctl·istiod·data plane `1.30.1` /
+  Jaeger `all-in-one:1.63.0` / 宿主 macOS 8 GB，minikube `--cpus=2 --memory=4096`
+  （与 §0 同源，本轮复采确认未变）
+- 判据脚本：`examples/scripts/trace-audit.py --route-matrix <file> --mesh`
+- 矩阵定义：`examples/mesh/scripts/route-matrix-apps.txt`（apps 组）、
+  `route-matrix-micro.txt`（对照组）
+- 请求发起：`VARIANT=apps bash examples/mesh/scripts/bring-up.sh verify`
+
+### 6.1 路由矩阵实测表（第三次跑，19:02）
+
+| # | 路由 | 方法 | HTTP | 目标域 service span | sidecar 跳 | traceID（前 8） | 判定 |
+|---|---|---|---|---|---|---|---|
+| 1 | `/api/ping` | GET | 200 | —（刻意不触达任何域） | 2 跳 | `6ce73903` | PASS |
+| 2 | `/api/order/2` | GET | 200 | `service.order.GetOrder` | 2 跳 | `3fbb04e3` | PASS |
+| 3 | `/api/order` | POST | 200 | `service.order.CreateOrder` | 2 跳 | `b470f1ef` | PASS |
+| 4 | `/api/points/1` | GET | 200 | `service.points.GetPoints` | 2 跳 | `d3452ef3` | PASS |
+| 5 | `/api/product/1` | GET | 200 | `service.product.GetProduct` | 2 跳 | `2af90ab5` | PASS |
+| 6 | `/api/stock/1` | GET | 200 | `service.stock.GetStock` | 2 跳 | `ff82acf9` | PASS |
+| 7 | `+async`（异步链） | — | 200 | `service.points.ConsumeOrderCompleted` | 2 跳 | `b470f1ef`（**与第 3 行同一条**） | PASS |
+
+完整 traceID 与 span 计数（Jaeger API 实测）：
+
+| 路由 | traceID | span 数 | 该 trace 内全部 `service.*` span |
+|---|---|---|---|
+| `/api/ping` | `6ce739030bc733a82b321fc65f5b7d05` | 8 | — |
+| `/api/order/2` | `3fbb04e3baec56d1ecfd3e75f63cfc1e` | 19 | `service.order.GetOrder` |
+| `/api/order` | `b470f1effbe97a79c046aa2db55722b7` | 35 | `service.order.CreateOrder` / `service.order.GetOrder` / **`service.points.ConsumeOrderCompleted`** |
+| `/api/points/1` | `d3452ef339ba5b89b6999dc36f5f7ec9` | 18 | `service.points.GetPoints` |
+| `/api/product/1` | `2af90ab5b9b16f0af2aa750fcaacb449` | 17 | `service.product.GetProduct` |
+| `/api/stock/1` | `ff82acf9b60d53d6aa975e58ccfe2424` | 18 | `service.stock.GetStock` |
+
+**异步链是本节唯一能覆盖 points 域写路径的证据**：points 域的加分路径不经 HTTP
+（没有 `POST /points` 路由），同步矩阵六行覆盖不到它。第 7 行断言的是
+「`POST /order` 产生的 `order.completed.v1` 消息，被 `srv-points` 消费后开出的
+`service.points.ConsumeOrderCompleted` span，与下单请求**落在同一条 trace 内**
+（traceID 逐字相同）」—— 即 mqx 的 Inject/Extract 续链真的生效。
+
+### 6.2 sidecar 跳的构成（矩阵「sidecar」列到底数的是什么）
+
+矩阵里的 sidecar 列只覆盖 **`ingressgateway → bff` 这一跳**，实测每次请求产生 3 个
+proxy span（去重后 2 个 `upstream_cluster`）：
+
+| 产生方 | `upstream_cluster` | 性质 |
+|---|---|---|
+| `istio-ingressgateway.istio-system` | `outbound|8081||bff.launchx-mesh.svc.cluster.local` | 入向出侧 |
+| `bff.launchx-mesh` | `inbound|8081||` | 目标入侧 |
+
+> ⚠️ **不可交付项（不是缺陷）**：`bff→srv-<域>` 那几跳走 Kitex TTHeader over TCP，
+> Envoy 只按 `tcp_proxy` 处理，**永远没有 sidecar span**。四域的 RPC 跳本来就不该
+> 出现在这一列。同理，这四跳的熔断 / 重试 / 超时仍在应用侧，落点是
+> **`xmiddleware.rpcx` 配置段 → `rpcx` 的 `client.Option`**（`conf/*.yaml`），网格接不住。
+> 注意不是 `internal/srv/<域>/route` 或 `middleware` —— 那两层只有准入闸门与业务维度限流。
+> 全仓 `WithRetry` / `WithCircuitBreaker` / `WithLoadBalancer` 只出现在一个地方：
+> **`rpcx/governance.go`**（SDK 侧收敛，业务侧经 `xmiddleware.rpcx` 配置取用）。
+>
+> 因此「治理已下沉网格」的准确表述是：**mTLS + 连接级可观测 + HTTP 跳的 L7 治理**。
+> RPC 跳与企业级治理仍在应用侧。
+
+### 6.3 请求命令原文（六条，含 `POST /order` 的完整 body）
+
+探针一律从集群内**已在运行**的 `istio-proxy` 容器发出（`kubectl exec … -c istio-proxy --
+curl`）—— 不用临时 Pod，因为本机到 Docker Hub 不通，探针镜像会停在 `ImagePullBackOff`。
+
+```bash
+POD=$(kubectl -n launchx-mesh get pods -o name | grep bff | head -1 | sed 's|pod/||')
+BASE=http://istio-ingressgateway.istio-system.svc.cluster.local
+
+# 1  GET /api/ping
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
+  curl -s -m 20 -X GET -w '\nHTTP=%{http_code}\n' $BASE/api/ping
+# 2  GET /api/order/2
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
+  curl -s -m 20 -X GET -w '\nHTTP=%{http_code}\n' "$BASE/api/order/2?user_id=1"
+# 3  POST /api/order
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- curl -s -m 20 -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":1,"items":[{"product_id":1,"name":"demo","quantity":1,"unit_price":100}]}' \
+  -w '\nHTTP=%{http_code}\n' $BASE/api/order
+# 4  GET /api/points/1
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
+  curl -s -m 20 -X GET -w '\nHTTP=%{http_code}\n' $BASE/api/points/1
+# 5  GET /api/product/1
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
+  curl -s -m 20 -X GET -w '\nHTTP=%{http_code}\n' $BASE/api/product/1
+# 6  GET /api/stock/1
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
+  curl -s -m 20 -X GET -w '\nHTTP=%{http_code}\n' $BASE/api/stock/1
+```
+
+响应（第三次跑的实测原文）：
+
+```json
+{"msg":"pong"}
+{"user_id":1,"order_id":2,"order_no":"O2026100611321249656fe6","status":"created","total_amount":5998,"items":[{"product_id":3,"name":"e2e-商品-改价","quantity":2,"unit_price":2999}]}
+{"user_id":1,"order_id":1053,"order_no":"M20261008110229000001","total_amount":100}
+{"user_id":1,"account":{"user_id":1,"balance":1400}}
+{"product":{"product_id":1,"title":"demo product","price":100,"status":1,"category_id":1,"created_at":1791432044}}
+{"product_id":1,"stock":{"product_id":1,"total":100,"available":100}}
+```
+
+第 3 条回的 `order_id=1053` 是本轮新建的订单，它的 `order_no` 前缀 `M2026…` 与
+§6.1 第 7 行的消费 span 一一对应。
+
+### 6.4 判据脚本输出原文（第三次跑）
+
+```
+=== 路由矩阵判据（入口 → bff → 目标域业务层 + sidecar）===
+#  路由                        方法     HTTP   域 span   sidecar  trace     年龄
+13 /api/ping                 GET    200    ✓        2 跳      6ce73903  0.5m  PASS
+14 /api/order/2              GET    200    ✓        2 跳      3fbb04e3  0.4m  PASS
+15 /api/order                POST   200    ✓        2 跳      b470f1ef  0.4m  PASS
+16 /api/points/1             GET    200    ✓        2 跳      d3452ef3  0.4m  PASS
+17 /api/product/1            GET    200    ✓        2 跳      2af90ab5  0.3m  PASS
+18 /api/stock/1              GET    200    ✓        2 跳      ff82acf9  0.3m  PASS
+19 +async(service.points.Con -      200    ✓        2 跳      b470f1ef  0.4m  PASS
+矩阵：7/7 行通过
+
+结论：PASS
+```
+
+### 6.5 可复跑自检（连跑三次，判据必须每次都过）
+
+| 跑次 | 时间 | 矩阵 | 首行 traceID | 异步链 traceID |
+|---|---|---|---|---|
+| 1 | 18:56 | 7/7 PASS | `0e88bd88` | `a6017497` |
+| 2 | 19:02 | 7/7 PASS | `b4c3850f` | `2aab670a` |
+| 3 | 19:02 | 7/7 PASS | `6ce73903` | `b470f1ef` |
+| 4 | 19:10 | 7/7 PASS | `07281b9d` | `ca4b175a` |
+
+四次 traceID **各不相同**，且异步链 traceID 每次都与当次 `POST /order` 行一致 ——
+这条防的是「第一次 PASS 是陈旧 trace 凑出来的」：若第二次结果不稳定，说明
+`--lookback` 时间窗或 flush 等待不足。
+
+### 6.6 反例自检（判据必须真的能拦下接线错误）
+
+把 `/product/:id` 错误地接到 order 域（`service.points.GetPoints` 换给 product 路由）：
+
+```bash
+printf '/api/product/1|GET|points|service.points.GetPoints\n' > /tmp/bad-matrix.txt
+python3 scripts/trace-audit.py --base http://127.0.0.1:16686 \
+  --route-matrix /tmp/bad-matrix.txt --lookback 5m --mesh
+echo "rc=$?"     # 期望 1（非零 = 判据生效）
+```
+
+实测 `rc=1` 且报「窗口内没有该 span」—— 判据方向为真，不是恒真判据。
+
+### 6.7 本轮实测踩到并修掉的三个真因（留给后来人）
+
+| 症状 | 真因 | 修法 |
+|---|---|---|
+| `POST /order` 返回 **504** | 宿主 Kafka 的 `PLAINTEXT` 监听器 advertised 为 `127.0.0.1:9092`；Pod 里 bootstrap 能连上，**元数据一返回就 `dial tcp 127.0.0.1:9092`（连的是 Pod 自己）** | 给 kafka 加一个专供网格的监听器 `MESH://:9094`（advertised 为 `kafka:9094`），宿主 9092 不动；`conf` 与 ConfigMap 的 brokers 改 9094；`20-host-middleware.yaml` 暴露 9094 |
+| 异步链**时有时无**（约 2/3 命中） | `srv-order` 与 `srv-points` 共用消费组 `mqx-group`：kafka-go 的 Reader 在**创建时**就以 GroupID 加入并占住分区，order 侧占住 partition 0 却从不读取 ⇒ 落进该分区的消息永远不处理 | 两域各配独立 `group_id`（`srv-order` / `srv-points`），互不抢分区 |
+| 6 条路由的 trace **一条都匹配不上** | 网格下根 span 是 **Envoy 的 proxy span**，`operationName` 是 `bff.launchx-mesh.svc.cluster.local:8081/*` 这类，路径只存在于 `http.url` **标签**里 —— 按 `GET /order/2` 匹配根 span 名必然零命中 | 改按「根 span 的 `http.method` + `http.url`/`http.target` 标签」绑定路由，而不是按 span 名 |
+
+> 另外一条口径坑（判据脚本自身）：micro 组的根 span 是应用侧 `GET /api/order/2`，
+> apps 组因为 VirtualService 有 `rewrite.uri: /`，根 span 路径不带 `/api`。脚本两种写法
+> 都认，改判据时别只留一种。
+
+---
+
+## 7. 指标采集口（2026-10-08 新增：**配置就绪，未起集群复验**）
+
+口径先说清楚：**本节只记录"清单与配置里备好了什么"，不含真机证据。**
+本轮没有起 minikube，故 ACCEPTANCE §13.4 的网格列记 **⚠️**，不记 ✅。
+
+### 7.1 两种落法（取决于该档有没有 HTTP 面）
+
+| 档 | `/metrics` 落点 | 配置 |
+|---|---|---|
+| `bff`（HTTP 面） | **复用入口跳那一个端口** 8081 | `metrics.enabled: true`，不配 `addr` |
+| 四域 `srv`（无 HTTP 面） | 单起监听 `0.0.0.0:9031-9034` | `metrics.enabled: true` + `metrics.addr` |
+
+判据（在本机已验，集群里同样适用）：
+
+```bash
+kubectl -n launchx-mesh exec deploy/bff -- curl -s localhost:8081/metrics | head
+# 四域是从 Pod 外抓：需经上面的采集口，且端口名必须是 tcp-metrics（见 7.2）
+```
+
+### 7.2 一处**必须多写**（反向项，唯一一处）
+
+四域各有一条 `AuthorizationPolicy`，`action: ALLOW` 且只放行 `sa/bff` ——
+ALLOW 语义下**未匹配即拒绝**，而 Prometheus 不在网格里、没有 SPIFFE 身份 ⇒ 一律 403。
+所以在 `20-srv-order.yaml` 等四份清单里写了：
+
+```yaml
+annotations:
+  traffic.sidecar.istio.io/excludeInboundPorts: "9031"
+```
+
+被排除的端口不经 sidecar：无 mTLS、不受 `AuthorizationPolicy` 约束，代价是这一口
+的连接级遥测也没了（采集口不需要）。
+
+**端口名同样有讲究，而且方向与入口跳相反**：入口跳的 Service 端口必须叫 `http`
+（否则 Envoy 按 `tcp_proxy` 处理，`outlier detection` 与 HTTP 重试静默失效）；采集口
+则必须叫 **`tcp-metrics`** —— 写成 `http-metrics` 会被 L7 接管，正好撞上上面那条
+ALLOW 策略，Prometheus 拿 403 而不是指标。
+
+### 7.3 未复验清单（起集群后要逐条确认）
+
+1. `kubectl -n launchx-mesh exec deploy/srv-order -- curl -s localhost:9031/metrics` 有输出；
+2. 从集群内一个**非网格** Pod（或宿主经 port-forward）抓 9031，确认没被 sidecar 拦；
+3. `bff:8081/metrics` 里出现 `rpcx_requests_total{rpc_role="client"}`（证明应用侧指标没被网格吞掉）；
+4. 直方图分桶是秒级（`le="0.001"` 起），不是 OTel 缺省的 `le="5"` 一档到底。

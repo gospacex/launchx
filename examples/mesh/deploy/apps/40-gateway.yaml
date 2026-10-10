@@ -1,0 +1,63 @@
+# apps 组的入口：Istio Gateway + VirtualService + DestinationRule。
+#
+# 这一份 YAML 取代了 `examples/micro/gateway` 的 562 行代码
+#（proxy 288 + routing 155 + setup 70 + main 49）：
+#   * 路由表（1 条 /api → bff）      → match.uri.prefix
+#   * strip: true                    → rewrite.uri: /
+#   * 上游解析（consul 发现/兜底）    → destination.host（由 EDS 解析）
+#   * 逐跳首部处理（hopHeaders 9 项） → Envoy 天然正确
+#
+# 术语注意：这里的 Gateway 是 Istio **资源**，不是应用侧 gateway **进程**。
+# apps 组没有 gateway 进程（对照组的 demo-gateway 保留不动，它是
+# 「换形态不改代码」的对照证据）。
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: mesh-apps
+  namespace: launchx-mesh
+spec:
+  # 选中 istio-system 里的 istio-ingressgateway Pod。
+  selector:
+    istio: ingressgateway
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["*"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: bff
+  namespace: launchx-mesh
+spec:
+  hosts: ["*"]
+  gateways: [mesh-apps]
+  http:
+    - match:
+        - uri: {prefix: /api}
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: bff
+            port: {number: 8081}
+      timeout: 5s
+      retries:
+        attempts: 2
+        perTryTimeout: 2s
+        retryOn: 5xx,connect-failure,reset
+---
+# outlier detection 只挂在 bff 上：它是唯一被 Envoy 按 L7 观察的目标。
+# 不要给 srv-* 加 DestinationRule —— 那一跳是 tcp_proxy，没有状态码可判，
+# 挂上去只会让人以为「RPC 跳的异常剔除也生效了」。
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: bff
+  namespace: launchx-mesh
+spec:
+  host: bff
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 30s
+      baseEjectionTime: 30s

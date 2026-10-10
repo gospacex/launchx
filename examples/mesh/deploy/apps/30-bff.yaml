@@ -1,0 +1,91 @@
+# apps 组 · bff（HTTP 边界）—— 五进程里唯一用 httpGet 探针的 Deployment。
+#
+# 与对照组 `deploy/micro/30-bff.yaml` 的三处差异：
+#   1. **探针 httpGet 而不是 tcpSocket**：micro 的 bff 用 tcpSocket，因为它的
+#      HTTP 语义由独立的 gateway 进程承载；apps 没有 gateway 进程，bff 直接接
+#      入口流量，而 webx 自带 `/healthz/{live,ready}`，不需要为探针单独开路由。
+#      **这一跳是唯一一条 Envoy 能按 L7 观察的跳**（ingress→bff），
+#      `40-gateway.yaml` 里 DestinationRule 的 outlier detection 只有在这一跳
+#      才有 5xx 可判 —— 探针能报 HTTP 状态，是它生效的前提之一。
+#   2. **无 POD_IP env**：理由同四域 srv（apps 零注册）。
+#   3. **显式建 ServiceAccount `bff`**：`50-authz.yaml` 的 AuthorizationPolicy
+#      是 `principals: ["cluster.local/ns/launchx-mesh/sa/bff"]`，认的是**调用方**
+#      的 SPIFFE 身份。不显式建，Pod 会用 default SA，实际 principal 变成
+#      `.../sa/default` ⇒ ALLOW 规则匹配不上、四域**全部 403**，
+#      而 `istioctl analyze` 报不出（纯运行期行为）。
+#
+# Service 端口名必须是 `http`（`appProtocol: http` 是同一语义的显式写法）：
+# 写成 `http-web` 之类仍会被 Istio 按 `http-` 前缀识别，但写成纯数字端口或
+# 不加协议声明 ⇒ Envoy 按 `tcp_proxy` 处理入口跳，outlier detection 与
+# HTTP 重试一起**静默失效**（不报错）。
+#
+# `/metrics` 与业务**共用这一口**（`webx.MetricsPrefix`，缺省 /metrics）：
+# bff 有 HTTP 面，故不另开采集口 —— 与四域 srv（无 HTTP 面，单开 9031-9034）
+# 是同一套开关的两种落法。Prometheus 抓 `bff:8081/metrics` 即可。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bff
+  namespace: launchx-mesh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bff
+  namespace: launchx-mesh
+spec:
+  selector:
+    app: bff
+  ports:
+    - name: http # 别改名：Envoy 据此按 L7 处理入口跳
+      port: 8081
+      targetPort: 8081
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bff
+  namespace: launchx-mesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bff
+  template:
+    metadata:
+      labels:
+        app: bff
+    spec:
+      serviceAccountName: bff # 见头注 3：决定 AuthorizationPolicy 的 principal
+      containers:
+        - name: app
+          image: launchx-mesh-apps:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/bff"]
+          ports:
+            - name: http
+              containerPort: 8081
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf/bff.yaml
+              subPath: bff.yaml
+          livenessProbe:
+            httpGet: {path: /healthz/live, port: 8081}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /healthz/ready, port: 8081}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: mesh-apps-configs

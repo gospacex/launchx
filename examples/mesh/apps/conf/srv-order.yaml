@@ -1,0 +1,122 @@
+# =============================================================================
+# 订单域（apps 组）—— srv 档配置
+# -----------------------------------------------------------------------------
+# 与 micro 的 srv-order/config.yaml 的差异（只注册面与地址，业务字段一字未动）：
+#   1. 无注册中心配置段、无自身注册地址段（service.self）：apps 零注册，Pod 地址
+#      不再需要对外声明；
+#   2. 中间件地址走宿主门面名 host-middleware；
+#   3. strict.db 保持 true：库连不上即退，别降级成「起来但落不了库」。
+#
+# 实例名一律等于 service.name（setup.go 按 cfg.GetString("service.name") 取
+# cache/kv 实例）——写成字面量会在改名后悄悄取到 nil 句柄，而 nil 在这三类句柄
+# 上是 fail-open，症状是「限流不生效 / 缓存不生效」这类静默退化。
+# =============================================================================
+service:
+  name: srv-order
+  mode: srv
+  addr: "0.0.0.0:9022"
+
+trace:
+  enabled: true
+  endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+  on:
+    db: true
+    cache: true
+    kv: true
+    mq: true
+    lock: true
+
+logx:
+  level: info
+  otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
+    enable_trace: true
+
+# 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
+# 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+# enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
+metrics:
+  enabled: true
+  addr: "0.0.0.0:9031"
+# 地基失败即退：连不上库就启动失败（不是「起来但落不了库」）。
+strict:
+  db: true
+
+xmiddleware:
+  # ----- sqlx：order_db（订单三表 + outbox）-----
+  # db 入不入链由**组件级开关 trace.on.db** 裁决：true 走 dbx 的 orm.Open
+  #（无条件装 create/query/update/delete 四类 trace 回调），false 走
+  # orm.OpenNoTrace（不装）—— 两者都会构造连接池，开关不是构造开关。
+  #
+  # 下面这个 tracing 子段在 launchx 路径下**不被读取**（实测：component.buildDB
+  # 只读 trace.on.db，把 LoadMySQLFromConfigx 的第二个返回值丢掉了）。保留它是
+  # 为了与 examples/micro 的配置形状逐字一致 —— 别指望改它能开关入链。
+  sqlx:
+    driver: gorm
+    databases:
+      srv-order:
+        dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        tracing:
+          enabled: true
+
+  # ----- cachex：订单详情缓存（状态流转后 Delete 显式失效）-----
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-order:
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        db: 0
+        pool_size: 50
+
+  # ----- kvx：RPC 跳限流计数（原子 Incr；KV 不可用即放行）-----
+  # 为什么不是 cachex：cachex.Cache 只有 Get/Set，计数只能读-改-写，并发下
+  # 计数丢失 → 限了却被打穿且无痕可查。kvx 的 Incr 是原子的，语义正对。
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-order:
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        db: 1
+        pool_size: 30
+
+  # ----- lockx：同用户并发下单互斥（TTL 内未释放自动过期，不会死锁业务）-----
+  lockx:
+    driver: redis
+    addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+    namespace: srv-order
+    ttl: 10s
+    enable_trace: true
+
+  # ----- mqx：order.completed.v1 —— 本域是**生产**端 -----
+  mqx:
+    driver: kafka
+    instances:
+      srv-order:
+        # MUST 用 9094（kafka-mesh）：9092 那个监听器的 advertised 地址是
+        # 127.0.0.1:9092，在 Pod 里等于 Pod 自己 —— bootstrap 能连上、元数据一
+        # 返回就 `dial tcp 127.0.0.1:9092: connection refused`。见
+        # deploy/shared/20-host-middleware.yaml 的 kafka-mesh 注释。
+        brokers:
+          - "host-middleware.launchx-mesh.svc.cluster.local:9094"
+        enable_trace: true
+        # 键位口径（mqx 现状，实测过）：producer 的目标 topic 读的是
+        # consumer.topic —— FillDefaults 只把该键填给 writer，配 producer.topic
+        # 不生效，发送时 topic 是空串并报 Unknown Topic Or Partition。
+        # 业务 Message 侧也不再自带 topic（两边都带会撞 kafka-go 的
+        # 「Topic must not be specified for both」红线）。
+        consumer:
+          topic: order.completed.v1
+          # group_id MUST 显式给，且**不能**与 srv-points 相同：
+          #   kafka-go 的 Reader 在 NewReader 时即以 GroupID 加入消费组并参与分区
+          #   分配 —— 仅仅「创建了消费端」就会占住分区。本域（order）是纯生产端，
+          #   从不调用 Consume，被分到的分区因此**无人读取**：实测 3 分区里
+          #   partition 0 落在 srv-order 名下、lag 一路上涨，而下单消息有 1/3 概率
+          #   写进该分区 ⇒ 积分域永远收不到（症状是异步链时灵时不灵，且两侧日志
+          #   都不报错）。各域一个 group 后，points 独占全部三个分区。
+          group_id: mesh-order-v1

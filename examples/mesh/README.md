@@ -1,47 +1,66 @@
-# examples/mesh —— 服务网格形态（验收案例 E4 / E5、T10–T12）
+# examples/mesh —— 服务网格形态
 
-**本目录没有一行 Go 代码，这不是遗漏，是结论。**
+本目录同时承载**两条并存的证据链**：
 
-网格形态与微服形态共用同一份二进制（同一个镜像 `launchx-demo:dev`，三个 Deployment
-只是用不同 `command` 启动同一个镜像里的三个二进制）。网格带来的差异全部落在
-**部署面**：监听地址、注册中心位置、配置载体。一旦这里出现 `main.go`，
-就说明「为网格 fork 了代码」，C4/T8 的论证当场失效。
+| 组 | 代码 | 清单 | 镜像 | 论证 |
+|---|---|---|---|---|
+| **对照组** | 无（复用 `examples/micro`） | `deploy/micro/` | `launchx-demo:dev` | C4/T8「换形态不改代码」—— 与 micro 共用同一份二进制，差异全在部署面 |
+| **原生组** | `apps/`（独立 module，**无 gateway 进程**） | `deploy/apps/` | `launchx-mesh-apps:dev` | 「为网格写的应用有多瘦」—— 入口转发整块交 Istio，减法清单见 `apps/README.md` §4 |
 
-> 这条结论由根包 `examples_layout_test.go` 的 `TestMeshHasNoGoCode` 钉住
-> （顺带由 `TestMicroNotCoupledToMesh` 断言 `examples/micro` 不引用本目录）。
+**清单目录零 Go 代码** 仍是硬约束：`deploy/**` 下不许出现实现。Go 代码只允许在
+`apps/` 子树，由根包 `examples_layout_test.go` 的 `TestMeshGoCodeOnlyUnderApps`
+钉住（`TestMicroNotCoupledToMesh` 继续断言 `examples/micro` 不引用本目录）。
+
 > 历史教训：曾有人把 `examples/micro` 的旧快照拷成 `examples/mesh/micro/**`，
 > 那份快照反向 import `examples/micro/**/internal` —— 违反 Go internal 规则，
-> 直接让 `go build ./...` 挂掉。已清除，别再拷回来。
+> 直接让 `go build ./...` 挂掉。已清除，别再拷回来。这也是 `apps/` 选择独立
+> module 而不是复制 micro 层的直接原因。
 
 ## 1. 目录
 
 ```
 examples/mesh/
-├── namespace.yaml        # launchx-mesh + istio-injection=enabled
-├── consul.yaml           # consul 部署进集群（见 §4，这是必须的）
-├── configmap.yaml        # 三份配置副本（gateway/bff/srv）
-├── gateway.yaml          # 3 × (Service + Deployment)，tcpSocket 探针
-├── bff.yaml
-├── srv.yaml
-├── istio-operator.yaml   # istioctl install -f 的入参（OTel tracing provider）
-├── telemetry.yaml        # 采样率 100%（Istio 默认极低，是 T10 假阴性头号来源）
-├── scripts/bring-up.sh   # check / image / install / deploy / verify / status / down
-├── docs/verify.md        # T12 证据落盘
-└── README.md
+├── README.md                 # 本文件
+├── apps/                     # 网格原生应用（独立 go.mod，五个进程：bff + 4×srv）
+│   ├── cmd/ conf/ internal/ pkg/
+│   ├── go.mod  Makefile  Dockerfile
+│   └── README.md             # ★ 职责边界表 + 两处不可交付项 + 四类减法清单（含反向项校正）
+├── deploy/                   # 全部清单
+│   ├── shared/               #   两套共用（kubectl apply 的对象）
+│   │   ├── 00-namespace.yaml       # launchx-mesh + istio-injection=enabled
+│   │   ├── 10-consul.yaml          # consul 进集群（对照组仍需要）
+│   │   ├── 20-host-middleware.yaml # 宿主中间件门面（Service + 手工 Endpoints）
+│   │   └── 40-telemetry.yaml       # 采样率 100%（Istio 默认极低，T10 假阴性头号来源）
+│   ├── istio/
+│   │   └── operator.yaml           # istioctl install -f 的入参（**不是** kubectl 对象）
+│   ├── micro/                #   对照组清单（3 Deployment，含 gateway）
+│   └── apps/                 #   原生组清单（8 个文件）
+│                             #     10-configmap（五份配置的逐字镜像）
+│                             #     20/21/22/23-srv-{order,points,product,stock}（4 Deployment + Service）
+│                             #     30-bff（Deployment + Service + ServiceAccount bff）
+│                             #     40-gateway（Istio Gateway + VirtualService：入口转发）
+│                             #     50-authz（AuthorizationPolicy ×4：四域只受 bff 调用）
+├── scripts/bring-up.sh       # check / image / install / deploy / verify / status / down
+├── scripts/route-matrix-{apps,micro}.txt  # 入口链条矩阵定义（判据与 PROBE_ROUTES 两处同源）
+└── docs/verify.md            # T10–T13 证据落盘（T13 在 §6）
 ```
 
 ## 2. 一条命令跑通
+
+`VARIANT` 选部署哪套（默认 `apps`）；镜像 tag 随之切换，两条证据链互不污染。
 
 ```bash
 export PATH=/usr/local/bin:$PATH          # 本机 minikube/istioctl 都在这里，默认 PATH 没有
 cd /Users/hyx/work/gowork/src/hubx/launchx/examples
 
-./mesh/scripts/bring-up.sh check          # 前置 + 清单 dry-run + 地址自检
-./mesh/scripts/bring-up.sh image          # 交叉编译 → build 进 minikube daemon
-./mesh/scripts/bring-up.sh install        # minikube start(2C4G) + istioctl install + telemetry
-./mesh/scripts/bring-up.sh deploy         # apply → 等 rollout
-./mesh/scripts/bring-up.sh verify         # 集群内发一次全链路请求 + 打印 Jaeger services
+VARIANT=micro ./mesh/scripts/bring-up.sh check    # 前置 + 清单 dry-run + 地址自检
+VARIANT=micro ./mesh/scripts/bring-up.sh image    # 交叉编译 → build 进 minikube daemon
+               ./mesh/scripts/bring-up.sh install  # minikube start(2C4G) + istioctl install
+VARIANT=apps  ./mesh/scripts/bring-up.sh deploy   # apply shared + 选中变体 → 等 rollout
+               ./mesh/scripts/bring-up.sh verify   # 集群内发一次全链路请求 + 打印 Jaeger services
 ```
+
+`install` 是变体无关的（集群与 Istio 只装一次）；`image` / `deploy` 按 `VARIANT` 走。
 
 **资源前提（本机实测，别忽略）**：宿主总内存 8 GB。要先把与 launchx 无关的中间件
 停掉，否则 minikube 的 Pod 会反复 OOM/Evicted：
@@ -86,19 +105,32 @@ Pod 网络，于是**所有实例一律被判不健康**，发现侧永远拿不
 ## 5. 交不出去的 L7 治理（结论，不是待办）
 
 rpcx 走 Kitex 默认的 **TTHeader over TCP**（私有协议），Istio 对未声明 HTTP 的
-端口按 TCP 处理（`tcp_proxy`）—— **只看得见连接，看不见请求**。于是：
+端口按 TCP 处理（`tcp_proxy`）—— **只看得见连接，看不见请求**。于是 **`bff→srv` 这一跳**：
 
 | 能力 | 网格里可用？ | 说明 |
 |---|---|---|
 | mTLS / L4 授权 | ✅ | SPIFFE 身份，与本议题无关 |
 | 连接级可观测 | ✅ | 但 bff→srv 这一跳**没有 sidecar span**（同根因） |
-| 异常实例剔除 | ✅（需二选一） | 与应用侧重试/熔断别双开 |
-| 按请求重试 / 超时 / 熔断 | ❌ | 要按 HTTP 语义读请求 |
+| 异常实例剔除 | ✅（需二选一） | 与应用侧熔断**阈值须对齐**再双开，见 ACCEPTANCE §13.5 硬规则 |
+| 按请求重试 / 超时 / 熔断 | ❌ | 要按 HTTP 语义读请求；应用侧真接线在 `xmiddleware.rpcx`（`conf/*.yaml`） |
 | 按 path/header 灰度、限流、JWT | ❌ | 同上 |
 | 配置分发 | ❌ | 网格不管配置；ConfigMap 也没有长轮询热更新 |
 
-所以正确表述是：**网格本轮提供 mTLS + 连接级可观测，L7 治理仍在应用侧**。
-写成「治理已下沉网格」就是虚假陈述（ACCEPTANCE 陷阱 15）。
+**上表只对 RPC 跳成立。** 按跳分别判定（「入口」在 micro 组是 gateway **进程**，
+在 apps 组是 Istio `Gateway` **资源** —— 同名不同物）：
+
+| 跳 | 协议 | L7 治理 |
+|---|---|---|
+| `入口 → bff` | HTTP/1.1（webx） | ✅ **下沉 sidecar**：重试 / 超时 / 熔断 / 灰度 / 限流 / JWT 全部可用（VirtualService + DestinationRule） |
+| `bff → srv` | Kitex TTHeader/TCP | ❌ **交不出去**：Envoy 只做 `tcp_proxy`，熔断 / 重试 / 超时仍在应用侧 —— 落点是 `xmiddleware.rpcx` 配置段 → `rpcx` 的 `client.Option`（应用代码零新增） |
+
+> apps 组**没有 gateway 进程**：入口转发本身（路由表 / 上游解析 / 逐跳首部）也整块交给
+> Istio `Gateway` + `VirtualService`，micro 的 gateway 562 行在 apps 里一行不用写。
+> 详见 `apps/README.md` §4 减法清单。micro 组的 gateway 保留作对照，**不要删**。
+
+所以正确表述是：**网格本轮提供 mTLS + 连接级可观测 + HTTP 跳的 L7 治理；RPC 跳与企业级
+治理（业务限流、幂等、事务、配置分发）仍在应用侧**。写成「治理已下沉网格」就是虚假陈述
+（ACCEPTANCE 陷阱 15）。逐项归属见 `apps/README.md` 的职责表。
 
 ## 6. 排查表（本机实测踩过的）
 
@@ -106,10 +138,10 @@ rpcx 走 Kitex 默认的 **TTHeader over TCP**（私有协议），Istio 对未�
 |---|---|---|
 | Pod `ImagePullBackOff` | minikube 有独立 daemon，看不到宿主镜像 | 用 `minikube docker-env` 直接 build，或 `minikube image load` |
 | 容器 `exec format error` | 交叉编译 GOARCH 写错（宿主是 **x86_64**） | `GOOS=linux GOARCH=amd64` |
-| 链路 502，Pod 全 Running | consul 在宿主 → Pod IP 健康检查不可达 | consul 进集群（本目录 `consul.yaml`） |
-| Jaeger 里看不到 sidecar span | 采样率太低（Istio 默认非 100%） | `telemetry.yaml` 下发 100% |
+| 链路 502，Pod 全 Running | consul 在宿主 → Pod IP 健康检查不可达 | consul 进集群（`deploy/shared/10-consul.yaml`） |
+| Jaeger 里看不到 sidecar span | 采样率太低（Istio 默认非 100%） | `deploy/shared/40-telemetry.yaml` 下发 100%（`bring-up.sh install` 会自动 apply） |
 | sidecar span 与应用 span 分两条 trace | 用了 `zipkin` provider（发 B3 头） | 必须 `opentelemetry` provider（发 W3C `traceparent`） |
-| `istioctl install --set ...tracing.sampling` 直接 panic | 1.30 的 `tracing` 是数组，与 map 语义写路径冲突 | 用 `-f istio-operator.yaml` + Telemetry API |
+| `istioctl install --set ...tracing.sampling` 直接 panic | 1.30 的 `tracing` 是数组，与 map 语义写路径冲突 | 用 `-f deploy/istio/operator.yaml` + Telemetry API |
 | bff→srv 这一跳没有 sidecar span | Kitex 私有协议经 `tcp_proxy`，Envoy 看不见请求 | **不是 bug**，见 §5；T10 分两段断言 |
 
 ## 7. 验收落点
@@ -119,4 +151,5 @@ rpcx 走 Kitex 默认的 **TTHeader over TCP**（私有协议），Istio 对未�
 | **T10** | 同一 trace 下同时有应用 span（demo-gateway/bff/srv）与 sidecar span（`<workload>.launchx-mesh`），应用父子链仍是 gateway→bff→srv | `docs/verify.md` §T10 |
 | **T11** | 反向断言：只开 sidecar 追踪、应用侧不注册传播器时，出现「1 条 sidecar 链 + 应用侧孤儿 trace（≥4 条）」的分裂形态 | `docs/verify.md` §T11 |
 | **T12** | trace-id / span 数（应用 vs sidecar）/ sidecar 服务名 / Jaeger API 原始片段 / 版本号 全部落盘 | `docs/verify.md` |
+| **T13** | apps 原生组：**逐路由矩阵**（6 条 + 异步链 1 条）断言「入口 2xx + 目标域 `service.<域>.*` span 同 trace + 该 trace 含 sidecar span」；父子链是 `ingress→bff→srv`；`POST /order` 的 trace 内须同时出现 `service.points.ConsumeOrderCompleted` 且 traceID 与下单请求一致 | `docs/verify.md` **§6**（T13 路由矩阵） |
 | **E4/E5** | 部署成功 + 全链路通；证据同上 | — |

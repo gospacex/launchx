@@ -1,0 +1,498 @@
+# =============================================================================
+# apps 组配置（五进程：bff + 四域 srv）—— 一个 ConfigMap 装五份，
+# 各 Deployment 用 subPath 挂自己那份（mountPath: /app/conf/<svc>.yaml）。
+# -----------------------------------------------------------------------------
+# 与 `examples/mesh/apps/conf/*.yaml` 的关系：**逐字镜像**。
+# apps 的 conf/ 里地址段本来就直接写集群内可达名（apps 没有「本机形态」这份副本，
+# 它生来就是为网格写的），所以这里不存在 micro 组那种「回环地址 → 集群名」的换算。
+#   ⇒ 改配置请先改 `apps/conf/*.yaml`，再同步到本文件；两边逐字一致时
+#     `diff <(sed -n '/^  bff.yaml: |/,$p' ...) conf/` 应为空。
+#
+# 与 micro 组 configmap 的系统性差异（三条，业务字段一字未动）：
+#   1. **无注册中心段**：apps 不注册也不发现，服务发现交 K8s Service + Istio EDS。
+#      `service.upstream.<域>` 因此从「注册中心不可用时的直连兜底」升级为**唯一**
+#      地址来源（RegistryAddr 为空 ⇒ rpcx 走 Target 分支 ⇒ kitex dns resolver）。
+#      FQDN 写错的症状是入口 502 且四域一条 span 都没有。
+#   2. **五份而非三份**：micro 是一份 srv 配置服务四域（同构进程复用），
+#      apps 四域各一份 —— 因为四域的**句柄面不同**（见第 3 条）。
+#   3. **四域都有 kvx 段**（与 micro 的差异最大处）：spec `mesh-app-handles`
+#      「全部 srv-* 用 KV()[<name>]，四域一视同仁 —— 不因『本域 RPC 面只读』而省略」。
+#      理由：bff→srv 这一跳走 Kitex TTHeader/TCP，Envoy 只按 tcp_proxy 处理、
+#      拿不到 L7 限流，route 的 middleware 是本跳唯一的治理手段；而缺 kvx 是
+#      **fail-open**（不报错、只静默放行），是本仓最难发现的一类配置错。
+#
+# redis 逻辑库分配（同一宿主实例，靠 db 号隔离）：
+#   db 0 = srv-order 缓存 / db 1 = 四域 kvx 公共计数 / db 2 = bff 凭据 /
+#   db 3 = srv-product 缓存。kvx 四域共用 db 1：计数键都带服务名前缀，
+#   分开库只会让「同一份计数散在四个库里」更难排查。
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-apps-configs
+  namespace: launchx-mesh
+data:
+  # -------- bff —— HTTP 边界档（入口） --------
+  bff.yaml: |
+    # =============================================================================
+    # bff（apps 组）—— HTTP 边界档配置
+    # -----------------------------------------------------------------------------
+    # 纪律：地址一律来自本文件，Go 代码零硬编码。
+    #
+    # 与 micro 的 bff/config.yaml 的系统性差异只有三处（业务字段一字未动）：
+    #   1. **无注册中心配置段**（xmiddleware 下只有 cachex）：apps 不注册也不发现，
+    #      服务发现交 K8s Service + Istio EDS。判据是 conf/ 里搜不到注册中心驱动段
+    #      （bring-up.sh check 会跑这条 grep）；
+    #   2. `service.upstream.<域>` 从「注册中心不可用时的直连兜底」变成**唯一**
+    #      地址来源：RegistryAddr 为空 ⇒ rpcx.BuildClientOptions 走 Target 分支 ⇒
+    #      client.WithHostPorts ⇒ kitex 的 dns resolver 去解析 Service 名。
+    #      写错 FQDN 的症状是入口 502 且四域一条 span 都没有；
+    #   3. 宿主中间件地址走宿主门面名 host-middleware（见
+    #      deploy/shared/20-host-middleware.yaml：换宿主 IP 只改那一处 Endpoints）。
+    #
+    # 本机起服时把 host-middleware.* 与下面四个 FQDN 换成回环地址即可 ——
+    # 属**临时改动，不得落回文件**（Task 15 的地址自检会拦裸本机地址）。
+    # =============================================================================
+    service:
+      name: bff # 服务名 = Jaeger 的 service，也是 cachex 的实例名
+      mode: bff # 四档之一：monolith / bff / srv / gateway
+      addr: "0.0.0.0:8081" # 容器内必须监听全地址：绑回环地址时 Pod 外不可达
+      upstream:
+        srv-order: "srv-order.launchx-mesh.svc.cluster.local:9022"
+        srv-points: "srv-points.launchx-mesh.svc.cluster.local:9024"
+        srv-product: "srv-product.launchx-mesh.svc.cluster.local:9021"
+        srv-stock: "srv-stock.launchx-mesh.svc.cluster.local:9023"
+
+    webx:
+      addr: "0.0.0.0:8081"
+      timeout: 5s
+      rate_limit_rps: 100 # 入口自保护：按 client IP 令牌桶（Envoy 同维度可替代）
+      rate_limit_burst: 200
+      cors_origins: []
+      health_prefix: /healthz # webx 自带 /healthz/{live,ready}，业务不自建
+
+    # 调用链：全局闸 + 组件级开关（后者只裁决**组件 span** 的产出）。
+    # bff 只有一个组件句柄 cache，且它必须在册：handles 自检对
+    # 「句柄在 + 该组件开关开」才去核对入链有效性（Diverged 判据）。
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+      on:
+        cache: true
+
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+
+    # 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流）。
+    # 关掉（false 或不写）即不建 provider，meter 退回 noop。
+    metrics:
+      enabled: true
+    # 刻意**不设** strict：bff 的硬前提只有凭据缓存，缺了由 app.Setup 显式报错
+    # （handles.VerifyOrError(a, "cache")），不靠 strict 兜。
+    # 也**不设** auth 段：apps 的传输层身份下沉给 Istio（RequestAuthentication +
+    # AuthorizationPolicy），应用侧对匿名请求 fail-open（identity 层只做 best-effort
+    # 反查、供下游限流分桶），故这里没有 require 这类开关可配。
+    xmiddleware:
+      # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
+      # 不是组件：三项都只在客户端选项装配那一刻起作用，配置面收在 rpcx、
+      # 由 mode 在装配期读进 App.RPCClientOptions。零值全关，不写 = 不加选项。
+      rpcx:
+        # 熔断：服务级 + 实例级两道闸。阈值写出来是为了让生效值可见。
+        # 打开它不改成功路径，作用是在持续故障时快速失败。
+        circuit_breaker:
+          enabled: true
+          error_rate: 0.5
+          min_sample: 200
+        # 重试：故意不开 —— 链路上有非幂等写（下单/扣减/入账），超时重试会重复落库；
+        # 且网格侧若也开 HTTP 跳重试，故障期双侧重试互相放大（ACCEPTANCE §13.5 硬规则 1）。
+        # 超时预算也不够：三试 ≈ 3 × RPCTimeout（rpcx 缺省 3s）= 9s > 入口 webx.timeout 5s。
+        retry:
+          enabled: false
+          max_attempts: 2
+          backoff_ms: 10
+        # 负载均衡：闭集 weighted_random（缺省）/ weighted_round_robin /
+        # interleaved_weighted_round_robin；不给 consistent_hash（需业务 key 函数）。
+      # ----- cachex：边界凭据存储（token → user_id），bff 唯一的数据面 -----
+      # 为什么边界要有进程外存储：用本地 map 会让「一次签发要能被所有 bff 实例认」
+      # 不成立，多实例部署时表现为「请求随机 401」。这里存的不是业务数据
+      #（业务数据只在下游四域），故与「bff 不用 DB()」的口径不冲突。
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          bff: # 实例名须与 service.name 一致（setup.go 按它取实例）
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 2 # 与其他域的 0/1/3 分开：凭据被逐出 = 全员 401
+            pool_size: 30
+
+  # -------- srv-order —— 订单域（生产 order.completed.v1） --------
+  srv-order.yaml: |
+    # =============================================================================
+    # 订单域（apps 组）—— srv 档配置
+    # -----------------------------------------------------------------------------
+    # 与 micro 的 srv-order/config.yaml 的差异（只注册面与地址，业务字段一字未动）：
+    #   1. 无注册中心配置段、无自身注册地址段（service.self）：apps 零注册，Pod 地址
+    #      不再需要对外声明；
+    #   2. 中间件地址走宿主门面名 host-middleware；
+    #   3. strict.db 保持 true：库连不上即退，别降级成「起来但落不了库」。
+    #
+    # 实例名一律等于 service.name（setup.go 按 cfg.GetString("service.name") 取
+    # cache/kv 实例）——写成字面量会在改名后悄悄取到 nil 句柄，而 nil 在这三类句柄
+    # 上是 fail-open，症状是「限流不生效 / 缓存不生效」这类静默退化。
+    # =============================================================================
+    service:
+      name: srv-order
+      mode: srv
+      addr: "0.0.0.0:9022"
+
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+      on:
+        db: true
+        cache: true
+        kv: true
+        mq: true
+        lock: true
+
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
+    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9031"
+    # 地基失败即退：连不上库就启动失败（不是「起来但落不了库」）。
+    strict:
+      db: true
+
+    xmiddleware:
+      # ----- sqlx：order_db（订单三表 + outbox）-----
+      # db 入不入链由**组件级开关 trace.on.db** 裁决：true 走 dbx 的 orm.Open
+      #（无条件装 create/query/update/delete 四类 trace 回调），false 走
+      # orm.OpenNoTrace（不装）—— 两者都会构造连接池，开关不是构造开关。
+      #
+      # 下面这个 tracing 子段在 launchx 路径下**不被读取**（实测：component.buildDB
+      # 只读 trace.on.db，把 LoadMySQLFromConfigx 的第二个返回值丢掉了）。保留它是
+      # 为了与 examples/micro 的配置形状逐字一致 —— 别指望改它能开关入链。
+      sqlx:
+        driver: gorm
+        databases:
+          srv-order:
+            dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            tracing:
+              enabled: true
+
+      # ----- cachex：订单详情缓存（状态流转后 Delete 显式失效）-----
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          srv-order:
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 0
+            pool_size: 50
+
+      # ----- kvx：RPC 跳限流计数（原子 Incr；KV 不可用即放行）-----
+      # 为什么不是 cachex：cachex.Cache 只有 Get/Set，计数只能读-改-写，并发下
+      # 计数丢失 → 限了却被打穿且无痕可查。kvx 的 Incr 是原子的，语义正对。
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          srv-order:
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+
+      # ----- lockx：同用户并发下单互斥（TTL 内未释放自动过期，不会死锁业务）-----
+      lockx:
+        driver: redis
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        namespace: srv-order
+        ttl: 10s
+        enable_trace: true
+
+      # ----- mqx：order.completed.v1 —— 本域是**生产**端 -----
+      mqx:
+        driver: kafka
+        instances:
+          srv-order:
+            # MUST 用 9094（kafka-mesh）：9092 那个监听器的 advertised 地址是
+            # 127.0.0.1:9092，在 Pod 里等于 Pod 自己 —— bootstrap 能连上、元数据一
+            # 返回就 `dial tcp 127.0.0.1:9092: connection refused`。见
+            # deploy/shared/20-host-middleware.yaml 的 kafka-mesh 注释。
+            brokers:
+              - "host-middleware.launchx-mesh.svc.cluster.local:9094"
+            enable_trace: true
+            # 键位口径（mqx 现状，实测过）：producer 的目标 topic 读的是
+            # consumer.topic —— FillDefaults 只把该键填给 writer，配 producer.topic
+            # 不生效，发送时 topic 是空串并报 Unknown Topic Or Partition。
+            # 业务 Message 侧也不再自带 topic（两边都带会撞 kafka-go 的
+            # 「Topic must not be specified for both」红线）。
+            consumer:
+              topic: order.completed.v1
+              # group_id MUST 显式给，且**不能**与 srv-points 相同：
+              #   kafka-go 的 Reader 在 NewReader 时即以 GroupID 加入消费组并参与分区
+              #   分配 —— 仅仅「创建了消费端」就会占住分区。本域（order）是纯生产端，
+              #   从不调用 Consume，被分到的分区因此**无人读取**：实测 3 分区里
+              #   partition 0 落在 srv-order 名下、lag 一路上涨，而下单消息有 1/3 概率
+              #   写进该分区 ⇒ 积分域永远收不到（症状是异步链时灵时不灵，且两侧日志
+              #   都不报错）。各域一个 group 后，points 独占全部三个分区。
+              group_id: mesh-order-v1
+
+  # -------- srv-points —— 积分域（消费 order.completed.v1） --------
+  srv-points.yaml: |
+    # =============================================================================
+    # 积分域（apps 组）—— srv 档配置
+    # -----------------------------------------------------------------------------
+    # 由 conf/srv-order.yaml 改写而来，与它的差异**逐项列全**：
+    #   1. service.name 与各实例名 → srv-points；addr → 0.0.0.0:9024；
+    #   2. 删 cachex / lockx：本域不用缓存、不做互斥（写路径在 MQ 消费侧，
+    #      不在 HTTP/RPC 入向）；
+    #   3. **保留 kvx**：route 的限流计数用它。spec mesh-app-handles 的原话是
+    #      「全部 srv-* 都用 KV()[name]，四域一视同仁 —— 不因『本域 RPC 面只读』
+    #      而省略」：该跳走 Kitex TTHeader/TCP、Envoy 按 tcp_proxy 处理拿不到
+    #      L7 限流，route 的 middleware 是本跳唯一的治理手段，删掉它这一跳就没有
+    #      限流了（而缺 kvx 是 fail-open，不会报错，只会静默放行）；
+    #   4. trace.on 保留 db / kv / mq：在册句柄逐个要有对应开关，
+    #      否则 handles 自检不核对它（Want=false 时 Diverged 恒为假）。
+    # =============================================================================
+    service:
+      name: srv-points
+      mode: srv
+      addr: "0.0.0.0:9024"
+
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+      on:
+        db: true
+        kv: true
+        mq: true
+
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
+    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9032"
+    strict:
+      db: true
+
+    xmiddleware:
+      # ----- sqlx：order_db（积分余额与流水）-----
+      # 入链由组件级开关 trace.on.db 裁决；tracing 子段不被 launchx 读取
+      #（详见 srv-order.yaml 的同名说明）。
+      sqlx:
+        driver: gorm
+        databases:
+          srv-points:
+            dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            tracing:
+              enabled: true
+
+      # ----- kvx：RPC 跳限流计数（route 的 middleware 用原子 Incr）-----
+      # db 1 是四域 kvx 的**公共逻辑库**：计数键都带服务名前缀，分开库只会让
+      # 「同一份计数散在四个库里」更难排查。
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          srv-points:
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+
+      # ----- mqx：order.completed.v1 —— 本域是**消费**端 -----
+      mqx:
+        driver: kafka
+        instances:
+          srv-points:
+            # 同 srv-order：MUST 用 9094（kafka-mesh 监听器），9092 的 advertised
+            # 地址在 Pod 内指向自己，消费侧会连不上 broker（症状是「一条消息都收不到」，
+            # 且 producer 侧一切正常）。
+            brokers:
+              - "host-middleware.launchx-mesh.svc.cluster.local:9094"
+            enable_trace: true
+            # consumer.topic MUST 等于 events.TopicOrderCompleted
+            #（"order.completed.v1"）：mqx/kafka 的两侧都读这一个键，
+            # 写错的症状是「消息发了没人收」，且两侧日志都不报错。
+            consumer:
+              topic: order.completed.v1
+              # 独立消费组（理由见 srv-order 同处注释）：不与任何「只创建不消费」的
+              # 域共用 group，否则会被抢走分区，表现为「下单消息时灵时不灵地收不到」。
+              group_id: mesh-points-v1
+
+  # -------- srv-product —— 商品域（缓存侧） --------
+  srv-product.yaml: |
+    # =============================================================================
+    # 商品域（apps 组）—— srv 档配置
+    # -----------------------------------------------------------------------------
+    # 由 conf/srv-order.yaml 改写而来，与它的差异**逐项列全**：
+    #   1. service.name 与各实例名 → srv-product；addr → 0.0.0.0:9021；
+    #   2. 删 lockx / mqx：本域不做互斥、不发事件（出向只有 UpdatePrice 的写后
+    #      删缓存）；
+    #   3. **保留 kvx**：route 的限流计数用它（理由同 srv-points.yaml 第 3 条：
+    #      这一跳的 L7 治理只有应用侧这一处，缺 kvx 是 fail-open、静默放行）；
+    #   4. 保留 cachex：商品详情缓存（读缓存 → 回源 → 回填；写后失效）；
+    #   5. trace.on 保留 db / cache / kv。
+    # =============================================================================
+    service:
+      name: srv-product
+      mode: srv
+      addr: "0.0.0.0:9021"
+
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+      on:
+        db: true
+        cache: true
+        kv: true
+
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
+    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9033"
+    strict:
+      db: true
+
+    xmiddleware:
+      # ----- sqlx：order_db（商品表）-----
+      # 入链由组件级开关 trace.on.db 裁决；tracing 子段不被 launchx 读取
+      #（详见 srv-order.yaml 的同名说明）。
+      sqlx:
+        driver: gorm
+        databases:
+          srv-product:
+            dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            tracing:
+              enabled: true
+
+      # ----- cachex：商品详情缓存 -----
+      # 缺 cachex 是**降级**（每次详情读回源），不是装配错误：Setup 会打 Warn
+      # 后照常起服。但也别因此省略这一段 —— 省略等于把「缓存对外承诺」变成
+      # 「每次都打库」，而那件事没有任何判据会发现。
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          srv-product:
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 3
+            pool_size: 30
+
+      # ----- kvx：RPC 跳限流计数 -----
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          srv-product:
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+
+  # -------- srv-stock —— 库存域（KV + 锁） --------
+  srv-stock.yaml: |
+    # =============================================================================
+    # 库存域（apps 组）—— srv 档配置
+    # -----------------------------------------------------------------------------
+    # 由 conf/srv-order.yaml 改写而来，与它的差异**逐项列全**：
+    #   1. service.name 与各实例名 → srv-stock；addr → 0.0.0.0:9023；
+    #   2. 删 cachex / mqx：本域不做缓存、不发事件；
+    #   3. 保留 kvx：两个用途共用同一实例、靠 key 前缀隔离 —— route 的限流计数
+    #      （原子 Incr）与扣减的**旁路当日量**计数（失败不影响扣减结果，
+    #      不超卖的真相是库层条件 UPDATE）；
+    #   4. 保留 lockx：同商品扣减互斥。**不设 strict.lockx**：缺锁是降级
+    #      （service.acquire 打 Warn 后照常扣减），不是装配错误 —— 把它声明成
+    #      硬前提会让一次 lockx 配错演变成整域不可用；
+    #   5. trace.on 保留 db / kv / lock。
+    # =============================================================================
+    service:
+      name: srv-stock
+      mode: srv
+      addr: "0.0.0.0:9023"
+
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+      on:
+        db: true
+        kv: true
+        lock: true
+
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
+    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9034"
+    strict:
+      db: true
+
+    xmiddleware:
+      # ----- sqlx：order_db（库存表）-----
+      # 入链由组件级开关 trace.on.db 裁决；tracing 子段不被 launchx 读取
+      #（详见 srv-order.yaml 的同名说明）。
+      sqlx:
+        driver: gorm
+        databases:
+          srv-stock:
+            dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            tracing:
+              enabled: true
+
+      # ----- kvx：限流计数 + 扣减旁路当日量（同一实例，key 前缀隔离）-----
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          srv-stock:
+            addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+
+      # ----- lockx：同商品扣减互斥 -----
+      lockx:
+        driver: redis
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        namespace: srv-stock
+        ttl: 10s
+        enable_trace: true

@@ -1,0 +1,78 @@
+# =============================================================================
+# 商品域（apps 组）—— srv 档配置
+# -----------------------------------------------------------------------------
+# 由 conf/srv-order.yaml 改写而来，与它的差异**逐项列全**：
+#   1. service.name 与各实例名 → srv-product；addr → 0.0.0.0:9021；
+#   2. 删 lockx / mqx：本域不做互斥、不发事件（出向只有 UpdatePrice 的写后
+#      删缓存）；
+#   3. **保留 kvx**：route 的限流计数用它（理由同 srv-points.yaml 第 3 条：
+#      这一跳的 L7 治理只有应用侧这一处，缺 kvx 是 fail-open、静默放行）；
+#   4. 保留 cachex：商品详情缓存（读缓存 → 回源 → 回填；写后失效）；
+#   5. trace.on 保留 db / cache / kv。
+# =============================================================================
+service:
+  name: srv-product
+  mode: srv
+  addr: "0.0.0.0:9021"
+
+trace:
+  enabled: true
+  endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+  on:
+    db: true
+    cache: true
+    kv: true
+
+logx:
+  level: info
+  otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
+    enable_trace: true
+
+# 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
+# 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+# enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
+metrics:
+  enabled: true
+  addr: "0.0.0.0:9033"
+strict:
+  db: true
+
+xmiddleware:
+  # ----- sqlx：order_db（商品表）-----
+  # 入链由组件级开关 trace.on.db 裁决；tracing 子段不被 launchx 读取
+  #（详见 srv-order.yaml 的同名说明）。
+  sqlx:
+    driver: gorm
+    databases:
+      srv-product:
+        dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        tracing:
+          enabled: true
+
+  # ----- cachex：商品详情缓存 -----
+  # 缺 cachex 是**降级**（每次详情读回源），不是装配错误：Setup 会打 Warn
+  # 后照常起服。但也别因此省略这一段 —— 省略等于把「缓存对外承诺」变成
+  # 「每次都打库」，而那件事没有任何判据会发现。
+  cachex:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-product:
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        db: 3
+        pool_size: 30
+
+  # ----- kvx：RPC 跳限流计数 -----
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-product:
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        db: 1
+        pool_size: 30

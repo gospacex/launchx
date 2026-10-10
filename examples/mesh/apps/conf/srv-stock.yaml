@@ -1,0 +1,75 @@
+# =============================================================================
+# 库存域（apps 组）—— srv 档配置
+# -----------------------------------------------------------------------------
+# 由 conf/srv-order.yaml 改写而来，与它的差异**逐项列全**：
+#   1. service.name 与各实例名 → srv-stock；addr → 0.0.0.0:9023；
+#   2. 删 cachex / mqx：本域不做缓存、不发事件；
+#   3. 保留 kvx：两个用途共用同一实例、靠 key 前缀隔离 —— route 的限流计数
+#      （原子 Incr）与扣减的**旁路当日量**计数（失败不影响扣减结果，
+#      不超卖的真相是库层条件 UPDATE）；
+#   4. 保留 lockx：同商品扣减互斥。**不设 strict.lockx**：缺锁是降级
+#      （service.acquire 打 Warn 后照常扣减），不是装配错误 —— 把它声明成
+#      硬前提会让一次 lockx 配错演变成整域不可用；
+#   5. trace.on 保留 db / kv / lock。
+# =============================================================================
+service:
+  name: srv-stock
+  mode: srv
+  addr: "0.0.0.0:9023"
+
+trace:
+  enabled: true
+  endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+  on:
+    db: true
+    kv: true
+    lock: true
+
+logx:
+  level: info
+  otel:
+    # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+    # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+    # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
+    enable_trace: true
+
+# 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
+# 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+# enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
+metrics:
+  enabled: true
+  addr: "0.0.0.0:9034"
+strict:
+  db: true
+
+xmiddleware:
+  # ----- sqlx：order_db（库存表）-----
+  # 入链由组件级开关 trace.on.db 裁决；tracing 子段不被 launchx 读取
+  #（详见 srv-order.yaml 的同名说明）。
+  sqlx:
+    driver: gorm
+    databases:
+      srv-stock:
+        dsn: "order_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-mesh.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+        max_open_conns: 20
+        max_idle_conns: 5
+        tracing:
+          enabled: true
+
+  # ----- kvx：限流计数 + 扣减旁路当日量（同一实例，key 前缀隔离）-----
+  kvx:
+    driver: redis
+    enable_trace: true
+    instances:
+      srv-stock:
+        addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+        db: 1
+        pool_size: 30
+
+  # ----- lockx：同商品扣减互斥 -----
+  lockx:
+    driver: redis
+    addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
+    namespace: srv-stock
+    ttl: 10s
+    enable_trace: true

@@ -1,0 +1,104 @@
+# apps 组 · srv-order —— Kitex RPC 域服（网格原生形态）
+#
+# 与 micro 对照组（`deploy/micro/20-srv.yaml`）的三处差异：
+#   1. **无 POD_IP env**：micro 需要它是因为要把 Pod IP 注册进 consul
+#      （`service.self.addr: ${POD_IP}:9013`）；apps 零注册，地址不需要上报。
+#   2. **subPath 各域一份**：micro 四域同构、共用一份 `srv.yaml`；apps 四域的
+#      **句柄面不同**（见 `mesh-app-handles` 矩阵），所以 conf 也是四份。
+#   3. 端口四域各异，micro 只有一个 9013。
+#
+# 端口名写成 `tcp-rpc`（`tcp-` 前缀显式声明 L4）—— 别改成 grpc-*：对照组实测，
+# 改成 grpc-rpc 后 Istio 会为该端口建 HTTP/2 listener，把 kitex 的 TTHeader 当 h2
+# 解析 → 入口直接 502。代价：bff→srv 这一跳**没有 sidecar span**、L7 治理也交不
+# 出去 —— 协议事实，不是漏配（Envoy 对未声明 HTTP 的端口按 tcp_proxy 处理）。
+#
+# ⚠️ 端口命名**不能靠 `istioctl analyze <file>` 自查**：实测该命令对尚未 apply 的
+# Service 不跑 IST0118（把 host-middleware 整份改名成新服务做探针，零消息；
+# 而它 apply 后在集群里稳定报 3 条 IST0118）。要等 apply 之后跑
+# `istioctl analyze -n launchx-mesh` 才查得出（Task 13 的判据）。
+#
+# 探针用 tcpSocket 而不是 httpGet：srv 档没有 HTTP 面，且这一跳 Envoy 读不到
+# 状态码，outlier detection 在本跳无从生效。需要 HTTP 探针的是 bff（30-bff.yaml），
+# 那里 webx 自带 /healthz/{live,ready}。
+#
+# `strict.db: true` 在 conf/<svc>.yaml 里（不在清单里）：库连不上即退，
+# 比「起来但落不了库」好排查得多。
+apiVersion: v1
+kind: Service
+metadata:
+  name: srv-order
+  namespace: launchx-mesh
+spec:
+  selector:
+    app: srv-order
+  ports:
+    - name: tcp-rpc # 见头注：改成 grpc-* 会让入口 502
+      port: 9022
+      targetPort: 9022
+    # 采集口。端口名用 `tcp-`（L4）而不是 `http-`：/metrics 是普通 HTTP/1.1，
+    # 但声明成 http-* 会让 sidecar 按 L7 接管，从而落进 50-authz.yaml 的
+    # `action: ALLOW`（只放行 sa/bff）—— Prometheus 一律 403。
+    - name: tcp-metrics
+      port: 9031
+      targetPort: 9031
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srv-order
+  namespace: launchx-mesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: srv-order
+  template:
+    metadata:
+      labels:
+        app: srv-order
+      annotations:
+        # ⚠️ **必须排除**：不排除时 sidecar 会拦截 9031 端口，请求落到
+        # 50-authz.yaml 的 `action: ALLOW`（只放行 sa/bff）⇒ Prometheus 403。
+        # 排除 = 该端口不经 sidecar：既无 mTLS，也不受 AuthorizationPolicy 约束。
+        # 代价是这一口的连接级遥测也一并没有 —— 采集口不需要，可接受。
+        traffic.sidecar.istio.io/excludeInboundPorts: "9031"
+    spec:
+      containers:
+        - name: app
+          image: launchx-mesh-apps:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/srv-order"]
+          ports:
+            - name: rpc
+              containerPort: 9022
+            - name: metrics
+              containerPort: 9031
+          env:
+            # conf/<svc>.yaml 的 sqlx dsn 里是 ${HUBX_DB_PW} 占位，由这里注入。
+            - name: HUBX_DB_PW
+              value: hubx123
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf/srv-order.yaml
+              subPath: srv-order.yaml
+          livenessProbe:
+            tcpSocket:
+              port: 9022
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 9022
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: mesh-apps-configs

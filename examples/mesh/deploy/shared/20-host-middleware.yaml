@@ -41,6 +41,13 @@ spec:
     - name: kafka
       port: 9092
       protocol: TCP
+    # kafka-mesh（9094）：宿主 Kafka 的 MESH 监听器，advertised 地址就是这个
+    # Service 名（见 dockers/docker-compose.yml 的 KAFKA_CFG_ADVERTISED_LISTENERS）。
+    # 9092 那个监听器的 advertised 是 127.0.0.1:9092 —— 在 Pod 里等于 Pod 自己，
+    # 连上 bootstrap 之后必然 `connection refused`。**Pod 侧必须用 9094。**
+    - name: kafka-mesh
+      port: 9094
+      protocol: TCP
     - name: grpc-otlp
       port: 4317
       protocol: TCP
@@ -67,6 +74,8 @@ subsets:
         port: 6379
       - name: kafka
         port: 9092
+      - name: kafka-mesh
+        port: 9094
       - name: grpc-otlp
         port: 4317
       - name: otlp-http

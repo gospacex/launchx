@@ -50,8 +50,11 @@ data:
       level: info
       otel:
         enable_trace: true
-        exporter: otlp
-        endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+    # 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流）。
+    # 关掉（false 或不写）即不建 provider，meter 退回 noop。
+    metrics:
+      enabled: true
     xmiddleware:
       coordx:
         driver: consul
@@ -86,9 +89,31 @@ data:
       level: info
       otel:
         enable_trace: true
-        exporter: otlp
-        endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+    # 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
+    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流）。
+    # 关掉（false 或不写）即不建 provider，meter 退回 noop。
+    metrics:
+      enabled: true
     xmiddleware:
+      # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
+      # 不是组件：三项都只在客户端选项装配那一刻起作用，配置面收在 rpcx、
+      # 由 mode 在装配期读进 App.RPCClientOptions。零值全关，不写 = 不加选项。
+      rpcx:
+        # 熔断：服务级 + 实例级两道闸。阈值写出来是为了让生效值可见。
+        # 打开它不改成功路径，作用是在持续故障时快速失败。
+        circuit_breaker:
+          enabled: true
+          error_rate: 0.5
+          min_sample: 200
+        # 重试：故意不开 —— 链路上有非幂等写（下单/扣减/入账），超时重试会重复落库；
+        # 且网格侧若也开 HTTP 跳重试，故障期双侧重试互相放大（ACCEPTANCE §13.5 硬规则 1）。
+        # 超时预算也不够：三试 ≈ 3 × RPCTimeout（rpcx 缺省 3s）= 9s > 入口 webx.timeout 5s。
+        retry:
+          enabled: false
+          max_attempts: 2
+          backoff_ms: 10
+        # 负载均衡：闭集 weighted_random（缺省）/ weighted_round_robin /
+        # interleaved_weighted_round_robin；不给 consistent_hash（需业务 key 函数）。
       coordx:
         driver: consul
         addr: "consul.launchx-mesh.svc.cluster.local:8500"
@@ -118,8 +143,13 @@ data:
       level: info
       otel:
         enable_trace: true
-        exporter: otlp
-        endpoint: "host-middleware.launchx-mesh.svc.cluster.local:4318"
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
+    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
+    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9030"
     strict:
       db: true
     xmiddleware:
