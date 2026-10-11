@@ -107,6 +107,21 @@ xmiddleware:
           batch_timeout: 10ms
           required_acks: -1   # sarama WaitForAll
 
+      # ----- 订阅侧实例：order.completed.v1（下单送积分）-----
+      # 为什么要单起一个实例：同一个实例里 producer 与 consumer 共用
+      # `consumer.topic` 这一个键（mqx 现状 —— producer 的目标 topic 就是读它），
+      # 而上面那个实例的 topic 是**发送侧**的 points.changed.v1。收发不同 topic
+      # 只能靠两个实例表达。
+      srv-points-order-in:
+        brokers:
+          - "127.0.0.1:9092"
+        enable_trace: true
+        consumer:
+          topic: order.completed.v1
+          # group_id 必须显式写：缺省 "mqx-group" 会让所有服务挤进同一个消费组，
+          # 订阅同一 topic 的服务互相抢分区，表现为「消息投出去了但没人收到」。
+          group_id: srv-points
+
   # ----- kvx：限流计数 + 幂等键（幂等键用 Set 写、Exists 查）-----
   kvx:
     driver: redis

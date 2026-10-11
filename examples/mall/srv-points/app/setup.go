@@ -10,17 +10,20 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"time"
 
 	"github.com/cloudwego/kitex/server"
 	"github.com/gospacex/logx"
+	"github.com/gospacex/mqx"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/launchx/examples/mall/pkg/handlecheck"
 	pointsrpc "github.com/gospacex/launchx/examples/mall/pkg/kitex_gen/points/points"
+	"github.com/gospacex/launchx/examples/mall/srv-points/internal/consumer"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/handler"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/middleware"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/repository"
@@ -30,11 +33,30 @@ import (
 	"github.com/gospacex/launchx/examples/pkg/outbox"
 )
 
+// orderEventsInstance 订阅侧 mqx 实例名（config.yaml 里的 `instances.<name>`）。
+//
+// 为什么不是 `a.MQConsumer()`：框架按 service.name 装配的那一个实例，
+// producer 与 consumer **共用同一个 topic 键**（mqx 现状：producer 的目标
+// topic 读的就是 consumer.topic）。该实例的 topic 是发送侧的
+// `points.changed.v1`，拿它去收 `order.completed.v1` 会两头都不对 ——
+// 发的事件去错 topic、订阅的又不是自己要的。故订阅侧单起一个实例。
+//
+// 代价是这一个句柄由业务自己构造（不经 launchx），也就拿不到框架那套
+// 统一的降级文案；下面因此显式补了带后果的 Warn。
+const orderEventsInstance = "srv-points-order-in"
+
 // 自保护参数（固定窗口限流）。非地址类常量，故留在代码里：
 // 会随环境变的只有地址，一律进 config.yaml。
 const (
 	rateLimitPerMinute = 120 // 积分是写多读少的域（入账/消费都要过），上限比商品域紧
 	rateLimitWindow    = time.Minute
+
+	// consumerStopTimeout 退出时等消费循环收尾的上限。
+	//
+	// 取 5s 与框架退出链每环的上限（service.stop_timeout 缺省 5s）同量级：
+	// 消费协程要做的只是退出循环并 Close，5s 足够；再长就说明卡在驱动里了，
+	// 这时继续等下去只会把进程拖到优雅期耗尽被 SIGKILL。
+	consumerStopTimeout = 5 * time.Second
 )
 
 // Setup 是注册给 App.OnSetup 的装配回调：
@@ -124,5 +146,48 @@ func Setup(a *launchx.App) error {
 	rt := route.NewRouter(limiter, traceOn, logger)
 
 	a.SetRPCServer(pointsrpc.NewServer(&srvrpc.Server{Handler: h, Router: rt}, opts...))
+
+	// ---- 异步消费端：order.completed.v1 → 送积分 ----
+	// 放在最后：它依赖上面装好的 svc，且不成功不该影响 RPC 面可用。
+	startOrderConsumer(a, svc, logger)
+
 	return nil
+}
+
+// startOrderConsumer 起"下单送积分"的消费循环。
+//
+// 降级口径（刻意不阻断启动）：消费端挂了 = "排队的积分没人发"，而本域的
+// RPC 入账仍然可用，积分不会算错 —— 只是异步那一路要等人修。这与
+// `strict.db: true`（账错了比不可用更难挽回）不是同一量级，故这里只 Warn
+// 带后果，不返回 error。反过来，静默不启动是最差的姿态，故必须说出来。
+func startOrderConsumer(a *launchx.App, svc *service.PointsService, logger logx.Logger) {
+	cfg := mqx.ReadConfigFromConfigx(a.Config(), orderEventsInstance)
+	if cfg == nil || cfg.Driver == "" {
+		logger.Warn("srv-points: order consumer not configured, skipped",
+			logx.String("instance", orderEventsInstance),
+			logx.String("consequence", "order.completed.v1 无人消费，下单送积分不会自动发生"))
+		return
+	}
+	c, err := mqx.NewConsumer(cfg)
+	if err != nil {
+		logger.Warn("srv-points: order consumer unavailable, running without it",
+			logx.String("instance", orderEventsInstance),
+			logx.Err(err),
+			logx.String("consequence", "order.completed.v1 无人消费，下单送积分不会自动发生"))
+		return
+	}
+	runner := consumer.NewRunner(c, consumer.NewHandler(svc, logger), logger)
+	runner.Start(context.Background())
+	logger.Info("srv-points: order.completed consumer started",
+		logx.String("instance", orderEventsInstance),
+		logx.String("topic", cfg.Consumer.Topic),
+		logx.String("group_id", cfg.Consumer.GroupID))
+
+	// 退出链：业务回调先于组件停止（此时 DB 仍可用，在途这轮能收干净）。
+	// 停止有界 —— kafka-go 的 ConsumerGroup.Close 会卡在 joinGroup 的网络读上
+	// （不设读 deadline），无界等待会让整个进程退不出去。
+	a.OnStop(func() error {
+		runner.Stop(consumerStopTimeout)
+		return nil
+	})
 }

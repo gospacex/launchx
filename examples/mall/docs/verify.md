@@ -116,7 +116,11 @@ go run ./examples/mall/e2e --mode=registry   # 经 consul 发现（默认）
 `RowsAffected==0` 时按 `classifyMiss` 区分"没记录"(4001) 与"不够扣"(4002)。
 所以新建商品不会自动有库存行 —— e2e 里库存域固定打 `schema.sql` 种好的
 `product_id=1`。跨域只存 ID，两域用不同 ID 不影响链路；但**示例确实缺一个
-"商品创建 → 库存初始化"的落地路径**（现在只有 outbox 事件，没有消费方）。
+"商品创建 → 库存初始化"的落地路径**（product.created.v1 仍只有生产端）。
+
+> 补记（2026-10-11）：四个事件里 `order.completed.v1` 已补上消费端
+> （srv-points 消费 → 下单送积分，见 `srv-points/internal/consumer`）。
+> 其余三个（product.created / stock.reserved / points.changed）仍只有生产端。
 
 **② 一张预占单只能结算一次。** `ReleaseTx` 与 `ConfirmTx` 都只认
 `status=ReserveReserved` 的流水，且各自把整行翻成终态（3/2）。对同一
