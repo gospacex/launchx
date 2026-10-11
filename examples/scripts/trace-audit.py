@@ -485,32 +485,48 @@ def eval_row(row, views, now_us):
                     f"（同一路由连读两次：前一次回源并回填、后一次命中缓存）"
                 ],
             }
-        older, newer = cands[-2], cands[-1]
+        # ⚠️ 不能简单取「最后两条」：屏幕外的历史读会混进来。设想窗口内已有
+        # 上一轮的两次读（回源 + 命中），本轮又读两次（都命中）—— 取最后两条
+        # 就是「命中 + 命中」，older_miss 为空 ⇒ **误判 FAIL**（判据骂的不是
+        # 真问题）。故改为：newer = 最后一条（必须命中），older = newer 之前
+        # 最近的一条**回源**读。找得到就证明「回源→回填→命中」发生过；
+        # 找不到则说明窗口里全是命中，按 §「不得把 SKIP 写成 PASS」的原则，
+        # 明确 FAIL 并提示先让缓存过期。
+        hit_trace = cands[-1]
+        miss_trace = None
+        for v in reversed(cands[:-1]):
+            if any(any(o.startswith(m) for o in v["ops"]) for m in row["miss"]):
+                miss_trace = v
+                break
         want = wanted(row["span"])
         miss_spans = row["miss"]
-        # 回源侧：较旧那条必须**至少含一个**回源 span（证明真的回源了）。
-        older_miss = sorted(
-            {m for m in miss_spans if any(o.startswith(m) for o in older["ops"])}
-        )
-        # 命中侧：较新那条**一个都不许有**。
         newer_miss = sorted(
-            {m for m in miss_spans if any(o.startswith(m) for o in newer["ops"])}
+            {m for m in miss_spans if any(o.startswith(m) for o in hit_trace["ops"])}
         )
-        biz_ok = want is None or any(o.startswith(want) for o in newer["ops"])
-        hops_ok = len(newer["proxy_hops"]) > 0
-        hit = match_route(newer, row["route"], row["method"])
-        code = (hit if hit not in (None, False) else None) or http_status_of(newer)
+        if miss_trace is None:
+            return {
+                "ok": False,
+                "http": "-",
+                "span": "MISS",
+                "hops": 0,
+                "traceID": hit_trace["traceID"],
+                "age": (now_us - hit_trace["start"]) / 1e6 / 60,
+                "why": [
+                    "窗口内该路由的读全部命中缓存，没有找到回源的那一次 —— 本轮"
+                    "没验到「回源→回填」环节。这不是缓存坏了，而是**样本不足**："
+                    "等 TTL 过期（apps 的 product 详情缓存 5 分钟）或连读一个新商品 id 再跑。"
+                ],
+            }
+        biz_ok = want is None or any(o.startswith(want) for o in hit_trace["ops"])
+        hops_ok = len(hit_trace["proxy_hops"]) > 0
+        hit = match_route(hit_trace, row["route"], row["method"])
+        code = (hit if hit not in (None, False) else None) or http_status_of(hit_trace)
         status_ok = True if code is None else str(code).startswith("2")
-        ok = bool(older_miss) and not newer_miss and biz_ok and hops_ok and status_ok
+        ok = not newer_miss and biz_ok and hops_ok and status_ok
         why = []
-        if not older_miss:
-            why.append(
-                f"前一次读没有回源 span（期望含 {' / '.join(miss_spans)} 之一）"
-                "—— 缓存可能一直是热的，本轮没验到回源"
-            )
         if newer_miss:
             why.append(
-                f"后一次读仍含回源 span {' '.join(newer_miss)} —— 缓存未命中"
+                f"最近一次读仍含回源 span {' '.join(newer_miss)} —— 缓存未命中"
             )
         if not biz_ok:
             why.append(f"命中侧 trace 内没有以 {want} 开头的 span")
@@ -522,12 +538,12 @@ def eval_row(row, views, now_us):
             "ok": ok,
             "http": "n/a" if code is None else str(code),
             "span": "✓命中" if not newer_miss else "MISS",
-            "pair": "✓回源" if older_miss else "MISS",
-            "hops": len(newer["proxy_hops"]),
-            "traceID": newer["traceID"],
-            "age": (now_us - newer["start"]) / 1e6 / 60,
+            "pair": "✓回源",
+            "hops": len(hit_trace["proxy_hops"]),
+            "traceID": hit_trace["traceID"],
+            "age": (now_us - hit_trace["start"]) / 1e6 / 60,
             "why": why,
-            "raw": newer["raw"],
+            "raw": hit_trace["raw"],
         }
 
     if row["kind"] == "async":

@@ -28,7 +28,9 @@ SDK_REPOS=(
   cachex configx coordx dbx kvx lockx logx mqx otelx rpcx searchx
   traceflag webx mongodbx hubx
 )
-# 嵌套子模块：路径含斜杠，仓库名是最后一段。
+# 嵌套子模块：路径形如 `cachex/redis`，对应**父仓 cachex 内的子目录**（子 module），
+# GitHub 上并没有 `gospacex/redis` 这个仓库。故这里只登记路径，clone 时连同父仓
+# 一起取回 —— clone_one 幂等，多个子路径共享同一个父仓时只会真 clone 一次。
 SDK_NESTED=(
   cachex/memcached cachex/redis
   coordx/apollo coordx/consul coordx/etcd coordx/k8s_configmap coordx/nacos
@@ -56,8 +58,11 @@ fail=0
 for r in "${SDK_REPOS[@]}"; do
   clone_one "$r" "https://github.com/$ORG/$r.git" || fail=1
 done
+# 嵌套子模块取**第一段**（父仓名）来拼 URL：`path` 里的第二段是父仓内的子目录，
+# 拼进 URL 会得到 `.../gospacex/cachex/redis.git` 这种必然 404 的地址。
 for r in "${SDK_NESTED[@]}"; do
-  clone_one "$r" "https://github.com/$ORG/$r.git" || fail=1
+  repo="${r%%/*}"
+  clone_one "$repo" "https://github.com/$ORG/$repo.git" || fail=1
 done
 
 if [ "$fail" -ne 0 ]; then

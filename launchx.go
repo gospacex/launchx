@@ -1,6 +1,7 @@
 package launchx
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/gospacex/launchx/internal/pipeline"
@@ -16,7 +17,12 @@ func Bootstrap(path string) (*App, error) {
 	}
 	a := &App{configPath: path, events: pipeline.NewEvents()}
 	if err := pipeline.Run(a.env(), a.steps()); err != nil {
-		_ = a.Close()
+		// 地基失败照样要收干净已初始化的资源；但 Close 的返回值**不能丢**：
+		// tracing 冲刷失败、注销失败这类问题只在产物 destructive 时才有感知，
+		// 丢掉它等于「回收了，但不知道回收得干不干净」。回收这件事与其结果一并返回。
+		if exitErr := a.Close(); exitErr != nil {
+			return nil, errors.Join(fmt.Errorf("launchx: bootstrap: %w", err), exitErr)
+		}
 		return nil, err
 	}
 	return a, nil

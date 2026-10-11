@@ -22,8 +22,9 @@
 # 刻意不定义 set -e：四步都要跑完再看总账，中途退出会让人以为只错了一处。
 #
 # 踩坑记录（macOS bash 3.2）：**变量后面紧跟中文必须写成 ${name}**。
-# bash 3.2 不做多字节识别，`$scope（可选` 会被解析成变量名 `${scope}\xef\xbc\x88...`，
-# 于是 `set -u` 下报 "unbound variable"，不带 -u 则静默展开成空串 —— 两种情况都不指向
+# bash 3.2 不做多字节识别：若写成「`$scope` 紧跟中文且没加花括号」（下面第 78 行
+# 那道检查专门拦这种写法），变量名会被并进后面那些字节里 —— `set -u` 下报
+# "unbound variable" 而名字带乱码，不带 -u 则静默展开成空串，两种情况都不指向
 # 真正的原因。本脚本里所有紧跟非 ASCII 的引用一律用花括号（同 e2e.sh 的约定）。
 # =============================================================================
 set -uo pipefail
@@ -76,11 +77,16 @@ fail=0
 step() { printf '\n=== %s ===\n' "$1"; }
 
 step "shell 变量紧邻非 ASCII 检查（macOS bash 3.2 会把它吞进变量名）"
-# 为什么值得单独一步：这不是风格问题，是**静默错误**。`echo "端口 $p（已占用）"`
-# 在 bash 3.2 里把 `（` 的字节并进变量名 => 不带 set -u 时展开成空串且不报错，
+# 为什么值得单独一步：这不是风格问题，是**静默错误**。`echo "端口 $p 被占用"`
+# 这种写法一旦漏写花括号、让变量名与后面的中文之间没有空格，bash 3.2 里
 # 带 set -u 时报 "unbound variable" 而名字还带乱码，两种都不指向真正原因。
 # 只扫被花括号保护的写法以外的裸引用。
-bad_shell=$(grep -rnE '\$[A-Za-z_][A-Za-z0-9_]*[^[:space:][:print:]]' --include='*.sh' examples/ 2>/dev/null || true)
+#
+# ⚠️ 这里曾经用 `[^[:space:][:print:]]` 判"非 ASCII"，那条正则**恒不命中**：
+# POSIX 的 `[[:print:]]` 把多字节汉字也判为可打印（`printf '（x\n' | grep -cE
+# '[^[:print:]]'` == 0，`LC_ALL=C` 下同样 0），于是这一步永远打印 OK —— 一道
+# 恒绿的闸门比没有闸门更危险。判"非 ASCII"必须用字节范围 `[^ -~]`。
+bad_shell=$(grep -rnE '\$[A-Za-z_][A-Za-z0-9_]*[^ -~]' --include='*.sh' examples/ 2>/dev/null || true)
 if [ -n "$bad_shell" ]; then
   echo "以下脚本里变量后紧跟非 ASCII，必须写成 \${name} 形式：" >&2
   printf '%s\n' "$bad_shell" >&2
@@ -103,8 +109,14 @@ done <<<"$(extra_modules "$scope")"
 if [ ${#dirs[@]} -eq 0 ]; then
   echo "OK（本范围没有可格式化的目录）"
 else
+  # 先看 gofmt 自己的退出码：本脚本刻意不加 `set -e`（失败要聚合成一条报告），
+  # 命令替换失败时变量为空，若只判空就会把"gofmt 执行失败"读成"全部已格式化"。
   unformatted=$(gofmt -l "${dirs[@]}")
-  if [ -n "$unformatted" ]; then
+  grc=$?
+  if [ "$grc" -ne 0 ]; then
+    echo "gofmt 执行失败（退出码 ${grc}），门禁无法判定，按失败处理" >&2
+    fail=1
+  elif [ -n "$unformatted" ]; then
     echo "以下文件未 gofmt：" >&2
     printf '%s\n' "$unformatted" >&2
     fail=1

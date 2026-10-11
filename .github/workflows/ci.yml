@@ -80,6 +80,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # 与 gate job 同理：replace 指向 ../<sdk>，没有这一步 `go test .` 会挂在
+      # 模块解析阶段（reading ../cachex/go.mod: no such file or directory），
+      # 而这个 job 的定位恰恰是"任何环境都必须出结论"。
+      # 注意本 job 的 checkout 没带 path，仓库落在工作区根，fetch-sdks.sh 按
+      # $ROOT/../<sdk> 推导仍然正确。
+      - name: 拉取兄弟 SDK（replace 指到 ../<sdk>）
+        run: bash examples/scripts/fetch-sdks.sh
       - name: 库源码不得直引中间件 / examples 布局约束
         run: |
           go test . -run 'TestLibrarySourceHasNoDirectMiddlewareImports' -count=1

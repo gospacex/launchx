@@ -29,10 +29,21 @@ const DefaultEndpoint = "localhost:4318"
 
 // Init 装配 otelx 并完成两项 OTel 全局注册，返回 provider 供退出链关闭。
 //
-// enabled=false 时 otelx 返回 noop provider 且不触碰全局 TracerProvider；
-// 本函数仍会把它显式设为全局，以保证「关闭即全局无 span」的语义不被上游
-// 遗留的 provider 破坏，并仍注册传播器（传播器与是否采样无关）。
+// 采样缺省为 `always_on`（历史行为，本地与验收适用）。生产要控制成本请走
+// `InitWithSampler` 或由 App 从 `trace.sampler*` 读配置。
 func Init(serviceName, endpoint string, enabled bool) (otelx.Provider, error) {
+	return InitWithSampler(serviceName, endpoint, enabled, otelx.SamplerConfig{Type: "always_on"})
+}
+
+// InitWithSampler 同 Init，但显式给定采样配置。
+//
+// 为什么必须留这个出口：采样率写死在库里，下游所有业务就都被迫继承同一个
+// 策略 —— 生产高 QPS 下 100% 采样是实打实的成本与 exporter 背压。没有出口，
+// 想改的业务只能绕过本包自己调 `otel.SetTracerProvider`，反而更危险。
+//
+// Type 为空时 otelx 会按 `always_on` 处理（见 otelx.buildSampler），
+// 故零值 Config 是安全的。
+func InitWithSampler(serviceName, endpoint string, enabled bool, sampler otelx.SamplerConfig) (otelx.Provider, error) {
 	if serviceName == "" {
 		return nil, fmt.Errorf("telemetry: service name is empty")
 	}
@@ -46,7 +57,7 @@ func Init(serviceName, endpoint string, enabled bool) (otelx.Provider, error) {
 			Exported:    "otlp",
 			Endpoint:    endpoint,
 		},
-		Sampler: otelx.SamplerConfig{Type: "always_on"},
+		Sampler: sampler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: init %q: %w", serviceName, err)

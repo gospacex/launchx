@@ -132,6 +132,12 @@ type App struct {
 	// serverStop 停止服务端的钩子，退出链在 server.stop 之后调用。
 	// 只在 Run 真正起服时接上：从未起服（后台型服务）时保持 nil。
 	serverStop func() error
+	// metricsStop 关闭 srv 档自建采集口监听的钩子。
+	//
+	// 刻意**不**走 OnStop：OnStop 整组都在 server.stop 之前执行（见 Close 的第 1 步），
+	// 挂在那里会让采集口早于服务端停止就被掐断，停机过程本身的指标采不到。
+	// 这里单独留一个钩子，由 Close 在 server.stop 之后调用。
+	metricsStop func() error
 
 	// registry / registered 记录「本进程注册进注册中心的那个实例」，
 	// 退出链第 4 步按它注销（未注册态两者皆为零值，注销彻底静默）。
@@ -427,7 +433,11 @@ func (a *App) stepTelemetry(e *pipeline.Env) error {
 		return fmt.Errorf("launchx: service.name is required")
 	}
 	a.serviceName = name
-	p, err := telemetry.Init(name, a.cfg.GetString("trace.endpoint"), a.cfg.GetBool("trace.enabled"))
+	p, err := telemetry.InitWithSampler(name,
+		a.cfg.GetString("trace.endpoint"),
+		a.cfg.GetBool("trace.enabled"),
+		a.telemetrySampler(),
+	)
 	if err != nil {
 		return err
 	}
@@ -442,6 +452,26 @@ func (a *App) stepTelemetry(e *pipeline.Env) error {
 	}
 	a.metrics = m
 	return nil
+}
+
+// telemetrySampler 从 `trace.sampler*` 读采样策略。
+//
+// 缺省 `always_on` 是有意的：**验收判据依赖「发了请求就必须能查到 trace」**，
+// 换成比率采样会让 Jaeger 侧的 assertions 变成概率事件。生产需要控制 exporter
+// 成本时显式配 `trace.sampler: parentbased` + `trace.sampler_ratio: 0.05`
+// （或 `traceidratio`），配之前先确认验收脚本那一档不受影响。
+func (a *App) telemetrySampler() otelx.SamplerConfig {
+	s := otelx.SamplerConfig{Type: "always_on"}
+	if t := strings.TrimSpace(a.cfg.GetString("trace.sampler")); t != "" {
+		s.Type = t
+	}
+	if r := a.cfg.GetFloat64("trace.sampler_ratio"); r > 0 {
+		s.Ratio = r
+	}
+	if a.cfg.IsSet("trace.sampler_parent") {
+		s.Parent = a.cfg.GetBool("trace.sampler_parent")
+	}
+	return s
 }
 
 // stepLogger 构造 logx 并设为全局（业务在任意包内可 logx.GetGlobal()）。
@@ -668,6 +698,13 @@ func selfAddr(cfg configx.Config) (string, int, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("self address %q is not host:port: %w", raw, err)
 	}
+	// 空 host 必须拦下：`:8080` 是合法的监听写法（SplitHostPort 也认），但作为
+	// **注册地址**是没有意义的 —— 注册出去之后上游解析到一个空主机，实例 ID
+	// 也会拼成 `svc--8080`，而日志里「service registered」照常打印，症状要等到
+	// 调用侧 502 才暴露。宁可启动期明确报错，也不要注册一个连不上的地址。
+	if strings.TrimSpace(host) == "" {
+		return "", 0, fmt.Errorf("self address %q has no host part (use 0.0.0.0:<port> or set service.self.addr)", raw)
+	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return "", 0, fmt.Errorf("self address %q has a non-numeric port %q: %w", raw, portStr, err)
@@ -763,8 +800,10 @@ func (a *App) Run() error {
 //   - 没配 metrics.addr（srv 档且开了指标却没配地址，已在 mode.Assemble 阶段即退，
 //     走到这里说明本来就没开指标）。
 //
-// 监听挂在业务退出链上（OnStop）而不是 server.stop：它先于服务端启动，
-// 反序退出时也就晚于服务端关闭 —— 停机过程本身的指标不会被提前掐断。
+// 关闭钩子挂在 `App.metricsStop` 上，由 Close 在 **server.stop 之后**调用
+// （见 Close 第 2b 步）。为什么不挂 OnStop：OnStop 整组都在 server.stop 之前
+// 执行，挂在那里会让采集口先于服务端停止被掐断 —— 早先这里正是这么写的，
+// 注释还顺着错法写成了「反序退出时晚于服务端关闭」。
 func (a *App) startMetricsListener() error {
 	a.mu.Lock()
 	m, engine, addr := a.metrics, a.engine, a.metricsAddr
@@ -775,11 +814,13 @@ func (a *App) startMetricsListener() error {
 	if err := m.Serve(addr); err != nil {
 		return err
 	}
-	a.OnStopNamed("metrics", func() error {
+	a.mu.Lock()
+	a.metricsStop = func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 		defer cancel()
 		return m.Shutdown(ctx)
-	})
+	}
+	a.mu.Unlock()
 	return nil
 }
 
@@ -802,6 +843,12 @@ func (a *App) setupSnapshot() []func(*App) error {
 //
 // 每一步都记录事件，供测试断言顺序（不靠日志文本匹配）。
 // 中间步骤失败不中断后续回收（否则会漏掉 flush），错误聚合返回。
+//
+// 注：`internal/pipeline` 里另有一个通用的 `pipeline.Shutdown`（同为「反序 +
+// 幂等 + 错误聚合」）。本框架的退出链**不走它**，原因：这里的每一环还要额外
+// 套一层有界等待（`runStop`）并在超时时记 `stop.timeout.<name>`，而 `pipeline`
+// 那版只对 NS 步骤做顺序执行。两者并存很容易让人以为改了其中之一就改了退出链，
+// 故在此写明：**退出链的唯一实现是 App.Close**。
 func (a *App) Close() error {
 	a.mu.Lock()
 	if a.closed {
@@ -818,7 +865,7 @@ func (a *App) Close() error {
 	limit := a.stopTimeout()
 
 	// 1. 业务回调先退（此时基础设施仍可用）
-	rec("setup.stop")
+	rec(pipeline.StepSetupStop)
 	for i := len(stops) - 1; i >= 0; i-- {
 		if err := a.runStop(stops[i].name, stops[i].fn, limit); err != nil {
 			errs = append(errs, err)
@@ -831,6 +878,18 @@ func (a *App) Close() error {
 	if a.serverStop != nil {
 		if err := a.runStop("server.stop", a.serverStop, limit); err != nil {
 			errs = append(errs, fmt.Errorf("server stop: %w", err))
+		}
+	}
+
+	// 2b. 采集口监听（仅 srv 档自建的那个）：必须**晚于**服务端停止，
+	//     否则停机过程自身的指标会被提前掐断。钩子在 startMetricsListener 里接。
+	a.mu.Lock()
+	metricsStop := a.metricsStop
+	a.metricsStop = nil
+	a.mu.Unlock()
+	if metricsStop != nil {
+		if err := a.runStop("metrics.listener", metricsStop, limit); err != nil {
+			errs = append(errs, fmt.Errorf("metrics listener stop: %w", err))
 		}
 	}
 

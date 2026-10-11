@@ -28,7 +28,12 @@ const (
 )
 
 // 反序退出链步骤名（显式序列，不依赖 defer）。
+//
+// StepSetupStop 是「业务 OnStop 组」的事件名。它与下面几个**不同层**：其余六个
+// 是基础设施的固定步骤，业务回调是 N 条（每条各自 migrating runStop 有界执行），
+// 这里只为**整组**记一个事件，故单独给一个常量，不要在 App.Close 里写字面量。
 const (
+	StepSetupStop          = "setup.stop"
 	StepServerStop         = "server.stop"
 	StepComponentStop      = "component.stop"
 	StepRegistryDeregister = "registry.deregister"
