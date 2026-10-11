@@ -28,7 +28,22 @@
 --
 -- 本机没有 mysql 客户端时走容器内执行（compose 的 mysql 服务）：
 --   docker exec -i mysql mysql -uroot -prootpass < examples/mall/scripts/schema.sql
--- 验证：docker exec mysql mysql -umall_rw -phubx123 -e "SHOW DATABASES"
+-- 验证：docker exec mysql mysql -umall_rw -p"${MALL_RW_PW:-hubx123}" -e "SHOW DATABASES"
+--
+-- ---------------------------- 口令（仅演示）----------------------------
+-- 应用账号 mall_rw 的口令**不再硬编码在本文件里**：下面两处写成
+-- `${MALL_RW_PW:-hubx123}`，由 shell 在灌脚本之前展开。
+--
+--   ⚠️ 这里的 `hubx123` 是**演示默认值**，不是建议口令。生产环境口令必须走
+--   Secret 注入（K8s Secret / Vault / CI 变量），绝不写进仓库，也别靠这里的
+--   缺省值兜底 —— 缺省值存在的唯一理由是"本机一遍跑通"。
+--
+-- 展开方式（二选一，二选一即可，别两种都不做就把脚本灌进 mysql ——
+-- 那样账号口令会被设成字面量 `${MALL_RW_PW:-hubx123}`，应用侧连不上）：
+--   export MALL_RW_PW='<你的口令>'
+--   envsubst < examples/mall/scripts/schema.sql | mysql -h127.0.0.1 -P3306 -uroot -p
+--   # 或容器内执行：
+--   envsubst < examples/mall/scripts/schema.sql | docker exec -i mysql mysql -uroot -prootpass
 -- ============================================================
 
 -- ---------------------------- 应用账号 ----------------------------
@@ -37,7 +52,7 @@
 -- 演示没了。幂等：MySQL 8 没有 CREATE USER IF NOT EXISTS，故先 DROP 再建，
 -- 重跑本脚本不会报 "user already exists"。
 DROP USER IF EXISTS 'mall_rw'@'%';
-CREATE USER 'mall_rw'@'%' IDENTIFIED BY 'hubx123';
+CREATE USER 'mall_rw'@'%' IDENTIFIED BY '${MALL_RW_PW:-hubx123}';
 GRANT SELECT, INSERT, UPDATE, DELETE ON product_db.* TO 'mall_rw'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON order_db.*  TO 'mall_rw'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON stock_db.*  TO 'mall_rw'@'%';
@@ -106,7 +121,11 @@ CREATE TABLE IF NOT EXISTS outbox (
   event_type  VARCHAR(64)  NOT NULL,
   payload     TEXT,
   traceparent VARCHAR(255) NOT NULL DEFAULT '' COMMENT 'W3C traceparent，随 mqx header 续链',
-  status      TINYINT      NOT NULL DEFAULT 0 COMMENT '0 pending / 1 sent / 2 abandon',
+  -- status 取值与 examples/pkg/outbox 的常量一一对应（改一处须改另一处）：
+  -- 0 pending（待发）/ 1 sent（已投）/ 2 abandon（重试上限，转人工对账）
+  -- / 3 claimed(在飞)（已被补发器取走、尚未确认结果；进程中途崩溃时靠它
+  --   区分"正在发"与"还没发"，避免重启后被重复取走）
+  status      TINYINT      NOT NULL DEFAULT 0 COMMENT '0 pending / 1 sent / 2 abandon / 3 claimed(在飞)',
   retry_count INT          NOT NULL DEFAULT 0,
   created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -216,7 +235,11 @@ CREATE TABLE IF NOT EXISTS stock_reservations (
   created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  KEY idx_sr_order_product (order_no, product_id),
+  -- (order_no, product_id) 必须是**唯一键**而不是普通索引：它是预占幂等的
+  -- 事实来源。同一单重放时 repository.ReserveTx 先查同键流水，命中即按幂等
+  -- 成功返回（不重复扣）；并发下两侧都先查 miss 时，由本唯一键的冲突裁决，
+  -- 第二写入方回查到已有行后同样按重放处理 —— 普通索引挡不住后一种。
+  UNIQUE KEY uk_sr_order_product (order_no, product_id),
   KEY idx_sr_product_status (product_id, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

@@ -30,6 +30,17 @@ trace:
     lock: true
     registry: true
 
+# 入口限流（route 层的 middleware.rate_limit，kvx 固定窗口）。
+#
+# per-user 配额是 per_minute，0 号桶（**无身份**调用方，即 rpc 层拿不到
+# user_id 的那些方法）是 anonymous_per_minute —— 后者必须远小于前者：全体无
+# 身份来源共用这一个桶，给它与 per-user 同等的量，单个来源就能打满整个域的
+# 名额，把有身份的正常流量一起挤掉。
+# 不配 anonymous_per_minute 时按 600/10 回落（见 middleware.NewRateLimiter）。
+rate_limit:
+  per_minute: 600
+  anonymous_per_minute: 60
+
 logx:
   level: info
   otel:

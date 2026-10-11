@@ -38,9 +38,9 @@ import (
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -167,8 +167,17 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 	}
 	// 熔断前置：一个窗口内失败过多的商品直接快速失败，避免每次都走一遍
 	// 加锁 + 事务（超卖时这个路径会被打成热点）。
+	//
+	// 熔断打开的语义是**基础设施故障**（trigger=infra），不是"卖完了"：计数只吃
+	// 业务性失败（见 noteFailure），而业务性失败连续 20 次的现实含义通常是
+	// "这一行写不进去"而不是"这个商品真的没货"。报成 CodeStockInsufficient 会把
+	// 排查方向直接带偏 —— 调用方去改库存，真正的故障在 DB/网络。
 	if s.tripped(ctx, cmd.ProductID) {
-		return nil, codes.New(codes.CodeStockInsufficient, "stock sold out (circuit tripped)")
+		if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+			span.SetAttributes(attribute.String("stock.circuit.trigger", "infra"))
+		}
+		return nil, codes.New(codes.CodeStockCircuitOpen,
+			"stock reserve circuit open (trigger=infra: repeated reserve failures in the current window, retry later)")
 	}
 
 	unlock, deny := s.withProductLock(ctx, cmd.ProductID)
@@ -206,12 +215,17 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 		},
 	})
 	if err != nil {
-		s.bumpFail(ctx, cmd.ProductID)
+		s.noteFailure(ctx, cmd.ProductID, err)
 		return nil, s.mapRepoErr(ctx, err)
 	}
 	s.invalidate(ctx, cmd.ProductID)
 	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
 		span.SetAttributes(attribute.Int64("stock.reservation_id", int64(rec.ReservationID)))
+		// 幂等重放（同一 order_no 的第二次预占）不扣减、不插新流水，
+		// 必须在链路上留痕：否则重放与首次预占长得一模一样，对账时无从区分。
+		if rec.Idempotent {
+			span.SetAttributes(attribute.Bool("stock.reserve_idempotent", true))
+		}
 	}
 	return &model.ReserveResult{
 		ReservationID: rec.ReservationID,
@@ -314,7 +328,7 @@ func (s *StockService) withProductLock(ctx context.Context, productID uint64) (f
 	lk, err := s.lock.Lock(ctx, fmt.Sprintf("stock:reserve:%d", productID), lockx.WithTTL(stockLockTTL))
 	if err != nil {
 		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试
-		return noop, codes.Wrap(codes.CodeStockLockFailed, "concurrent reserve in progress, retry later", err)
+		return noop, codes.Wrap(codes.CodeConcurrent, "concurrent reserve in progress, retry later", err)
 	}
 	return func() {
 		// 解锁必须用请求 ctx：传 Background 会让 release span 失去父节点，
@@ -363,7 +377,38 @@ func (s *StockService) auditDrift(ctx context.Context, d *model.StockDetail) {
 		logx.String("hint", "reconcile stock_reservations against stocks.reserved for this product"))
 }
 
-// bumpFail 预占失败计数（kvx 原子自增 + 窗口 TTL）
+// noteFailure 预占失败的记账：**只有业务性失败才进熔断计数**。
+//
+// 判据是错误种类而不是"有没有错"。DB 不可达、事务超时、死锁回滚都属于基础
+// 设施故障，把它们计进售罄熔断，等于把一次 DB 抖动渲染成"这个商品卖完了" ——
+// 调用方收到 CodeStockInsufficient 会去补货，真正的故障却在数据库那头。
+// 基础设施故障因此只在日志与 span 上留痕，交由告警处置，不推高熔断计数。
+func (s *StockService) noteFailure(ctx context.Context, productID uint64, err error) {
+	if errors.Is(err, repository.ErrInsufficient) || errors.Is(err, repository.ErrNotFound) {
+		s.bumpFail(ctx, productID)
+		return
+	}
+	s.logger.WarnContext(ctx, "stock: reserve failed for infra reasons, not counted toward the sold-out circuit",
+		logx.Int("product_id", int(productID)),
+		logx.Err(err),
+		logx.String("hint", "check stock_db / redis before blaming the product's stock level"))
+	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+		span.SetAttributes(attribute.String("stock.circuit.trigger", "infra"))
+	}
+}
+
+// bumpFail 预占失败计数（kvx 原子自增 + 窗口 TTL）。
+//
+// 补 TTL 的竞态（2026-10-10 说明，未彻底修）：kvx 的 Incr 带不了过期时间，
+// 只能"首次创建后补一次 Set"。但 `n == 1` 是 A 进程看到的快照，等它去 Set 时
+// B 进程可能已经累加到 5 —— 此时的 `Set(key, "1")` 会把 5 覆写回 1（计数被抹掉，
+// 熔断永远打不开），这是真实存在的窗口，不是理论问题。
+//
+// 缩小窗口的做法：Set 之前先查一次 TTL，只有**确实还没有 TTL** 才补。
+// check-then-act 的窗口还在（TTL 查询与 Set 之间仍可能被别人插进来），只是从
+// "每次首次创建都撞"缩小到"两个进程同时首次创建才撞"。
+// 彻底修需要 kvx 提供 Expire(key, ttl) 或 SetNX（Redis 原生两者都有），
+// 在 SDK 补上之前只能做到这一步 —— 计数丢几次的后果是熔断迟钝，不是账目错。
 func (s *StockService) bumpFail(ctx context.Context, productID uint64) {
 	if s.kv == nil || productID <= 0 {
 		return
@@ -371,11 +416,28 @@ func (s *StockService) bumpFail(ctx context.Context, productID uint64) {
 	key := failCounterKey(productID)
 	n, err := s.kv.Incr(ctx, key)
 	if err != nil {
-		return // 计数失败不影响业务：熔断只是削峰手段，不是正确性依赖
+		// 计数失败要看得见：KV 一挂，熔断就静默失效（永远打不开），
+		// 而它保护的那条路径正是最容易被打爆的写热点。
+		s.logger.WarnContext(ctx, "stock: fail counter incr failed, circuit may never trip",
+			logx.String("key", key), logx.Err(err))
+		return
 	}
-	if n == 1 {
-		// 首次创建时补 TTL：Incr 无法带过期时间，不补则计数键永久堆积
-		_ = s.kv.Set(ctx, key, "1", failCounterWindow)
+	if n != 1 {
+		return
+	}
+	ttl, err := s.kv.TTL(ctx, key)
+	if err != nil {
+		s.logger.WarnContext(ctx, "stock: fail counter ttl probe failed, skip backfill",
+			logx.String("key", key), logx.Err(err))
+		return
+	}
+	if ttl > 0 {
+		// 已经有 TTL（说明是别人先补的）：再 Set 一次会把已累加的值覆写回 1
+		return
+	}
+	if err := s.kv.Set(ctx, key, "1", failCounterWindow); err != nil {
+		s.logger.WarnContext(ctx, "stock: fail counter ttl backfill failed",
+			logx.String("key", key), logx.Err(err))
 	}
 }
 

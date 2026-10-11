@@ -54,6 +54,9 @@ func (h *OrderHandler) CreateOrder(ctx context.Context, req *orderpb.CreateOrder
 	rec, err := h.svc.CreateOrder(ctx, model.CreateOrderCmd{
 		UserID: uint64(req.GetUserId()),
 		Items:  toModelItems(req.GetItems()),
+		// 幂等键原样透传：handler 不加工、不兜底（判空回落是 service 的事，
+		// 两层各判一次就会出现"到底谁决定单号"的分歧）。
+		OrderNo: req.GetOrderNo(),
 	})
 	if err != nil {
 		if sErr := settle(&resp.Code, &resp.Message, err); sErr != nil {

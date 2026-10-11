@@ -40,9 +40,9 @@ import (
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -121,7 +121,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 		total += int64(it.Quantity) * it.UnitPrice
 	}
 
-	orderNo := newOrderNo()
+	orderNo := resolveOrderNo(s, ctx, cmd.OrderNo)
 	unlock, deny := s.withUserLock(ctx, cmd.UserID)
 	if deny != nil {
 		return nil, deny
@@ -304,7 +304,7 @@ func (s *OrderService) withUserLock(ctx context.Context, userID uint64) (func(),
 	if err != nil {
 		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试，
 		// 不能笼统报 internal（会被当成需要人工介入的故障）。
-		return noop, codes.Wrap(codes.CodeOrderConcurrent, "concurrent order in progress, retry later", err)
+		return noop, codes.Wrap(codes.CodeConcurrent, "concurrent order in progress, retry later", err)
 	}
 	return func() {
 		// 解锁必须用请求 ctx：这里传过 context.Background()，lockx 的 release
@@ -367,6 +367,31 @@ func evTraceID(ctx context.Context) string {
 		return sc.TraceID().String()
 	}
 	return ""
+}
+
+// resolveOrderNo 决定本单的单号：调用方给了就用它的（那是幂等键），没给才自己生成。
+//
+// 为什么必须有这一层：bff 用**同一个** order_no 同时驱动库存预占、积分入账与
+// 下单，三处共用一个号才能对账（跨域 report 的 JOIN 也靠它）。订单域若自己另起
+// 一个号，重放一次就是「新号 + 新单 + 新预占」，而积分侧会被 uk_ledger_order_type
+// 幂等掉 ⇒ 出现「下了两单、只送一次积分」的对账差异。
+//
+// 没给时**不报错**：老调用方（仓内 demo 脚本、旧客户端）还没有这个字段，直接
+// 拒会让它们全 400。代价是这段调用没有幂等保护 —— 所以必须留痕（Warn + span
+// 属性），否则"幂等没生效"这件事会静默到对账那天才暴露。
+func resolveOrderNo(s *OrderService, ctx context.Context, given string) string {
+	if given != "" {
+		return given
+	}
+	generated := newOrderNo()
+	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
+		span.SetAttributes(attribute.Bool("order.idempotent_key_missing", true))
+	}
+	if s.logger != nil {
+		s.logger.WarnContext(ctx, "order: create without idempotency key, replay protection is off",
+			logx.String("generated_order_no", generated))
+	}
+	return generated
 }
 
 // newOrderNo 订单号（uk_order_no，≤40 字符）：O + yyyyMMddHHmmss + 8 位 hex 随机

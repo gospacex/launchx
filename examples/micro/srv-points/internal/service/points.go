@@ -42,9 +42,9 @@ import (
 
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
-	"github.com/gospacex/launchx/examples/micro/pkg/traceparent"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -272,8 +272,10 @@ func (s *PointsService) withUserLock(ctx context.Context, userID uint64) (func()
 	}
 	lk, err := s.lock.Lock(ctx, fmt.Sprintf("points:change:user:%d", userID), lockx.WithTTL(pointsLockTTL))
 	if err != nil {
-		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试
-		return noop, codes.Wrap(codes.CodeInternal, "concurrent points change in progress, retry later", err)
+		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试。
+		// 码必须走通用段 CodeConcurrent（渲染成 429）—— 报 CodeInternal 会被
+		// 读成"服务端坏了"，客户端因此不敢重试，与这句注释的意图正好相反。
+		return noop, codes.Wrap(codes.CodeConcurrent, "concurrent points change in progress, retry later", err)
 	}
 	return func() {
 		// 解锁必须用请求 ctx：传 Background 会让 release span 失去父节点，

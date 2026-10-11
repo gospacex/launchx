@@ -315,16 +315,61 @@ func (s *ProductService) withProductLock(ctx context.Context, productID uint64) 
 	}, nil
 }
 
+// hotCounterWindow 热度计数的滚动窗口（24h）：见 bumpHot 的注释。
+const hotCounterWindow = 24 * time.Hour
+
+// hotCounterKey 商品热度计数键。带 productID 而非只用一个全局计数器：
+// 热度是**按商品**看的运营信号，且拆 key 能让冷商品的计数自然过期消失。
+func hotCounterKey(productID uint64) string {
+	return fmt.Sprintf("hot:product:%d", productID)
+}
+
 // bumpHot 商品访问热度计数（kvx 原子自增；KV 缺失时静默降级）。
 //
 // 与限流计数一样走 kvx，但**不参与业务判定**：计数失败既不告警也不重试，
 // 热度只是运营信号，不该在它上面产生故障面。
+//
+// 计数键带 24h TTL，因此热度是**滚动 24 小时**而不是"自上线以来累计" ——
+// 后者会让冷商品的 key 永久驻留（Incr 建出来的 key 没有过期时间），且热度
+// 值只涨不跌，运营侧看不出"最近热不热"。
 func (s *ProductService) bumpHot(ctx context.Context, productID uint64) {
 	if s.kv == nil || productID <= 0 {
 		return
 	}
-	if _, err := s.kv.Incr(ctx, fmt.Sprintf("hot:product:%d", productID)); err != nil {
+	key := hotCounterKey(productID)
+	n, err := s.kv.Incr(ctx, key)
+	if err != nil {
 		s.logger.WarnContext(ctx, "product: hot counter incr failed", logx.Err(err))
+		return
+	}
+	if n == 1 {
+		s.ensureTTL(ctx, key, hotCounterWindow)
+	}
+}
+
+// ensureTTL 给刚由 Incr 创建的计数键补一个 TTL。
+//
+// 补之前先 TTL 判一次，且**不宣称"此时值必然是 1"**：kvx 的 Incr 不能带过期
+// 时间，而 Set 会覆写并发期间别人已经累加的值 —— A 拿到 n==1 去补 TTL 时 B
+// 可能已经加到 3，A 这一写把它按回 1（热度被低估）。先判 TTL、只在确实没有
+// TTL 时才写，把这段竞态窗口从"每次"压到"仅首次"。
+//
+// ⚠️ 这不是彻底修：只要 kvx 只提供 Set（没有 Expire / SetNX），覆写竞态就
+// 消不掉 —— 判空与写入之间仍有窗口。彻底修要等 kvx 提供 Expire（只设 TTL
+// 不动值）或 SetNX。热度少算的后果只是运营信号偏小，可接受。
+func (s *ProductService) ensureTTL(ctx context.Context, key string, window time.Duration) {
+	ttl, err := s.kv.TTL(ctx, key)
+	if err != nil {
+		s.logger.WarnContext(ctx, "product: ttl probe failed, counter key may leak",
+			logx.String("key", key), logx.Err(err))
+		return
+	}
+	if ttl > 0 {
+		return // 已有 TTL：不覆写，避免把并发累加的值按回去
+	}
+	if err := s.kv.Set(ctx, key, "1", window); err != nil {
+		s.logger.WarnContext(ctx, "product: counter ttl set failed, key may leak",
+			logx.String("key", key), logx.Err(err))
 	}
 }
 

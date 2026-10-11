@@ -1,9 +1,72 @@
 # =============================================================================
-# 微服案例的 k8s 部署清单（六个 Deployment + 一个 ConfigMap）
+# 微服案例的 k8s 部署清单（一份 ConfigMap + 六个 Service + 六个 Deployment）
 # -----------------------------------------------------------------------------
-# 探针口径（本例最关键的一条）：
+# 同目录还有三份配套清单，一起 apply（编号即顺序）：
+#   00-namespace.yaml      命名空间
+#   10-host-middleware.yaml 宿主中间件（mysql/redis/kafka/jaeger）的集群内门面
+#   20-secret.yaml         数据库口令与演示令牌（**不进 ConfigMap**）
 #
-#   - gateway / bff 有 HTTP 面 → 可以用 HTTP GET /healthz/live；
+# 用法（minikube）：
+#   bash examples/micro/scripts/build-bin.sh          # 先产出 examples/docker/bin/
+#   docker build -f examples/docker/Dockerfile -t launchx-demo:dev examples/docker
+#   minikube image load launchx-demo:dev
+#   kubectl apply -f examples/micro/deploy/
+#   kubectl -n launchx-demo get pod -w
+#
+# -----------------------------------------------------------------------------
+# 一、为什么每个 Deployment 都必须挂 config.yaml（本轮修掉的头号缺陷）
+#
+# 镜像（examples/docker/Dockerfile）只 `COPY bin/ /app/bin/`，**镜像内没有
+# config.yaml**；而六个进程都以相对路径读配置（`Bootstrap("config.yaml")`，
+# 镜像 WORKDIR 已是 /app/conf）—— 二进制与配置缺一不可。此前本文件只有
+# Namespace / ConfigMap / 6×Deployment，且 ConfigMap 里只有 gateway 一份，
+# 另外五份被注释成「实际交付时用 kubectl create configmap --from-file 生成」，
+# 但**六个 Deployment 连 volumes/volumeMounts 都没有**：那份注释等于把配置
+# 交付这件事推给了不存在的步骤，Pod 起来必然找不到配置。
+#
+# 现在的口径：**六份配置全部落在本文件的 ConfigMap 里，六个 Deployment 用
+# subPath 各挂自己那份**，不依赖任何 apply 之外的手工步骤。`--from-file`
+# 的写法只在「配置还要频繁改、且每次改都要重生成 ConfigMap」时才省力，
+# 代价是清单本身不再自足（clone 下来 apply 一遍跑不起来）。
+#
+# 挂载形态（与 examples/mesh/deploy/apps/20-srv-order.yaml:93-98 同写法）：
+#   volumes:        conf ← configMap/micro-config
+#   volumeMounts:   mountPath: /app/conf/config.yaml, subPath: <key>
+# 用 subPath 是为了让「六个进程共用一份 ConfigMap、各自只看到自己那份」——
+# 不用 subPath 就得把整个 ConfigMap 目录挂进去，进程会在同目录下看到另外五份
+# 同名不同义的文件。
+#
+# -----------------------------------------------------------------------------
+# 二、配置副本与 examples/micro/<dir>/config.yaml 的关系
+#
+# 六份是那六个文件的**部署副本**：业务字段逐字一致，只有**地址段**按下表换算
+# （与 examples/mesh/deploy/micro/10-configmap.yaml:7-15 的换算表同源），
+# 以及两处结构性差异（第 3、4 条）：
+#
+#   1. 监听地址 127.0.0.1 → 0.0.0.0
+#      （service.addr / webx.addr / metrics.addr）
+#      容器内绑回环 = Pod 外不可达：k8s 探针打的是 Pod IP，Service 转发的也是
+#      Pod IP，绑 127.0.0.1 的表现是「进程活着但 readiness 永不通过」。
+#   2. 宿主中间件 127.0.0.1 → host-middleware.launchx-demo.svc.cluster.local
+#      （mysql 3306 / redis 6379 / kafka 9094 / jaeger OTLP 4318）
+#      Pod 的回环是 Pod 自己。kafka 只走 9094 不走 9092，理由见
+#      10-host-middleware.yaml 头注（9092 的 advertised 是回环地址）。
+#   3. **没有 coordx（注册中心）段**：本清单不部署 consul，服务发现交
+#      k8s Service DNS —— `service.upstream.<服务名>` 从「注册中心不可用时的
+#      直连兜底」升级为**唯一**地址来源。与 apps 组的取舍完全相同
+#      （examples/mesh/deploy/apps/10-configmap.yaml:11-14）：
+#      RegistryAddr 为空 ⇒ launchx 不挂 resolver（internal/mode/webx.go:116-127），
+#      gateway 侧 proxy.NewResolver 收到 nil finder 后走配置兜底
+#      （examples/micro/gateway/app/setup.go:51-58）。
+#      相应地，四个 srv 的 trace.on 里去掉了 registry（没有句柄就没有该组件）。
+#      代价：本地那份 consul 注册表与本清单无关，链路不经过注册中心。
+#   4. bff 的 demo.auth_token 改为 `${DEMO_AUTH_TOKEN}`（明文不进 ConfigMap，
+#      值来自 20-secret.yaml 的 demo-auth Secret），见下面「四、Secret」。
+#
+# -----------------------------------------------------------------------------
+# 三、探针口径（本例最关键的一条）
+#
+#   - gateway / bff 有 HTTP 面 → 可以用 HTTP GET /healthz/{live,ready}；
 #   - **四个域服没有 HTTP 面**（kitex 私有协议），只能用 tcpSocket。
 #
 # 为什么 srv 档必须显式给探针而不是"靠 consul TTL 就够了"：
@@ -16,34 +79,76 @@
 #  liveness 负责"要不要重启"，重启会丢掉进程内的 outbox 补发进度，
 #  判得太激进会制造无意义的重启风暴。
 #
-# 用法（minikube）：
-#   kubectl apply -f examples/micro/deploy/micro.yaml
-#   kubectl -n launchx-demo get pod -w
+# ⚠️ readiness 打 /healthz/ready、liveness 打 /healthz/live —— 两者不是一件事，
+# 别写成同一个路径：readiness 应该回答「我现在的依赖（库/缓存/MQ）能不能服务」，
+# liveness 只回答「我是不是卡死了」。写成同一个路径后，依赖抖动会直接触发
+# 重启，把「下游抖一下」放大成「一批实例重建 + outbox 补发进度丢失」。
+# webx 自带这两个端点（examples/mesh/deploy/apps/30-bff.yaml:92 已验证可用）。
 #
-# 注意：镜像里的六个二进制与 config.yaml 缺一不可 —— configPath 是相对路径
-# "config.yaml"，进程必须在配置所在目录下启动（镜像的 WORKDIR 已经是 /app/conf）。
+# -----------------------------------------------------------------------------
+# 四、Secret 与 ConfigMap 的分工
+#
+# ConfigMap 只放**非敏感**配置；两样敏感值走 20-secret.yaml：
+#   - HUBX_DB_PW：四个 srv 的 DSN 里是 `${HUBX_DB_PW}` 占位，由 secretKeyRef
+#     注入（保持环境变量口径，不改成明文）；
+#   - DEMO_AUTH_TOKEN：bff 的 demo.auth_token 写 `${DEMO_AUTH_TOKEN}`，由
+#     secretKeyRef 注入。展开点在本仓配置层（internal/configsrc/expand.go 对
+#     GetString 施加 os.ExpandEnv），与 DSN 的占位同一条路径。
+#
+# -----------------------------------------------------------------------------
+# 五、安全上下文（六个容器一致）
+#
+# 照 examples/mesh/deploy/apps/20-srv-order.yaml:66-74,112-116 落地：
+#   Pod 级：runAsNonRoot + runAsUser/runAsGroup/fsGroup 65534(nobody) +
+#           seccompProfile: RuntimeDefault
+#   容器级：allowPrivilegeEscalation: false + capabilities.drop: [ALL] +
+#           readOnlyRootFilesystem: true
+# 只读根文件系统 mesh 组已验证可行（同一套镜像、同一档进程、无写盘需求），
+# 这里照搬；配套挂一个 emptyDir 到 /tmp —— 只读根下 /tmp 也是只读的，
+# 进程万一写临时文件（日志滚动、panic 转储）会直接失败。
+# 镜像侧同步以非 root 运行（examples/docker/Dockerfile 的 USER 65534:65534），
+# 两处口径必须一致，否则运行时身份由谁决定就成了悬案。
+#
+# -----------------------------------------------------------------------------
+# 六、端口与端口名
+#
+# 端口（与 examples/micro/README.md §1 的表格一致）：
+#   gateway 8080（HTTP，采集口同口）/ bff 8081（HTTP，采集口同口）
+#   product 9021 / order 9022 / stock 9023 / points 9024（kitex RPC）
+#   采集口：order 9031 / points 9032 / product 9033 / stock 9034
+#
+# 端口名沿用全仓约定（改错会让 Istio 按名误判协议，微服侧也要保持一致以免
+# 日后入网格时踩同一个坑）：
+#   - 入口 HTTP：`http`；
+#   - RPC：`tcp-rpc`（`tcp-` 前缀显式声明 L4，别写 grpc-*）；
+#   - 采集口：`tcp-metrics`（/metrics 是 HTTP/1.1，但声明成 http-* 会让
+#     sidecar 按 L7 接管，进网格后会被 AuthorizationPolicy 挡成 403）。
 # =============================================================================
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: launchx-demo
----
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: micro-config
   namespace: launchx-demo
 data:
-  # 每份 config.yaml 的键名就是进程要读的文件名（Bootstrap("config.yaml")）。
-  # 六个进程各挂一份，靠 volumeMount 的 subPath 分别落到各自的目录。
+  # 键名即「哪一份」，与 Deployment 的 subPath 一一对应：
+  #   gateway.config.yaml / bff.config.yaml / product.config.yaml /
+  #   order.config.yaml / stock.config.yaml / points.config.yaml
+  # 进程读的是挂载后的路径 /app/conf/config.yaml（Bootstrap("config.yaml")），
+  # 与键名无关 —— 键名只是 ConfigMap 内部的区分。
   gateway.config.yaml: |
     service:
       name: demo-gateway
       mode: gateway
       addr: "0.0.0.0:8080"
+      upstream:
+        # 无注册中心（见头注二.3），这是 gateway → bff 的**唯一**地址来源。
+        demo-bff: "demo-bff.launchx-demo.svc.cluster.local:8081"
     webx:
       addr: "0.0.0.0:8080"
       timeout: 5s
+      rate_limit_rps: 100
+      rate_limit_burst: 200
+      cors_origins: []
       health_prefix: /healthz
     gateway:
       routes:
@@ -53,20 +158,502 @@ data:
           name: api
     trace:
       enabled: true
-      endpoint: "jaeger:4318"
+      endpoint: "host-middleware.launchx-demo.svc.cluster.local:4318"
     logx:
       level: info
       otel:
         enable_trace: true
-    # 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
-    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流）。
-    # 关掉（false 或不写）即不建 provider，meter 退回 noop。
+    # 指标：HTTP 面挂在 webx 的 MetricsPrefix（缺省 /metrics）上，不另开端口。
     metrics:
       enabled: true
-  # 其余五份按各自目录下的 config.yaml 原样填入（此处省略，避免清单与文件
-  # 各维护一份而漂移 —— 实际交付时用 `kubectl create configmap --from-file`
-  # 从目录生成，见 README §部署）。
+  # ------------------------------------------------------------------ bff
+  bff.config.yaml: |
+    service:
+      name: demo-bff
+      mode: bff
+      addr: "0.0.0.0:8081"
+      upstream:
+        # 同上：无注册中心，四域地址的唯一来源（端口与各自的 service.addr 一致）。
+        demo-product: "demo-product.launchx-demo.svc.cluster.local:9021"
+        demo-stock:   "demo-stock.launchx-demo.svc.cluster.local:9023"
+        demo-order:   "demo-order.launchx-demo.svc.cluster.local:9022"
+        demo-points:  "demo-points.launchx-demo.svc.cluster.local:9024"
+    webx:
+      addr: "0.0.0.0:8081"
+      timeout: 5s
+      rate_limit_rps: 100
+      rate_limit_burst: 200
+      cors_origins: []
+      health_prefix: /healthz
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-demo.svc.cluster.local:4318"
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+    metrics:
+      enabled: true
+    # 入口鉴权：本档是 HTTP 边界，唯一验凭据的地方。缺这一段时装配层按 true
+    # 处理（安全默认值）；auth.require=false 会让六条路由对任何调用方开放。
+    auth:
+      require: true
+      ticket_ttl: 5m
+    demo:
+      # ⚠️ 明文不进 ConfigMap：值来自 20-secret.yaml 的 demo-auth
+      #（secretKeyRef → env DEMO_AUTH_TOKEN → configsrc 的 os.ExpandEnv）。
+      # 生产必须换成签发服务（含轮换与吊销），详见 20-secret.yaml 头注。
+      auth_token: "${DEMO_AUTH_TOKEN}"
+      seed_user_id: 1001
+    xmiddleware:
+      # 出向 RPC 治理。**重试刻意不开**：链路上有非幂等写（下单 / 扣减 / 入账），
+      # 传输层超时重试会产生重复落库；且入口侧若也开重试，故障期双侧重试会
+      # 互相放大（ACCEPTANCE §13.5 硬规则 1）。
+      rpcx:
+        circuit_breaker:
+          enabled: true
+          error_rate: 0.5
+          min_sample: 200
+        retry:
+          enabled: false
+          max_attempts: 2
+          backoff_ms: 10
+      # 凭据存储：多实例部署时必须是进程外的，用本地 map 会表现为「请求随机 401」
+      #（签发落在哪个实例上，哪个实例才认）。db 2 与四域的 0/1 分开：
+      # 凭据被逐出 = 全员 401。
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-bff:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 2
+            pool_size: 30
+  # ---------------------------------------------------------------- product
+  product.config.yaml: |
+    service:
+      name: demo-product
+      mode: srv
+      addr: "0.0.0.0:9021"
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-demo.svc.cluster.local:4318"
+      on:
+        db: true
+        cache: true
+        mq: true
+        kv: true
+        lock: true
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+    # srv 档没有 HTTP 面，采集口必须单起监听；addr 漏配而 enabled=true 时
+    # 装配期即退（否则指标被采集却无人能读，且不报错）。
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9033"
+    auth:
+      require: true
+      ticket_ttl: 5m
+    # 地基失败即退：连不上库就启动失败，而不是降级成"起来但落不了库"。
+    strict:
+      db: true
+    xmiddleware:
+      sqlx:
+        driver: gorm
+        databases:
+          demo-product:
+            # ${HUBX_DB_PW} 由 20-secret.yaml 的 demo-db 注入（见头注四）。
+            dsn: "mall_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-demo.svc.cluster.local:3306)/product_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            conn_max_lifetime: 5m
+            conn_max_idle_time: 1m
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-product:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 0
+            pool_size: 50
+      mqx:
+        driver: kafka
+        instances:
+          demo-product:
+            # MUST 用 9094（kafka-mesh）：9092 的 advertised 是回环地址，
+            # 在 Pod 里等于 Pod 自己（详见 10-host-middleware.yaml 头注）。
+            brokers:
+              - "host-middleware.launchx-demo.svc.cluster.local:9094"
+            enable_trace: true
+            consumer:
+              topic: product.created.v1
+              # group_id 必须显式写：缺省会被填成 mqx-group，所有服务挤进同一个
+              # 消费组互相抢分区，表现为「消息投出去了但没人收到」。
+              group_id: demo-srv-product
+            producer:
+              batch_size: 100
+              batch_timeout: 10ms
+              required_acks: -1
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-product:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+      lockx:
+        driver: redis
+        addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+        namespace: demo-product
+        ttl: 10s
+        enable_trace: true
+        retry:
+          enabled: true
+          max_attempts: 3
+          backoff_ms: 50
+  # ------------------------------------------------------------------ order
+  order.config.yaml: |
+    service:
+      name: demo-order
+      mode: srv
+      addr: "0.0.0.0:9022"
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-demo.svc.cluster.local:4318"
+      on:
+        db: true
+        cache: true
+        mq: true
+        kv: true
+        lock: true
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9031"
+    auth:
+      require: true
+      ticket_ttl: 5m
+    strict:
+      db: true
+    xmiddleware:
+      sqlx:
+        driver: gorm
+        databases:
+          demo-order:
+            dsn: "mall_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-demo.svc.cluster.local:3306)/order_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            conn_max_lifetime: 5m
+            conn_max_idle_time: 1m
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-order:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 0
+            pool_size: 50
+      mqx:
+        driver: kafka
+        instances:
+          demo-order:
+            brokers:
+              - "host-middleware.launchx-demo.svc.cluster.local:9094"
+            enable_trace: true
+            consumer:
+              topic: order.completed.v1
+              group_id: demo-srv-order
+            producer:
+              batch_size: 100
+              batch_timeout: 10ms
+              required_acks: -1
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-order:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+      lockx:
+        driver: redis
+        addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+        namespace: demo-order
+        ttl: 10s
+        enable_trace: true
+        retry:
+          enabled: true
+          max_attempts: 3
+          backoff_ms: 50
+  # ------------------------------------------------------------------ stock
+  stock.config.yaml: |
+    service:
+      name: demo-stock
+      mode: srv
+      addr: "0.0.0.0:9023"
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-demo.svc.cluster.local:4318"
+      on:
+        db: true
+        cache: true
+        mq: true
+        kv: true
+        lock: true
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9034"
+    auth:
+      require: true
+      ticket_ttl: 5m
+    strict:
+      db: true
+    xmiddleware:
+      sqlx:
+        driver: gorm
+        databases:
+          demo-stock:
+            dsn: "mall_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-demo.svc.cluster.local:3306)/stock_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 30 # 预占是写热点，连接池比读域开得大
+            max_idle_conns: 10
+            conn_max_lifetime: 5m
+            conn_max_idle_time: 1m
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-stock:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 0
+            pool_size: 50
+      mqx:
+        driver: kafka
+        instances:
+          demo-stock:
+            brokers:
+              - "host-middleware.launchx-demo.svc.cluster.local:9094"
+            enable_trace: true
+            consumer:
+              topic: stock.reserved.v1
+              group_id: demo-srv-stock
+            producer:
+              batch_size: 100
+              batch_timeout: 10ms
+              required_acks: -1
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-stock:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+      lockx:
+        driver: redis
+        addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+        namespace: demo-stock
+        ttl: 10s
+        enable_trace: true
+        retry:
+          enabled: true
+          max_attempts: 3
+          backoff_ms: 50
+  # ----------------------------------------------------------------- points
+  points.config.yaml: |
+    service:
+      name: demo-points
+      mode: srv
+      addr: "0.0.0.0:9024"
+    trace:
+      enabled: true
+      endpoint: "host-middleware.launchx-demo.svc.cluster.local:4318"
+      on:
+        db: true
+        cache: true
+        mq: true
+        kv: true
+        lock: true
+    logx:
+      level: info
+      otel:
+        enable_trace: true
+    metrics:
+      enabled: true
+      addr: "0.0.0.0:9032"
+    auth:
+      require: true
+      ticket_ttl: 5m
+    strict:
+      db: true
+    xmiddleware:
+      sqlx:
+        driver: gorm
+        databases:
+          demo-points:
+            dsn: "mall_rw:${HUBX_DB_PW}@tcp(host-middleware.launchx-demo.svc.cluster.local:3306)/points_db?charset=utf8mb4&parseTime=True&loc=Local"
+            max_open_conns: 20
+            max_idle_conns: 5
+            conn_max_lifetime: 5m
+            conn_max_idle_time: 1m
+      cachex:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-points:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 0
+            pool_size: 50
+      mqx:
+        driver: kafka
+        instances:
+          demo-points:
+            brokers:
+              - "host-middleware.launchx-demo.svc.cluster.local:9094"
+            enable_trace: true
+            consumer:
+              topic: points.changed.v1
+              group_id: demo-srv-points
+            producer:
+              batch_size: 100
+              batch_timeout: 10ms
+              required_acks: -1
+      kvx:
+        driver: redis
+        enable_trace: true
+        instances:
+          demo-points:
+            addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+            db: 1
+            pool_size: 30
+      lockx:
+        driver: redis
+        addr: "host-middleware.launchx-demo.svc.cluster.local:6379"
+        namespace: demo-points
+        ttl: 10s
+        enable_trace: true
+        retry:
+          enabled: true
+          max_attempts: 3
+          backoff_ms: 50
 ---
+# =============================================================================
+# 六个 Service：给 Deployment 一个集群内稳定入口
+# -----------------------------------------------------------------------------
+# 此前六个 Deployment 一个 Service 都没有 —— 结果不只是「没法从外面访问」：
+# Prometheus 按 Pod 名抓取本就不现实（Pod IP 会变），而四个域服的采集口
+# 9031-9034 只存在于 Pod 上，没有 Service 就没有稳定的抓取目标；bff/gateway
+# 的 8080/8081 同理。Service 的另一个用处是当**地址来源**：本清单没有注册中心，
+# 上面六份配置里的 upstream 写的就是这些 Service 的 FQDN。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-gateway
+  namespace: launchx-demo
+spec:
+  selector:
+    app: demo-gateway
+  ports:
+    # 入口端口名**必须**是 `http`（全仓约定）：Istio 按名识别协议，写错会让
+    # 入口 502。微服形态当前没有 sidecar，但日后入网格时同一份清单要能用。
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-bff
+  namespace: launchx-demo
+spec:
+  selector:
+    app: demo-bff
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-product
+  namespace: launchx-demo
+spec:
+  selector:
+    app: demo-product
+  ports:
+    # `tcp-rpc`（`tcp-` 前缀显式声明 L4）—— 别改成 grpc-*：kitex 是 TTHeader
+    # over TCP，改了之后 Istio 会按 h2 解析，入口直接 502。
+    - name: tcp-rpc
+      port: 9021
+      targetPort: 9021
+    # 采集口。端口名用 `tcp-` 而不是 `http-`：/metrics 是 HTTP/1.1，但声明成
+    # http-* 会让 sidecar 按 L7 接管，进网格后被 AuthorizationPolicy 挡成 403。
+    - name: tcp-metrics
+      port: 9033
+      targetPort: 9033
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-order
+  namespace: launchx-demo
+spec:
+  selector:
+    app: demo-order
+  ports:
+    - name: tcp-rpc
+      port: 9022
+      targetPort: 9022
+    - name: tcp-metrics
+      port: 9031
+      targetPort: 9031
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-stock
+  namespace: launchx-demo
+spec:
+  selector:
+    app: demo-stock
+  ports:
+    - name: tcp-rpc
+      port: 9023
+      targetPort: 9023
+    - name: tcp-metrics
+      port: 9034
+      targetPort: 9034
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-points
+  namespace: launchx-demo
+spec:
+  selector:
+    app: demo-points
+  ports:
+    - name: tcp-rpc
+      port: 9024
+      targetPort: 9024
+    - name: tcp-metrics
+      port: 9032
+      targetPort: 9032
+---
+# =============================================================================
+# 六个 Deployment
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -80,6 +667,15 @@ spec:
     metadata:
       labels: { app: demo-gateway }
     spec:
+      # Pod 级安全上下文：业务容器以 nobody(65534) 运行，拒绝 root；
+      # seccomp 用运行时默认档案（见头注五）。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
           image: launchx-demo:dev
@@ -90,12 +686,31 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 10
           readinessProbe:
-            httpGet: { path: /healthz/live, port: http }
+            httpGet: { path: /healthz/ready, port: http }
             initialDelaySeconds: 5
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # 只读根文件系统下 /tmp 也是只读的，给它一块可写的 emptyDir。
+            - name: tmp
+              mountPath: /tmp
+            # 配置：进程以相对路径 "config.yaml" 读取，WORKDIR 是 /app/conf。
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: gateway.config.yaml
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: conf
+          configMap:
+            name: micro-config
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -110,11 +725,26 @@ spec:
     metadata:
       labels: { app: demo-bff }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: bff
           image: launchx-demo:dev
           command: ["/app/bin/demo-bff"]
           ports: [{ name: http, containerPort: 8081 }]
+          env:
+            # bff.config.yaml 的 demo.auth_token 是 ${DEMO_AUTH_TOKEN} 占位，
+            # 值走 Secret（明文 env 会在 describe / CI 日志里回显）。
+            - name: DEMO_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-auth
+                  key: demo-auth-token
           # /healthz 与 /ping 在鉴权白名单里（见 bff/app/setup.go 的
           # authSkipPaths）：探针不该因为凭据存储抖动而失败，否则编排系统会
           # 因为"鉴权用的 redis 抖了一下"重启一批健康实例。
@@ -123,12 +753,29 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 10
           readinessProbe:
-            httpGet: { path: /healthz/live, port: http }
+            httpGet: { path: /healthz/ready, port: http }
             initialDelaySeconds: 5
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: bff.config.yaml
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: conf
+          configMap:
+            name: micro-config
 ---
 # 四个域服：只有 RPC 面，探针走 tcpSocket（端口 = service.addr 的端口）。
 # 顺序与 scripts/e2e.sh 的 spec 列表一致：product 9021 / order 9022 /
@@ -146,11 +793,29 @@ spec:
     metadata:
       labels: { app: demo-product }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: product
           image: launchx-demo:dev
           command: ["/app/bin/demo-product"]
-          ports: [{ name: rpc, containerPort: 9021 }]
+          ports:
+            - { name: rpc, containerPort: 9021 }
+            - { name: metrics, containerPort: 9033 }
+          env:
+            # conf 的 sqlx dsn 里是 ${HUBX_DB_PW} 占位，由这里注入。
+            # 值走 Secret（20-secret.yaml 的 demo-db）：明文 value 会在
+            # describe / CI 日志里回显。strict.db=true，库连不上即退。
+            - name: HUBX_DB_PW
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: HUBX_DB_PW
           livenessProbe:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 20
@@ -159,9 +824,26 @@ spec:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 5
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: product.config.yaml
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: conf
+          configMap:
+            name: micro-config
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -176,11 +858,26 @@ spec:
     metadata:
       labels: { app: demo-order }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: order
           image: launchx-demo:dev
           command: ["/app/bin/demo-order"]
-          ports: [{ name: rpc, containerPort: 9022 }]
+          ports:
+            - { name: rpc, containerPort: 9022 }
+            - { name: metrics, containerPort: 9031 }
+          env:
+            - name: HUBX_DB_PW
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: HUBX_DB_PW
           livenessProbe:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 20
@@ -189,9 +886,26 @@ spec:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 5
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: order.config.yaml
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: conf
+          configMap:
+            name: micro-config
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -206,11 +920,26 @@ spec:
     metadata:
       labels: { app: demo-stock }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: stock
           image: launchx-demo:dev
           command: ["/app/bin/demo-stock"]
-          ports: [{ name: rpc, containerPort: 9023 }]
+          ports:
+            - { name: rpc, containerPort: 9023 }
+            - { name: metrics, containerPort: 9034 }
+          env:
+            - name: HUBX_DB_PW
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: HUBX_DB_PW
           livenessProbe:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 20
@@ -219,9 +948,26 @@ spec:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 5
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: stock.config.yaml
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: conf
+          configMap:
+            name: micro-config
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -236,11 +982,26 @@ spec:
     metadata:
       labels: { app: demo-points }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: points
           image: launchx-demo:dev
           command: ["/app/bin/demo-points"]
-          ports: [{ name: rpc, containerPort: 9024 }]
+          ports:
+            - { name: rpc, containerPort: 9024 }
+            - { name: metrics, containerPort: 9032 }
+          env:
+            - name: HUBX_DB_PW
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: HUBX_DB_PW
           livenessProbe:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 20
@@ -249,6 +1010,23 @@ spec:
             tcpSocket: { port: rpc }
             initialDelaySeconds: 5
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: conf
+              mountPath: /app/conf/config.yaml
+              subPath: points.config.yaml
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: conf
+          configMap:
+            name: micro-config

@@ -92,7 +92,7 @@ if port_open 8081; then
   fi
 fi
 
-export HUBX_DB_PW="${HUBX_DB_PW:-hubx123}"
+export HUBX_DB_PW="${HUBX_DB_PW:?请设置 HUBX_DB_PW（应用账号 mall_rw 的口令）}"
 export CGO_ENABLED=0
 
 # 最小三进程：只测 gateway → bff 这一跳的边界，不需要四个域服全起。

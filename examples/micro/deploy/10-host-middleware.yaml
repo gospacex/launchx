@@ -1,0 +1,64 @@
+# =============================================================================
+# 宿主中间件的集群内门面（无 selector 的 Service + 手工 Endpoints）
+# -----------------------------------------------------------------------------
+# 为什么微服形态也需要这一层：
+#   六个进程的配置副本里，中间件地址不能写 `127.0.0.1` —— Pod 的回环是 Pod
+#   自己，写它的后果是「进程连自己」，症状因组件而异且都不指向真因：
+#     * sqlx（strict.db: true）→ 连不上库，装配期直接退，Pod CrashLoopBackOff；
+#     * cachex / kvx / lockx → 不报错、只静默降级（限流失效、缓存失效）；
+#     * mqx → 投不出去，outbox 补发永远不成功。
+#   统一写一个集群 DNS 名，换宿主地址只改这一处 Endpoints。
+#
+# ⚠️ Endpoints 的 IP = **从 minikube 视角看宿主的地址**，换环境必须改：
+#      minikube ssh -- "getent hosts host.minikube.internal" | awk '{print $1}'
+#    当前值 192.168.65.254 是本机（Docker Desktop + minikube docker driver）
+#    的实测值，与 `examples/mesh/deploy/shared/20-host-middleware.yaml:69`
+#    用的是同一个地址 —— 两处是同一台宿主，改要一起改。
+#    清单侧无法把它写成占位符（Endpoints 要求合法 IP，占位串会被 API server 拒），
+#    也没有既有 envsubst 约定，故**换环境只能手工改这一行**。
+#
+# kafka 只开 9094（kafka-mesh）不开 9092：宿主 kafka 9092 那个监听器的
+# advertised 地址是 127.0.0.1:9092，在 Pod 里等于 Pod 自己 —— bootstrap 能连上、
+# 元数据一返回就 `connection refused`。Pod 侧必须用 9094（advertised 是本
+# Service 名），理由与 `examples/mesh/deploy/shared/20-host-middleware.yaml:44-47`
+# 逐字相同。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: host-middleware
+  namespace: launchx-demo
+spec:
+  # 刻意**不写 selector**：后端由下面的 Endpoints 手工指定（宿主不在 Pod 网络里）
+  ports:
+    - name: mysql
+      port: 3306
+      protocol: TCP
+    - name: redis
+      port: 6379
+      protocol: TCP
+    - name: kafka-mesh
+      port: 9094
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: host-middleware
+  namespace: launchx-demo
+subsets:
+  - addresses:
+      # 宿主地址（minikube 视角），换环境必须按上面的命令重新取并改这一行。
+      - ip: 192.168.65.254
+    ports:
+      - name: mysql
+        port: 3306
+      - name: redis
+        port: 6379
+      - name: kafka-mesh
+        port: 9094
+      - name: otlp-http
+        port: 4318

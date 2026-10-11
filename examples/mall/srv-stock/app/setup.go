@@ -107,9 +107,17 @@ func Setup(a *launchx.App) error {
 	)
 
 	// 限流器只在 KV 组件可用时启用（kv 为 nil 时 Allow 恒 true：fail-open）
+	//
+	// 0 号桶（无身份调用方）的配额单独给一个远小于 per-user 的值：rpc 层对拿
+	// 不到 user_id 的方法（列表 / 报表 / 按商品维度的接口）一律传 0，全体无身份
+	// 来源共用一个桶。不区分的话，一个匿名来源就能打满整个域的名额，把有身份
+	// 的正常流量一起挤掉 —— 限流从"按主体配额"退化成"全域共享桶"。
+	// 可在 config.yaml 用 rate_limit.anonymous_per_minute 覆盖；未配时按
+	// rateLimitPerMinute/10（见 middleware.NewRateLimiter）。
 	var limiter *middleware.RateLimiter
 	if kv := a.KV()[name]; kv != nil {
-		limiter = middleware.NewRateLimiter(kv, "rate:"+name, rateLimitPerMinute, rateLimitWindow)
+		anonPerMinute := a.Config().GetInt("rate_limit.anonymous_per_minute")
+		limiter = middleware.NewRateLimiter(kv, "rate:"+name, rateLimitPerMinute, rateLimitWindow, anonPerMinute, logger)
 	}
 
 	h := handler.NewStockHandler(svc, traceOn)

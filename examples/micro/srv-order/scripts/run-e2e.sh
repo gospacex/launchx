@@ -208,8 +208,10 @@ place_order() {
     return 1
   fi
   row="$(mysql_exec -e "SELECT COUNT(*) FROM order_db.order_items i JOIN order_db.orders o ON o.id=i.order_id WHERE o.order_no='${ORDER_NO}';" | tail -1)"
-  if [ "$row" -lt 1 ] 2>/dev/null; then
-    fail "order_items 中没有该单的明细行（实际 ${row}）"
+  # 先判空再判值：`[ "" -lt 1 ]` 只会以退出码 2 失败并被认定成「条件不成立」，
+  # 于是 mysql_exec 拿不到数字时这条断言会**静默通过**（典型判据 fail-open）。
+  if [ -z "${row:-}" ] || ! [ "${row}" -ge 1 ]; then
+    fail "order_items 中没有该单的明细行（实际 ${row:-<空>}）"
     return 1
   fi
   log "落库确认：orders 1 行 + order_items ${row} 行"

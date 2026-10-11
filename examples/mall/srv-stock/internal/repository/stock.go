@@ -61,6 +61,10 @@ type ReserveInput struct {
 type ReserveOutput struct {
 	ReservationID uint64
 	Available     int32
+	// Replayed 本次是「同一 (order_no, product_id) 的重放」：没有发生新的扣减，
+	// 返回的是既有流水与当前 available。调用方据此把这件事记进 span ——
+	// 重放占比异常高通常意味着上游在超时重试，那是另一类故障面。
+	Replayed bool
 }
 
 // ReleaseInput 释放事务输入
@@ -200,6 +204,16 @@ func (r *StockRepository) ListStocks(ctx context.Context, q model.ListStocksQuer
 
 // ReserveTx 3 表事务 + outbox：stocks 条件扣减 + 预占流水 + 变动日志 + outbox。
 //
+// 幂等：同一 (order_no, product_id) 只允许存在一条预占流水。事务内先查同键
+// 流水，命中即按**重放**返回（回已有 reservation_id 与当前 available，不再
+// 扣减、不再插流水、不再插 outbox）。上游超时重试、MQ 补发、调用方自己重放
+// 都会走到这条路径 —— 没有这层保护时重复扣减的表现是库存被悄悄扣掉两份，
+// 而对账单上只有同一个单号，事后无从发现。
+//
+// 唯一键 uk_sr_order_product 是这层幂等的**事实来源**：先查后插在并发下会
+// 两侧同时 miss，真正裁决谁生效的是唯一键冲突，故插入失败时必须回查一次
+// （见下方 insert 失败分支），否则会把并发重放误报成预占失败。
+//
 // 条件更新是防超卖的第二道闸（第一道是 lockx）：只判 RowsAffected==0 时
 // 再回查一次区分"没记录"与"不够扣"，两次判定都只在事务内发生，
 // 中间不会被别的预占插进来。
@@ -208,6 +222,16 @@ func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (out *
 	defer func() { end(err) }()
 	out = &ReserveOutput{}
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// ① 幂等前置：同键流水已存在 ⇒ 本次是重放，直接回既有结果。
+		var exist model.Reservation
+		probe := tx.Where("order_no = ? AND product_id = ?", in.OrderNo, in.ProductID).
+			Order("id DESC").Take(&exist).Error
+		switch {
+		case probe == nil:
+			return r.finishReplay(tx, in, out, exist.ID)
+		case !errors.Is(probe, gorm.ErrRecordNotFound):
+			return fmt.Errorf("probe reservation %s/%d: %w", in.OrderNo, in.ProductID, probe)
+		}
 		res := tx.Model(&model.Stock{}).
 			Where("product_id = ? AND available >= ?", in.ProductID, in.Quantity).
 			Updates(map[string]any{
@@ -228,6 +252,13 @@ func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (out *
 			Status:    model.ReserveReserved,
 		}
 		if err := tx.Create(&rv).Error; err != nil {
+			// ② 插入失败先回查一次：唯一键冲突说明并发的那一侧刚插进去，
+			// 本次同样按重放处理（不重复扣减）。回查也 miss 才是真的写失败。
+			var dup model.Reservation
+			if e := tx.Where("order_no = ? AND product_id = ?", in.OrderNo, in.ProductID).
+				Order("id DESC").Take(&dup).Error; e == nil {
+				return r.finishReplay(tx, in, out, dup.ID)
+			}
 			return fmt.Errorf("insert reservation: %w", err)
 		}
 		if err := tx.Create(&model.StockLog{
@@ -284,6 +315,23 @@ func (r *StockRepository) ReleaseTx(ctx context.Context, in ReleaseInput) (out i
 		if in.Quantity > rv.Quantity {
 			return fmt.Errorf("release %s: %w (reserved %d, release %d)", in.OrderNo, ErrOverRelease, rv.Quantity, in.Quantity)
 		}
+		// 状态推进改成**带 status 守卫的条件更新**（CAS）：只有把这条流水从
+		// status=1 翻成终态的那一方才继续动库存。
+		//
+		// 先 CAS 再动库存（而不是反过来）是刻意的顺序：无锁降级 / 跨进程绕过
+		// 锁的调用下，两个并发副本会读到同一条 status=1 的流水；谁先翻状态谁
+		// 生效，后到者 RowsAffected==0 → ErrReservationNF（4005，幂等成功语义），
+		// 整个事务回滚，reserved 不会被扣两遍。反过来写则两侧都会先扣库存。
+		cas := tx.Model(&model.Reservation{}).
+			Where("id = ? AND status = ?", rv.ID, model.ReserveReserved).
+			Updates(map[string]any{"status": model.ReserveReleased})
+		if cas.Error != nil {
+			return fmt.Errorf("mark reservation released %d: %w", rv.ID, cas.Error)
+		}
+		if cas.RowsAffected != 1 {
+			// 已被并发的那一侧推进到终态：本次按"已释放过"处理（幂等成功）。
+			return fmt.Errorf("release %s/%d: %w", in.OrderNo, in.ProductID, ErrReservationNF)
+		}
 		res := tx.Model(&model.Stock{}).
 			Where("product_id = ? AND reserved >= ?", in.ProductID, in.Quantity).
 			Updates(map[string]any{
@@ -296,10 +344,6 @@ func (r *StockRepository) ReleaseTx(ctx context.Context, in ReleaseInput) (out i
 		}
 		if res.RowsAffected == 0 {
 			return r.classifyMiss(tx, in.ProductID, ErrInsufficient)
-		}
-		if err := tx.Model(&model.Reservation{}).Where("id = ?", rv.ID).
-			Updates(map[string]any{"status": model.ReserveReleased}).Error; err != nil {
-			return fmt.Errorf("mark reservation released %d: %w", rv.ID, err)
 		}
 		if err := tx.Create(&model.StockLog{
 			ProductID: in.ProductID,
@@ -341,6 +385,18 @@ func (r *StockRepository) ConfirmTx(ctx context.Context, in ConfirmInput) (total
 		if in.Quantity > rv.Quantity {
 			return fmt.Errorf("confirm %s: %w (reserved %d, confirm %d)", in.OrderNo, ErrOverRelease, rv.Quantity, in.Quantity)
 		}
+		// 同 ReleaseTx：先把流水 CAS 到终态，抢到的那一方才动库存。
+		// 同一单被并发确认两次时，第二个拿到 RowsAffected==0 → 4005，事务回滚，
+		// total 只会被扣一次。
+		cas := tx.Model(&model.Reservation{}).
+			Where("id = ? AND status = ?", rv.ID, model.ReserveReserved).
+			Updates(map[string]any{"status": model.ReserveConfirmed})
+		if cas.Error != nil {
+			return fmt.Errorf("mark reservation confirmed %d: %w", rv.ID, cas.Error)
+		}
+		if cas.RowsAffected != 1 {
+			return fmt.Errorf("confirm %s/%d: %w", in.OrderNo, in.ProductID, ErrReservationNF)
+		}
 		res := tx.Model(&model.Stock{}).
 			Where("product_id = ? AND reserved >= ? AND total >= ?", in.ProductID, in.Quantity, in.Quantity).
 			Updates(map[string]any{
@@ -353,10 +409,6 @@ func (r *StockRepository) ConfirmTx(ctx context.Context, in ConfirmInput) (total
 		}
 		if res.RowsAffected == 0 {
 			return r.classifyMiss(tx, in.ProductID, ErrInsufficient)
-		}
-		if err := tx.Model(&model.Reservation{}).Where("id = ?", rv.ID).
-			Updates(map[string]any{"status": model.ReserveConfirmed}).Error; err != nil {
-			return fmt.Errorf("mark reservation confirmed %d: %w", rv.ID, err)
 		}
 		if err := tx.Create(&model.StockLog{
 			ProductID: in.ProductID,
@@ -428,6 +480,23 @@ func (r *StockRepository) AdjustTx(ctx context.Context, in AdjustInput) (total, 
 		return 0, 0, err
 	}
 	return total, available, nil
+}
+
+// finishReplay 幂等重放的收尾：回填既有 reservation_id 与当前 available。
+//
+// 刻意不比较本次 quantity 与既有流水 quantity：两者不等说明调用方拿同一个
+// 单号下了不同的量，那是**调用方**的错，而库存侧唯一安全的处置是维持既有
+// 结果（改量等于凭第二次请求重写第一次的账）。差异由调用方侧的 span 属性
+// （stock.reserve_replayed）去暴露，不在这里静默吞掉。
+func (r *StockRepository) finishReplay(tx *gorm.DB, in ReserveInput, out *ReserveOutput, reservationID uint64) error {
+	out.ReservationID = reservationID
+	out.Replayed = true
+	var s model.Stock
+	if err := tx.Where("product_id = ?", in.ProductID).Take(&s).Error; err != nil {
+		return fmt.Errorf("reload stock %d: %w", in.ProductID, err)
+	}
+	out.Available = s.Available
+	return nil
 }
 
 // classifyMiss 区分"库存记录不存在"与"数量不够"。

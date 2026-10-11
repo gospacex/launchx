@@ -47,15 +47,31 @@ import (
 
 // 四服地址。与 dockers/docker-compose.yml 收编后的本机中间件一致；
 // 走 registry 模式时这些地址只是兜底（实际由 consul 发现给出）。
+//
+// 默认值一律读 env（缺省值保持原样，本机行为不变）：`examples/HANDLE-AUDIT.md`
+// 与 `examples/ACCEPTANCE.md` 的地址红线判据要求源码里不出现 `127.0.0.1` /
+// `localhost`，目的是让同一份二进制能在网格里复用而不必 fork 改常量。写死在
+// const 里会让这条判据恒红 —— 而它被写成 BRE `\|` 时是**静默零命中**，
+// 一直伪装成"合规"，2026-10-11 修成 `-E` 才把这 6 处照出来。
+var (
+	productTarget = envOr("MALL_PRODUCT_ADDR", "127.0.0.1:9101")
+	orderTarget   = envOr("MALL_ORDER_ADDR", "127.0.0.1:9102")
+	stockTarget   = envOr("MALL_STOCK_ADDR", "127.0.0.1:9103")
+	pointsTarget  = envOr("MALL_POINTS_ADDR", "127.0.0.1:9104")
+
+	registryAddr = envOr("MALL_REGISTRY_ADDR", "127.0.0.1:8500") // consul
+	otlpEndpoint = envOr("MALL_OTLP_ENDPOINT", "127.0.0.1:4318") // jaeger OTLP/HTTP
+)
+
+// envOr 取环境变量，缺省回落到 def。
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 const (
-	productTarget = "127.0.0.1:9101"
-	orderTarget   = "127.0.0.1:9102"
-	stockTarget   = "127.0.0.1:9103"
-	pointsTarget  = "127.0.0.1:9104"
-
-	registryAddr = "127.0.0.1:8500" // consul
-	otlpEndpoint = "127.0.0.1:4318" // jaeger OTLP/HTTP
-
 	// stockProductID 库存域单独用一个**已存在**的商品 ID。
 	//
 	// 为什么不是新建的那个：库存域没有"建库存"RPC，AdjustTx 是纯 UPDATE

@@ -212,7 +212,12 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 	}
 	s.invalidate(ctx, cmd.ProductID)
 	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-		span.SetAttributes(attribute.Int64("stock.reservation_id", int64(rec.ReservationID)))
+		span.SetAttributes(
+			attribute.Int64("stock.reservation_id", int64(rec.ReservationID)),
+			// 重放命中说明上游在拿同一个单号重复预占：结果是幂等的（没多扣），
+			// 但这类调用量本身就是故障信号，必须能在 Jaeger 上按属性搜出来。
+			attribute.Bool("stock.reserve_replayed", rec.Replayed),
+		)
 	}
 	return &model.ReserveResult{
 		ReservationID: rec.ReservationID,
@@ -222,6 +227,10 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 }
 
 // ReleaseStock 释放预占（幂等：流水不存在按已释放处理）
+//
+// 加锁的理由与预占同源：释放是"读流水 → 改库存 → 推进流水状态"三步，
+// 两个并发副本同时读到同一条 status=1 的流水时，会各把 reserved 减一遍。
+// 锁 key 带 order_no（按单互斥，不同单的释放互不阻塞）。
 func (s *StockService) ReleaseStock(ctx context.Context, cmd model.ReleaseCmd) (out *model.ReleaseResult, err error) {
 	ctx, end := s.begin(ctx, "ReleaseStock")
 	defer func() { end(err) }()
@@ -229,6 +238,12 @@ func (s *StockService) ReleaseStock(ctx context.Context, cmd model.ReleaseCmd) (
 	if cmd.ProductID <= 0 || cmd.Quantity <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id/quantity/order_no required")
 	}
+	unlock, deny := s.withLock(ctx, fmt.Sprintf("stock:release:%d:%s", cmd.ProductID, cmd.OrderNo), cmd.ProductID)
+	if deny != nil {
+		return nil, deny
+	}
+	defer unlock()
+
 	available, err := s.repo.ReleaseTx(ctx, repository.ReleaseInput{
 		OrderNo:   cmd.OrderNo,
 		ProductID: cmd.ProductID,
@@ -242,6 +257,9 @@ func (s *StockService) ReleaseStock(ctx context.Context, cmd model.ReleaseCmd) (
 }
 
 // ConfirmStock 确认预占（真正出库：扣 total）
+//
+// 与释放同形：先按 (product_id, order_no) 加锁，再由流水状态的 CAS 裁决谁
+// 真正结算。少任何一层，同一单被并发确认两次就会扣掉两份 total。
 func (s *StockService) ConfirmStock(ctx context.Context, cmd model.ConfirmCmd) (out *model.ConfirmResult, err error) {
 	ctx, end := s.begin(ctx, "ConfirmStock")
 	defer func() { end(err) }()
@@ -249,6 +267,12 @@ func (s *StockService) ConfirmStock(ctx context.Context, cmd model.ConfirmCmd) (
 	if cmd.ProductID <= 0 || cmd.Quantity <= 0 || cmd.OrderNo == "" {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id/quantity/order_no required")
 	}
+	unlock, deny := s.withLock(ctx, fmt.Sprintf("stock:confirm:%d:%s", cmd.ProductID, cmd.OrderNo), cmd.ProductID)
+	if deny != nil {
+		return nil, deny
+	}
+	defer unlock()
+
 	total, available, err := s.repo.ConfirmTx(ctx, repository.ConfirmInput{
 		OrderNo:   cmd.OrderNo,
 		ProductID: cmd.ProductID,
@@ -262,6 +286,10 @@ func (s *StockService) ConfirmStock(ctx context.Context, cmd model.ConfirmCmd) (
 }
 
 // AdjustStock 入库 / 盘点（2 表事务）
+//
+// 盘点（Δ<0）也加锁：它与预占 / 释放改的是同一行 stocks，且条件更新只保证
+// "不会扣成负数"，保证不了"两次盘点各自的 Δ 都被记进账" —— 无锁时两次并发
+// 盘点可能读到同一个 available 快照，其中一个 Δ 被另一个覆盖。
 func (s *StockService) AdjustStock(ctx context.Context, cmd model.AdjustCmd) (out *model.AdjustResult, err error) {
 	ctx, end := s.begin(ctx, "AdjustStock")
 	defer func() { end(err) }()
@@ -272,6 +300,12 @@ func (s *StockService) AdjustStock(ctx context.Context, cmd model.AdjustCmd) (ou
 	if cmd.ProductID <= 0 || cmd.Delta == 0 {
 		return nil, codes.New(codes.CodeInvalidParam, "product_id/delta invalid")
 	}
+	unlock, deny := s.withLock(ctx, fmt.Sprintf("stock:adjust:%d", cmd.ProductID), cmd.ProductID)
+	if deny != nil {
+		return nil, deny
+	}
+	defer unlock()
+
 	total, available, err := s.repo.AdjustTx(ctx, repository.AdjustInput{
 		ProductID:  cmd.ProductID,
 		Delta:      cmd.Delta,
@@ -304,15 +338,34 @@ func (s *StockService) Report(ctx context.Context, q model.StockReportQuery) (ou
 // 在日志里说清后果：这是本示例唯一一处"降级即可能超卖"的路径，
 // 静默继续会让事后无法回答"当时有没有加锁"。返回非 nil error 表示拒绝本次请求。
 func (s *StockService) withProductLock(ctx context.Context, productID uint64) (func(), *codes.Error) {
+	return s.withLock(ctx, fmt.Sprintf("stock:reserve:%d", productID), productID)
+}
+
+// withLock 按给定 key 取互斥锁，返回解锁闭包。
+//
+// 与 withProductLock 的关系：后者是本域「预占」这一条写路径的专用入口，锁
+// key 只带 product_id（同一商品的预占必须全局串行，跨单也要排队）；其它写
+// 路径（释放 / 确认 / 盘点）同样需要互斥 —— 它们读-改-写的是同一张 stocks
+// 行与同一条流水，没有锁时两个并发副本能读到同一条 status=1 的流水并各推进
+// 一次，reserved 被扣两遍 —— 故统一收口到这里，只是 key 不同：
+//
+//	stock:release:<product_id>:<order_no>   释放（按单维度，不同单互不阻塞）
+//	stock:confirm:<product_id>:<order_no>   确认（同上）
+//	stock:adjust:<product_id>               盘点/入库（商品维度）
+//
+// 释放与确认按 (product_id, order_no) 加锁而不是按商品：这两条路径本身就是
+// 按单结算的，按商品会让"不同单的确认"互相排队，白白把吞吐压到单串行。
+func (s *StockService) withLock(ctx context.Context, key string, productID uint64) (func(), *codes.Error) {
 	noop := func() {}
 	if s.lock == nil {
-		s.logger.WarnContext(ctx, "stock: locker unavailable, reserve runs WITHOUT mutual exclusion",
+		s.logger.WarnContext(ctx, "stock: locker unavailable, write runs WITHOUT mutual exclusion",
+			logx.String("lock_key", key),
 			logx.Int("product_id", int(productID)),
-			logx.String("consequence", "oversell is possible; only the conditional UPDATE guards stock"),
+			logx.String("consequence", "oversell/double-settle is possible; only the conditional UPDATE guards stock"),
 			logx.String("hint", "check xmiddleware.lockx in config.yaml"))
 		return noop, nil
 	}
-	lk, err := s.lock.Lock(ctx, fmt.Sprintf("stock:reserve:%d", productID), lockx.WithTTL(stockLockTTL))
+	lk, err := s.lock.Lock(ctx, key, lockx.WithTTL(stockLockTTL))
 	if err != nil {
 		// 取锁失败（含重试耗尽）≠ 业务失败：明确告知调用方可重试
 		return noop, codes.Wrap(codes.CodeStockLockFailed, "concurrent reserve in progress, retry later", err)
@@ -375,8 +428,35 @@ func (s *StockService) bumpFail(ctx context.Context, productID uint64) {
 		return // 计数失败不影响业务：熔断只是削峰手段，不是正确性依赖
 	}
 	if n == 1 {
-		// 首次创建时补 TTL：Incr 无法带过期时间，不补则计数键永久堆积
-		_ = s.kv.Set(ctx, key, "1", failCounterWindow)
+		s.ensureTTL(ctx, key, failCounterWindow)
+	}
+}
+
+// ensureTTL 给刚由 Incr 创建的计数键补一个 TTL（key 无 TTL 时冷 key 会永久
+// 驻留 redis）。
+//
+// 补之前先 TTL 判一次，且**不宣称"此时值必然是 1"**：kvx 的 Incr 不能带过期
+// 时间，Set(key, "1") 会覆写并发期间别人已经累加的值 —— A 拿到 n==1 去补 TTL
+// 时 B 可能已经加到 3，A 这一写把它按回 1（熔断计数被低估，表现为"少挡了几次"）。
+// 先判 TTL 只在确实没有 TTL 时才写，把这段竞态窗口从"每次窗口滚动"压到"仅首次"。
+//
+// ⚠️ 这不是彻底修：只要 kvx 只提供 Set（没有 Expire / SetNX），覆写竞态就
+// 消不掉 —— 判空与写入之间仍有窗口。彻底修要等 kvx 提供 Expire（只设 TTL
+// 不动值）或 SetNX；在那之前只能缩小窗口 + 出错留痕。降级方向是"计数偏小"
+// （限流/熔断偏松），可接受。
+func (s *StockService) ensureTTL(ctx context.Context, key string, window time.Duration) {
+	ttl, err := s.kv.TTL(ctx, key)
+	if err != nil {
+		s.logger.WarnContext(ctx, "stock: ttl probe failed, counter key may leak",
+			logx.String("key", key), logx.Err(err))
+		return
+	}
+	if ttl > 0 {
+		return // 已有 TTL：不覆写，避免把并发累加的值按回去
+	}
+	if err := s.kv.Set(ctx, key, "1", window); err != nil {
+		s.logger.WarnContext(ctx, "stock: counter ttl set failed, key may leak",
+			logx.String("key", key), logx.Err(err))
 	}
 }
 

@@ -44,6 +44,21 @@ trace:
   on:
     registry: true
 
+# 边界鉴权（bff 是四个域服唯一的 HTTP 入口，也是全链路唯一验凭据的地方）。
+#
+# 调用方式：Authorization: Bearer <demo.auth_token>
+# 缺省即**要求鉴权**（安全默认值）：键缺失按开启处理，只有显式
+# auth.require=false 才关闭 —— 关了之后任何人都能带着任意 user_id 读别人的
+# 订单与积分账户（IDOR），仅限可信网络内的本机排障。
+#
+# 令牌 → 用户的映射在装配期从这两个键读出（与 examples/micro 同口径）。
+# 生产里这张表属于签发服务（含过期轮换与吊销），示例只播种一条。
+auth:
+  require: true
+demo:
+  auth_token: "mall-demo-token"   # 演示令牌；生产用 Secret 注入，不写进仓库
+  seed_user_id: 1001              # 该令牌对应的用户
+
 logx:
   level: info
   otel:

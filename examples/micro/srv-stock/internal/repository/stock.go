@@ -61,6 +61,10 @@ type ReserveInput struct {
 type ReserveOutput struct {
 	ReservationID uint64
 	Available     int32
+	// Idempotent 为 true 表示这次调用命中了既有预占流水（同一单重放），
+	// 没有发生任何扣减。调用方据此在 span 上留痕 —— 否则「重放成功」与
+	// 「首次预占成功」在链路上长得一模一样，对账时无从区分。
+	Idempotent bool
 }
 
 // ReleaseInput 释放事务输入
@@ -198,7 +202,18 @@ func (r *StockRepository) ListStocks(ctx context.Context, q model.ListStocksQuer
 
 // ---------- 多表事务 ----------
 
-// ReserveTx 3 表事务 + outbox：stocks 条件扣减 + 预占流水 + 变动日志 + outbox。
+// ReserveTx 3 表事务 + outbox：幂等查重 → stocks 条件扣减 → 预占流水 →
+// 变动日志 → outbox。
+//
+// 幂等（2026-10-10 修）：同 (order_no, product_id) 已有流水时**直接返回既有
+// 流水**，不再扣减、不再插新行。缺了这一步，「重放一次 POST /order」会多冻结
+// 一份 available，而释放路径（ReleaseTx 的 `Order("id DESC").Take`）只认最新
+// 一条 —— 旧流水永久停在 status=1，冻结量再也放不出来。
+//
+// 查重必须在**事务内、扣减之前**：放在事务外就退化成 check-then-act，两个并发
+// 重放都能查到"没有"，然后各扣一次。表上的 uk_sr_order_product
+// （见 examples/micro/scripts/schema-micro.sql）是最后一道闸，它让并发下的
+// 重复插入直接失败，而不是静默变成两笔预占。
 //
 // 条件更新是防超卖的第二道闸（第一道是 lockx）：只判 RowsAffected==0 时
 // 再回查一次区分"没记录"与"不够扣"，两次判定都只在事务内发生，
@@ -208,6 +223,23 @@ func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (out *
 	defer func() { end(err) }()
 	out = &ReserveOutput{}
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// ① 幂等查重：命中即原样返回（ReservationID 取既有流水，available 取当前值）
+		var exist model.Reservation
+		e := tx.Where("order_no = ? AND product_id = ?", in.OrderNo, in.ProductID).Take(&exist).Error
+		switch {
+		case e == nil:
+			var s model.Stock
+			if err := tx.Where("product_id = ?", in.ProductID).Take(&s).Error; err != nil {
+				return fmt.Errorf("reload stock %d: %w", in.ProductID, err)
+			}
+			out.ReservationID = exist.ID
+			out.Available = s.Available
+			out.Idempotent = true
+			return nil
+		case !errors.Is(e, gorm.ErrRecordNotFound):
+			return fmt.Errorf("probe reservation %s/%d: %w", in.OrderNo, in.ProductID, e)
+		}
+		// ② 条件扣减
 		res := tx.Model(&model.Stock{}).
 			Where("product_id = ? AND available >= ?", in.ProductID, in.Quantity).
 			Updates(map[string]any{

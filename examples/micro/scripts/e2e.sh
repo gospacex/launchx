@@ -23,9 +23,10 @@
 #   显示 COMMAND=com.docke）。处置：`docker stop etcdkeeper`（跑完再 start 回来）。
 #
 # 踩坑记录（macOS bash 3.2）：**变量后面紧跟中文必须写成 ${name}**。
-# bash 3.2 不做多字节识别，`$name（端口` 会被解析成变量名 `${name}\xef\xbc\x88...`，
-# 于是 `set -u` 下报 "unbound variable"，不带 -u 则静默展开成空串 —— 两种情况
-# 都不指向真正的原因。本脚本里所有紧跟非 ASCII 的引用一律用花括号。
+# bash 3.2 不做多字节识别：若写成「变量名紧跟中文且没加花括号」（ci.sh 的
+# "shell 变量紧邻非 ASCII 检查" 那一步专门拦这种写法），变量名会被并进后面那些
+# 字节里 —— `set -u` 下报 "unbound variable" 而名字带乱码，不带 -u 则静默展开成
+# 空串，两种情况都不指向真正的原因。本脚本里所有紧跟非 ASCII 的引用一律用花括号。
 # ============================================================
 set -euo pipefail
 
@@ -36,6 +37,9 @@ GO_BIN="${GO_BIN:-$HOME/sdk/go1.24.3/bin/go}"
 DOCKER_BIN="${DOCKER_BIN:-/Applications/Docker.app/Contents/Resources/bin/docker}"
 COMPOSE_FILE="${COMPOSE_FILE:-/Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml}"
 SCHEMA_SQL="$REPO_ROOT/examples/mall/scripts/schema.sql"
+# micro 自有的 DDL 补丁：共用 schema.sql 是 mall 案例的资产，micro 侧的约束
+#（库存预占流水唯一键）只加在自己这份里，见该文件头注释。
+SCHEMA_MICRO_SQL="$MICRO_DIR/scripts/schema-micro.sql"
 
 GATEWAY="${GATEWAY:-http://127.0.0.1:8080}"
 USER_ID="${USER_ID:-1001}"
@@ -137,11 +141,15 @@ require_base() {
 # order ⋈ order_items 的双表查询 + 缓存回填，比 /ping 多触达三层
 # （bff → order 域 → mysql）。只断言 /ping 等于只验了 bff 活着。
 # ------------------------------------------------------------
+# 口令一律从环境取、缺省即报错，不写 `-pxxx` 明文、也不给弱口令默认值：
+# 脚本进了仓库，写死在里面的口令就等于公开，而"连不上库"必须显式失败 ——
+# 悄悄用默认口令连上，只会让真正去改口令的人发现改了也没生效。
 mysql_exec() {
+  local pw="${MYSQL_ROOT_PW:?请设置 MYSQL_ROOT_PW（mysql root 口令）}"
   if command -v mysql >/dev/null 2>&1; then
-    mysql -h127.0.0.1 -P3306 -uroot -prootpass "$@"
+    MYSQL_PWD="$pw" mysql -h127.0.0.1 -P3306 -uroot "$@"
   elif [ -x "${DOCKER_BIN}" ]; then
-    "${DOCKER_BIN}" exec -i mysql mysql -uroot -prootpass "$@"
+    MYSQL_PWD="$pw" "${DOCKER_BIN}" exec -i -e MYSQL_PWD mysql mysql -uroot "$@"
   else
     fail "没有 mysql 客户端也没有 docker，无法灌种子数据"
     return 1
@@ -155,6 +163,17 @@ seed() {
   fi
   log "灌种子：$(basename "$SCHEMA_SQL")（四库 DDL + outbox 同构表，幂等）"
   mysql_exec <"$SCHEMA_SQL" >/dev/null
+
+  # micro 自有的 DDL 补丁：库存预占流水的 (order_no, product_id) 唯一键。
+  # 不并进上面的共用 schema.sql —— 那是 mall 案例的资产，且唯一键属于 micro
+  # 侧这次的幂等修复。缺了它，「重放一次 POST /order」会多冻结一份库存。
+  if [ -f "$SCHEMA_MICRO_SQL" ]; then
+    log "灌种子补丁：$(basename "$SCHEMA_MICRO_SQL")（micro 自有 DDL，幂等）"
+    mysql_exec <"$SCHEMA_MICRO_SQL" >/dev/null
+  else
+    fail "找不到 micro 的 DDL 补丁：$SCHEMA_MICRO_SQL"
+    return 1
+  fi
 
   # 幂等种子行：反复重跑不会撞 uk_order_no，也不会让主键漂移。
   log "灌种子订单：order_db.orders id=$SEED_ORDER_ID user_id=$USER_ID"
@@ -298,7 +317,10 @@ main() {
   require_base
   seed
 
-  export HUBX_DB_PW="${HUBX_DB_PW:-hubx123}"
+  # 应用账号口令（注入 config.yaml 的 ${HUBX_DB_PW} 占位）：从环境取、缺省即报错。
+  # 给默认值 hubx123 的旧写法会让"口令没配"这件事静默过去 —— 连上的是哪个库
+  # 全凭运气，排障时看不出来。
+  export HUBX_DB_PW="${HUBX_DB_PW:?请设置 HUBX_DB_PW（应用账号 mall_rw 的口令）}"
   export CGO_ENABLED=0
 
   # 四个域服：90xx 是 kitex RPC 端口；业务数据都在各自私有库里。

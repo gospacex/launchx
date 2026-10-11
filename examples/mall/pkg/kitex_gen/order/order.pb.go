@@ -49,9 +49,18 @@ func (x *OrderItem) GetUnitPrice() int64 {
 	return 0
 }
 
+// CreateOrderReq 下单请求。
+//
+// OrderNo（字段 3）是**手工追加**的幂等键：本仓库内没有 .proto/.thrift 源
+// （IDL 在仓外维护），重新生成 kitex_gen 时必须把它同步加回去，否则下单
+// 幂等会静默退化（bff 传了号、订单域自己另起一个号 ⇒ 重试 = 重复下单）。
+// 为什么不走 metainfo：metainfo 依赖 TTHeader 传输，客户端一旦换传输协议
+// 就**无声失效**（注入方看不出来、提取方只当没传），而幂等键失效的表现是
+// 重复扣款。显式进 IDL 的字段是契约，不是运行时约定。
 type CreateOrderReq struct {
-	UserId int64        `protobuf:"varint,1,opt,name=user_id" json:"user_id,omitempty"`
-	Items  []*OrderItem `protobuf:"bytes,2,rep,name=items" json:"items,omitempty"`
+	UserId  int64        `protobuf:"varint,1,opt,name=user_id" json:"user_id,omitempty"`
+	Items   []*OrderItem `protobuf:"bytes,2,rep,name=items" json:"items,omitempty"`
+	OrderNo string       `protobuf:"bytes,3,opt,name=order_no" json:"order_no,omitempty"`
 }
 
 func (x *CreateOrderReq) Reset() { *x = CreateOrderReq{} }
@@ -72,6 +81,14 @@ func (x *CreateOrderReq) GetItems() []*OrderItem {
 		return x.Items
 	}
 	return nil
+}
+
+// GetOrderNo 取调用方给的幂等单号；空串表示调用方没带（订单域自行生成）。
+func (x *CreateOrderReq) GetOrderNo() string {
+	if x != nil {
+		return x.OrderNo
+	}
+	return ""
 }
 
 type CreateOrderResp struct {

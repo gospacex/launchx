@@ -123,7 +123,7 @@ func Setup(a *launchx.App) error {
 	// 限流器只在 KV 组件可用时启用（kv 为 nil 时 Allow 恒 true：fail-open）
 	var limiter *middleware.RateLimiter
 	if kv := a.KV()[name]; kv != nil {
-		limiter = middleware.NewRateLimiter(kv, "rate:"+name, rateLimitPerMinute, rateLimitWindow)
+		limiter = middleware.NewRateLimiter(kv, "rate:"+name, rateLimitPerMinute, rateLimitWindow, logger)
 	}
 
 	h := handler.NewProductHandler(svc, traceOn)

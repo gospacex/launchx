@@ -142,6 +142,13 @@ type ReportRow struct {
 type CreateOrderCmd struct {
 	UserID uint64
 	Items  []OrderItemCmd
+	// OrderNo 调用方（bff）给的幂等键，落 uk_order_no。
+	//
+	// 空串表示调用方没带 —— 订单域会自己生成一个，但那样**就没有幂等了**：
+	// 重试一次就是一个新号、一张新单。故 caller 必须带；这里不把它设成必填
+	// 是为了不让老调用方直接 400（降级为"无幂等保护的下单"，并在 service
+	// 侧记一笔，见 resolveOrderNo）。
+	OrderNo string
 }
 
 // OrderItemCmd 下单明细（与 pb 的 OrderItem 对齐，但不含 pb）

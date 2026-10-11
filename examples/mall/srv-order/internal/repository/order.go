@@ -53,6 +53,13 @@ type CreateOrderInput struct {
 type CreateOrderOutput struct {
 	OrderID uint64
 	OrderNo string
+	// Idempotent 命中同 order_no 的既有订单：本次是重放，没有产生新行。
+	//
+	// 调用方必须看这个字段而不是把「插入失败」当成失败：RPC 失败重试发的是
+	// 同一个 CreateOrderReq，带上的是同一个 order_no。没有它，重试会撞
+	// uk_order_no 报唯一键冲突 —— 上游看到的是一个 5xx，最自然的反应是再试
+	// 一次，于是永远失败。
+	Idempotent bool
 }
 
 // UpdateStatusInput 状态流转输入（orders + order_status_log 两表事务）
@@ -242,11 +249,28 @@ func (r *OrderRepository) GetOrder(ctx context.Context, q model.GetOrderQuery) (
 //
 // outbox 行与业务行同事务是本包的立身之本：不同事务就会出现"订单落了、
 // 事件没落"（下游永远不知道这单存在）或"事件落了、订单回滚"（幽灵事件）。
+//
+// 幂等：order_no 是调用方给的幂等键，表上有 uk_order_no。事务内**先按
+// order_no 查重**，命中即回既有订单（out.Idempotent=true），不再插任何一行 ——
+// 查重必须在事务内，否则并发重放会各自查到"没有"然后各插一次。只靠唯一键挡
+// 是不够的：那会把重放变成一次唯一键冲突错误，而不是一次成功。
 func (r *OrderRepository) CreateOrderTx(ctx context.Context, in CreateOrderInput) (out *CreateOrderOutput, err error) {
 	ctx, end := r.begin(ctx, "CreateOrderTx")
 	defer func() { end(err) }()
 	out = &CreateOrderOutput{OrderNo: in.OrderNo}
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// ① 幂等查重（重放路径：不插订单、不插明细、**也不插 outbox 事件** ——
+		// 事件插多了下游会重复消费，那比重复下单更难收敛）。
+		var exist model.Order
+		switch e := tx.Where("order_no = ?", in.OrderNo).Take(&exist).Error; {
+		case e == nil:
+			out.OrderID = exist.ID
+			out.Idempotent = true
+			return nil
+		case !errors.Is(e, gorm.ErrRecordNotFound):
+			return fmt.Errorf("probe order %s: %w", in.OrderNo, e)
+		}
+		// ② 首次落库
 		o := model.Order{
 			UserID:      in.UserID,
 			OrderNo:     in.OrderNo,
