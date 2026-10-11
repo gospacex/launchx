@@ -60,7 +60,7 @@ func (h *OrderHandler) CreateOrder(ctx context.Context, req *orderpb.CreateOrder
 	ctx, end := layer.Begin(ctx, "handler", "order", "CreateOrder", h.traceOn, nil)
 	defer func() { end(err) }()
 
-	in := service.CreateOrderInput{UserID: uint64(req.GetUserId())}
+	in := service.CreateOrderInput{UserID: uint64(req.GetUserId()), OrderNo: req.GetOrderNo()}
 	for _, it := range req.GetItems() {
 		in.Items = append(in.Items, service.CreateOrderItem{
 			ProductID:   uint64(it.GetProductId()),

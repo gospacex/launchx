@@ -31,10 +31,10 @@ type fakeRepo struct {
 }
 
 func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.OrderItem,
-	_ func(orderID uint64) (payload, traceparent string)) error {
+	_ func(orderID uint64) (payload, traceparent string)) (model.CreateOutput, error) {
 	o.ID = 777
 	f.created, f.createdIts = o, items
-	return nil
+	return model.CreateOutput{ID: o.ID, TotalAmount: o.TotalAmount}, nil
 }
 func (f *fakeRepo) FindByID(context.Context, uint64) (*model.Order, error) {
 	f.findCalls++

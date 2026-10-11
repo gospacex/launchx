@@ -10,6 +10,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
 	"github.com/gospacex/otelx/layer"
+	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
@@ -36,8 +39,9 @@ import (
 type orderRepo interface {
 	// Create 的第三参是 outbox 事件回调（事务内、订单 ID 已知后调用），
 	// nil 时 outbox 行 payload 为空、由 Runner 放弃该行。
+	// 返回 Idempotent=true 表示该 order_no 已存在、本次未插任何行。
 	Create(ctx context.Context, o *model.Order, items []model.OrderItem,
-		fill func(orderID uint64) (payload, traceparent string)) error
+		fill func(orderID uint64) (payload, traceparent string)) (model.CreateOutput, error)
 	FindByID(ctx context.Context, id uint64) (*model.Order, error)
 	ItemsByOrderID(ctx context.Context, id uint64) ([]model.OrderItem, error)
 	UpdateStatus(ctx context.Context, id uint64, from, to string) error
@@ -75,6 +79,12 @@ type CreateOrderItem struct {
 type CreateOrderInput struct {
 	UserID uint64
 	Items  []CreateOrderItem
+	// OrderNo 幂等键：由入口（bff）生成并贯穿调用链。
+	//
+	// 为空表示调用方没给（老客户端 / 直连 srv 的调用），此时由本层生成并打
+	// `order.idempotent_key_missing=true` —— 那种情况下重放**无法**被识别，
+	// 留痕是为了让它在 Jaeger 上能被查出来，而不是静默退化。
+	OrderNo string
 }
 
 // OrderView 查单出参。
@@ -97,6 +107,9 @@ type CreateOrderResult struct {
 	ID          uint64
 	OrderNo     string
 	TotalAmount int64
+	// Idempotent=true 表示这是一次**重放命中**：返回的是既有订单，本次没有
+	// 新建任何行。调用方（bff）据此可以把它渲成成功而不是错误。
+	Idempotent bool
 }
 
 // CreateOrder 下单：加锁 → 落库（订单 + 明细 + 流转日志 + outbox 事件，同一事务）。
@@ -126,7 +139,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (re
 
 	o := &model.Order{
 		UserID:      in.UserID,
-		OrderNo:     fmt.Sprintf("M%s%06d", time.Now().Format("20060102150405"), in.UserID%1000000),
+		OrderNo:     s.resolveOrderNo(ctx, in.OrderNo),
 		Status:      model.StatusCreated,
 		TotalAmount: total,
 	}
@@ -140,7 +153,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (re
 	// traceparent 在事务外取好：它只依赖 ctx 里的 span context，与库无关；
 	// fill 在事务内被回调时直接闭包引用。
 	tp := traceparent.Of(ctx, s.traceOn)
-	if err := s.repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
+	out, err := s.repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
 		payload, mErr := events.OrderCompleted{
 			OrderID: orderID, UserID: in.UserID, TotalAmount: total, OccurredAt: time.Now(),
 		}.Marshal()
@@ -150,10 +163,49 @@ func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (re
 			return "", tp
 		}
 		return string(payload), tp
-	}); err != nil {
+	})
+	if err != nil {
 		return CreateOrderResult{}, codes.Wrap(codes.OrderCreateFail, "create order", err)
 	}
+	if out.Idempotent {
+		// 重放命中：既有订单原样返回。这里**不**报错 —— 报错会让调用方重试，
+		// 而重试必然再次撞同一个幂等键，于是永远失败。
+		layer.Attrs(ctx, attribute.Bool("order.idempotent_hit", true))
+		return CreateOrderResult{ID: out.ID, OrderNo: o.OrderNo, TotalAmount: out.TotalAmount, Idempotent: true}, nil
+	}
 	return CreateOrderResult{ID: o.ID, OrderNo: o.OrderNo, TotalAmount: o.TotalAmount}, nil
+}
+
+// resolveOrderNo 决定这一单用哪个号：调用方给了就用，没给才生成。
+//
+// 「给了就用」是幂等的全部意义所在 —— 入口生成的号才能贯穿重试：同一个请求
+// 重放时号不变，订单域据此认出它是同一笔。订单域自己另起一个号，等于每次
+// 重放都是新单。
+//
+// 没给时**留痕**（属性 + Warn）：那种情况下重放无法被识别，问题不在这一层，
+// 但沉默会让排查的人假设幂等一直生效。
+func (s *OrderService) resolveOrderNo(ctx context.Context, given string) string {
+	if given != "" {
+		return given
+	}
+	layer.Attrs(ctx, attribute.Bool("order.idempotent_key_missing", true))
+	if s.logger != nil {
+		s.logger.Warn("mesh-order: create order without idempotency key; replay cannot be deduped",
+			logx.String("hint", "caller should pass OrderNo (generated at the entry, stable across retries)"))
+	}
+	return newOrderNo()
+}
+
+// newOrderNo 订单号（uk_order_no，≤40 字符）：M + yyyyMMddHHmmss + 8 位 hex 随机。
+//
+// 随机段不是装饰：此前这里是 `M%s%06d`（时间戳 + userID%1000000），**同一用户
+// 同一秒下两单必然撞号** —— 时间精度到秒、用户段只取后 6 位，两个维度都不够。
+// 撞号在有唯一键时表现为第二单 duplicate error（用户看到下单失败），没唯一键时
+// 表现为两单同号（后续按 order_no 查询 / 对账串单）。
+func newOrderNo() string {
+	buf := make([]byte, 4)
+	_, _ = rand.Read(buf)
+	return "M" + time.Now().Format("20060102150405") + strconv.FormatUint(uint64(binary.BigEndian.Uint32(buf)), 16)
 }
 
 // GetOrder 查单：先缓存，未命中回源并回填。

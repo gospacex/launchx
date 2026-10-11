@@ -49,7 +49,7 @@ func TestCreatePersistsFourTables(t *testing.T) {
 		{ProductID: 2, ProductName: "p2", Quantity: 1, UnitPrice: 100},
 	}
 	filledID := uint64(0)
-	if err := repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
+	if _, err := repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
 		filledID = orderID
 		return `{"order_id":` + "1" + `}`, "00-trace"
 	}); err != nil {
@@ -120,7 +120,7 @@ func TestCreateWithNoItemsStillLogs(t *testing.T) {
 	ctx := context.Background()
 
 	o := &model.Order{UserID: 1, OrderNo: "M-2", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil, nil); err != nil {
+	if _, err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	var n int64
@@ -151,7 +151,7 @@ func TestUpdateStatusHappyPath(t *testing.T) {
 	ctx := context.Background()
 
 	o := &model.Order{UserID: 1, OrderNo: "M-3", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil, nil); err != nil {
+	if _, err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := repo.UpdateStatus(ctx, o.ID, model.StatusCreated, model.StatusPaid); err != nil {
@@ -181,7 +181,7 @@ func TestUpdateStatusRaceRidesOnRowsAffected(t *testing.T) {
 	ctx := context.Background()
 
 	o := &model.Order{UserID: 1, OrderNo: "M-4", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil, nil); err != nil {
+	if _, err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	// 第一次成功：created → paid
@@ -225,7 +225,7 @@ func TestCreateFailsWhenOrdersTableMissing(t *testing.T) {
 	if err := db.Migrator().DropTable(&model.Order{}); err != nil {
 		t.Fatalf("drop orders: %v", err)
 	}
-	err := repo.Create(context.Background(),
+	_, err := repo.Create(context.Background(),
 		&model.Order{UserID: 1, OrderNo: "M-X", Status: model.StatusCreated},
 		[]model.OrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}}, nil)
 	if err == nil {
@@ -240,7 +240,7 @@ func TestCreateRollsBackWhenItemInsertFails(t *testing.T) {
 	if err := db.Migrator().DropTable(&model.OrderItem{}); err != nil {
 		t.Fatalf("drop order_items: %v", err)
 	}
-	err := repo.Create(context.Background(),
+	_, err := repo.Create(context.Background(),
 		&model.Order{UserID: 1, OrderNo: "M-RB", Status: model.StatusCreated},
 		[]model.OrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}}, nil)
 	if err == nil {
@@ -262,7 +262,7 @@ func TestCreateRollsBackWhenStatusLogInsertFails(t *testing.T) {
 	if err := db.Migrator().DropTable(&model.OrderStatusLog{}); err != nil {
 		t.Fatalf("drop order_status_log: %v", err)
 	}
-	err := repo.Create(context.Background(),
+	_, err := repo.Create(context.Background(),
 		&model.Order{UserID: 1, OrderNo: "M-SL", Status: model.StatusCreated}, nil, nil)
 	if err == nil {
 		t.Fatal("order_status_log 表缺失时 Create 应报错")
@@ -285,7 +285,7 @@ func TestCreateRollsBackWhenOutboxInsertFails(t *testing.T) {
 	if err := db.Migrator().DropTable(&outbox.Event{}); err != nil {
 		t.Fatalf("drop outbox: %v", err)
 	}
-	err := repo.Create(context.Background(),
+	_, err := repo.Create(context.Background(),
 		&model.Order{UserID: 1, OrderNo: "M-OB", Status: model.StatusCreated}, nil, nil)
 	if err == nil {
 		t.Fatal("outbox 表缺失时 Create 应报错（事件须与业务行同事务）")
@@ -327,7 +327,7 @@ func TestUpdateStatusRollsBackWhenLogInsertFails(t *testing.T) {
 	repo := New(db, false)
 	ctx := context.Background()
 	o := &model.Order{UserID: 1, OrderNo: "M-UB", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil, nil); err != nil {
+	if _, err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := db.Migrator().DropTable(&model.OrderStatusLog{}); err != nil {
@@ -366,7 +366,7 @@ func TestTraceOnDoesNotChangeBehavior(t *testing.T) {
 
 	// 命中路径
 	o := &model.Order{UserID: 1, OrderNo: "M-T", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil, nil); err != nil {
+	if _, err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if got, err := repo.FindByID(ctx, o.ID); err != nil || got.OrderNo != "M-T" {

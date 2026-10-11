@@ -43,7 +43,7 @@ type fakeRepo struct {
 }
 
 func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.OrderItem,
-	fill func(orderID uint64) (payload, traceparent string)) error {
+	fill func(orderID uint64) (payload, traceparent string)) (model.CreateOutput, error) {
 	f.createCall++
 	f.created, f.createdIts = o, items
 	if f.createErr == nil && o.ID == 0 {
@@ -52,7 +52,7 @@ func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.Order
 	if f.createErr == nil && fill != nil {
 		f.fillPayload, f.fillTP = fill(o.ID)
 	}
-	return f.createErr
+	return model.CreateOutput{}, f.createErr
 }
 
 func (f *fakeRepo) FindByID(context.Context, uint64) (*model.Order, error) {

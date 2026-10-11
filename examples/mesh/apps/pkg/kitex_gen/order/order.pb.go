@@ -52,6 +52,11 @@ func (x *OrderItem) GetUnitPrice() int64 {
 type CreateOrderReq struct {
 	UserId int64        `protobuf:"varint,1,opt,name=user_id" json:"user_id,omitempty"`
 	Items  []*OrderItem `protobuf:"bytes,2,rep,name=items" json:"items,omitempty"`
+	// OrderNo 幂等键：由入口（bff）生成并贯穿三域；订单域据此查重。
+	//
+	// ⚠️ 手工追加到 DO NOT EDIT 生成码：仓库内没有 .proto/.thrift 源（IDL 在仓外
+	// 维护）。重新生成必须同步加回本字段，否则重放会退化成重复下单。
+	OrderNo string `protobuf:"bytes,3,opt,name=order_no" json:"order_no,omitempty"`
 }
 
 func (x *CreateOrderReq) Reset() { *x = CreateOrderReq{} }
@@ -72,6 +77,14 @@ func (x *CreateOrderReq) GetItems() []*OrderItem {
 		return x.Items
 	}
 	return nil
+}
+
+// GetOrderNo 幂等键。缺省返回 ""（调用方未生成），此时由订单域自行生成并留痕。
+func (x *CreateOrderReq) GetOrderNo() string {
+	if x != nil {
+		return x.OrderNo
+	}
+	return ""
 }
 
 type CreateOrderResp struct {

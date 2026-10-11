@@ -64,13 +64,13 @@ type fakeRepo struct {
 }
 
 func (f *fakeRepo) Create(_ context.Context, o *model.Order, _ []model.OrderItem,
-	_ func(orderID uint64) (payload, traceparent string)) error {
+	_ func(orderID uint64) (payload, traceparent string)) (model.CreateOutput, error) {
 	if f.createErr != nil {
-		return f.createErr
+		return model.CreateOutput{}, f.createErr
 	}
 	o.ID = 777
 	f.created = o
-	return nil
+	return model.CreateOutput{ID: o.ID, TotalAmount: o.TotalAmount}, nil
 }
 func (f *fakeRepo) FindByID(_ context.Context, id uint64) (*model.Order, error) {
 	if f.created != nil {

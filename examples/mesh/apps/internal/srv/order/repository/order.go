@@ -37,12 +37,29 @@ func quietNotFound(err error) bool { return errors.Is(err, gorm.ErrRecordNotFoun
 // traceparent；传 nil 或返回空 payload 时该行由 Runner 直接放弃（不占重试配额）。
 // 投递目标 topic 由 Runner 的 producer 绑定（mqx 配置侧键位），这里只登记
 // 逻辑 topic 供对账。
+//
+// Idempotent=true 时**一行都没插**（含 outbox 事件）：重放不该让积分域再收一次
+// 「订单已完成」，否则幂等只做在了订单表上、副作用照旧重复。
 func (r *OrderRepository) Create(ctx context.Context, o *model.Order, items []model.OrderItem,
-	fill func(orderID uint64) (payload, traceparent string)) (err error) {
+	fill func(orderID uint64) (payload, traceparent string)) (out model.CreateOutput, err error) {
 	ctx, end := layer.Begin(ctx, "repository", "order", "Create", r.traceOn, quietNotFound)
 	defer func() { end(err) }()
 
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 幂等查重必须在**事务内**：放在事务外，两个并发重放会各自查到「没有」
+		// 然后双双插入 —— 唯一键只会把第二个变成 duplicate error，那不是幂等，
+		// 是「第二次请求失败」。
+		var exist model.Order
+		switch e := tx.Where("order_no = ?", o.OrderNo).First(&exist).Error; {
+		case e == nil:
+			out.ID = exist.ID
+			out.TotalAmount = exist.TotalAmount
+			out.Idempotent = true
+			return nil
+		case !errors.Is(e, gorm.ErrRecordNotFound):
+			return e // 真故障（连接/语法）不能当成「没查到」继续插入
+		}
+
 		if err := tx.Create(o).Error; err != nil {
 			return err
 		}
@@ -67,8 +84,14 @@ func (r *OrderRepository) Create(ctx context.Context, o *model.Order, items []mo
 		if fill != nil {
 			ev.Payload, ev.Traceparent = fill(o.ID)
 		}
-		return tx.Create(&ev).Error
+		if err := tx.Create(&ev).Error; err != nil {
+			return err
+		}
+		out.ID = o.ID
+		out.TotalAmount = o.TotalAmount
+		return nil
 	})
+	return out, err
 }
 
 // FindByID 读订单主表。gorm 的 ErrRecordNotFound 原样上抛，由 service 翻成

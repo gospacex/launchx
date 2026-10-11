@@ -19,8 +19,11 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
 	"github.com/cloudwego/hertz/pkg/app"
@@ -187,14 +190,35 @@ func (h *MallHandler) createOrder(ctx context.Context, c *app.RequestContext) {
 			Quantity: it.Quantity, UnitPrice: it.UnitPrice,
 		})
 	}
+	// 幂等键在**入口**生成：它必须在重试之间保持不变，而只有入口知道「这是一次
+	// 重试还是一笔新单」。放到订单域生成，等于每次重放都另起一个号 —— 幂等失效，
+	// 而链路与日志看起来全正常。
+	//
+	// 本示例下单是异步链（bff → srv-order → outbox → kafka → srv-points），bff 不
+	// 同步调库存/积分，故这个号当前只在订单域被消费；保留在入口生成，是为了让
+	// 「重试安全」这件事有一个唯一的决定点。
+	orderNo := newOrderNo()
 	resp, err := h.clients.Order.CreateOrder(withIdentity(ctx), &orderpb.CreateOrderReq{
-		UserId: in.UserID, Items: items,
+		UserId:  in.UserID,
+		Items:   items,
+		OrderNo: orderNo,
 	})
 	if err != nil {
 		writeErr(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// newOrderNo 幂等键：M + yyyyMMddHHmmss + 8 位 hex 随机。
+//
+// 与 srv-order 的 newOrderNo 同形（前缀都是 M）—— 两边生成的号是同一张 orders
+// 表的候选键，格式不一致会让「这个号是谁生成的」变成要查的事。
+// 随机段不是装饰：缺了它，同一秒的两笔单会撞号（时间精度只到秒）。
+func newOrderNo() string {
+	buf := make([]byte, 4)
+	_, _ = rand.Read(buf)
+	return "M" + time.Now().Format("20060102150405") + strconv.FormatUint(uint64(binary.BigEndian.Uint32(buf)), 16)
 }
 
 // getPoints GET /points/:user_id —— 积分只读路径。

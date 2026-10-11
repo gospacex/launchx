@@ -18,6 +18,22 @@ type Order struct {
 // TableName 固定表名，避免依赖 gorm 的复数化规则（规则变动会让表名漂移）。
 func (Order) TableName() string { return "orders" }
 
+// CreateOutput 下单事务的落库结果。
+//
+// 放在 model 而不是 repository：service 用窄接口面向 repository 编程（不 import
+// 它），而接口方法签名要求返回类型**完全相同**，故这个出参必须是两边都认的
+// 共享类型。它是跨层契约，不是某一层的私有结构。
+//
+// Idempotent=true 表示「这个 order_no 已存在，本次一行都没插（含 outbox 事件）」，
+// 调用方应把既有订单原样返回而不是报错：重放来自失败重试 / 上游重发 / 用户双击，
+// 把幂等命中的重放当错误处理，会让调用方再试一次 —— 而重试必然再次撞同一个键，
+// 于是永远失败。
+type CreateOutput struct {
+	ID          uint64
+	TotalAmount int64
+	Idempotent  bool
+}
+
 // OrderItem 订单明细。
 type OrderItem struct {
 	ID          uint64 `gorm:"primaryKey;column:id"`
