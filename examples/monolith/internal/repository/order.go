@@ -57,7 +57,11 @@ func quietNotFound(err error) bool {
 //
 // userID > 0 时按归属用户过滤（鉴权路径必须传，否则任何人都能翻别人的单）；
 // userID == 0 表示不按用户收敛，只允许 demo 的无鉴权列表路径使用，且那条路径
-// 已被 RegisterRoutes 限制为"只能绑回环地址"（见 app/routes.go）。
+// 已被 RegisterRoutes 的 loopbackOnly 裁决挡在回环之内（见 app/routes.go）：
+// 监听地址不是回环时，路由表里所有免鉴权路径一律拒登、装配直接失败。
+//
+// 注：这句话曾是一句**假承诺** —— 全仓 grep `loopbackOnly` 零命中，注释声称的
+// 闸门在代码里并不存在。现已补齐实现与判据（app/routes_test.go）。
 func (r *Repository) List(ctx context.Context, userID int64, limit int) (out []model.Order, err error) {
 	ctx, end := r.begin(ctx, "List")
 	defer func() { end(err) }()

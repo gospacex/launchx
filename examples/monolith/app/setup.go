@@ -207,7 +207,13 @@ func Setup(a *launchx.App) error {
 		engine.Engine.Use(rl.Handle)
 	}
 
-	RegisterRoutes(engine.Engine, handler.New(svc, traceOn), auth)
+	// 监听地址一律从配置读，不写字面量：它是 RegisterRoutes 里「对外监听不得
+	// 有免鉴权路径」那条裁决的输入，写死一个回环字面量会让约束形同虚设
+	// （判据见 routes_test.go 的静态用例）。
+	listenAddr := cfg.GetString("webx.addr")
+	if err := RegisterRoutes(engine.Engine, handler.New(svc, traceOn), auth, listenAddr); err != nil {
+		return err
+	}
 	return nil
 }
 

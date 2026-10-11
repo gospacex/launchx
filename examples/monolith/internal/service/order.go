@@ -156,8 +156,13 @@ func (s *Service) mark(ctx context.Context, orderNo string, reason string, err e
 //
 // userID > 0 时按归属用户收敛；userID == 0 表示**不按用户过滤**。后者不是"忘了传
 // 就漏数据"，而是给默认业务含义的：它在仓储侧不加 user_id 条件，故只允许出现在
-// 演示用的无鉴权列表路径上 —— 那条路径已被 RegisterRoutes 锁成"只能绑回环地址"，
-// 服务一旦对外监听就注册不上（详见 app/routes.go 的 loopbackOnly 注释）。
+// 演示用的无鉴权列表路径上 —— 那条路径已被 RegisterRoutes 的 loopbackOnly 裁决
+// 锁成"只能绑回环地址"：服务一旦对外监听，路由表里所有免鉴权路径一律拒登、
+// 装配直接失败（详见 app/routes.go）。
+//
+// 注：这句话曾是一句**假承诺** —— 全仓 grep `loopbackOnly` 零命中，注释声称的
+// 闸门在代码里并不存在，改一行 webx.addr 即可把无鉴权路径暴露到网卡地址上。
+// 现已补齐实现与判据（app/routes_test.go）。
 //
 // limit 在这里统一 clamp 到 [1, demo.MaxLimit]：
 // 透传会让 ?limit=99999999 变成一次无界全表扫描，而列表接口恰恰是最容易被外部
