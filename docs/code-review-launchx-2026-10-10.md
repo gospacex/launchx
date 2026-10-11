@@ -359,8 +359,9 @@
 | mall 异步消费端 | ❌ | 需 kafka 真机才能验收；已把注释改成「当前只有生产端」而不是假装存在消费方 |
 | `pipeline.Shutdown` 零调用 | ❌ | 与 `App.Close` 是两份退出链。建议二选一（删掉 / 让 `Close` 把七步包成 `[]Step` 交给它），属结构性改动，本轮不动 |
 | 缓存穿透回填空值哨兵 | ❌ | 8 处（micro/mall 各四域），需先统一各域 cache 封装再改，否则会抄出八份不同的哨兵 |
-| monolith 写接口鉴权的 `route.Entry.Insecure` 约束 | ❌ 待裁定 | 见第 9 章两个 [问题] |
-| `micro/srv/` 冻结目录 + monolith 旧 DDL | ❌ 待裁定 | 同上 |
+| monolith 写接口鉴权 | ✅ 已落成（方式与第 9 章建议不同，见 10.7） | 复核时先发现一件更糟的事：`repository/order.go` 与 `service/order.go` 的注释都写着「该路径已被 RegisterRoutes 限制为只能绑回环地址（见 app/routes.go 的 loopbackOnly）」，而全仓 grep `loopbackOnly` **零命中** —— 注释虚构了一条安全约束。现已补成真判据 |
+| `micro/srv/` 冻结目录 | ✅ 裁定：维持冻结 + 上判据 | 删了就失去「拆分前 vs 拆分后」的对照证据；统一到 `srv-*` 也没有净收益。冻结语义落成 `frozen_test.go` 两条判据（声明被删会红 / 进部署清单会红），不再是口头约定 |
+| monolith 旧 DDL 与真源漂移 | ✅ 裁定：撤下（误列） | 复核后不成立：`bring-up.sh` 只建 3 表是因为 monolith 的业务面就只有 orders / order_items / users（无 outbox、无 stock/points/product），而 `order_db.sh` 的 10 表是给 micro/mall 四域用的 —— 两者不是同一张库的两个版本。且 monolith 的 `orders` 已带 `uk_orders_order_no`，与幂等口径一致 |
 | **mall gateway 不重复挂鉴权** | ✅ 裁定：不改 | 报告 §1 第 3 项提到「mall bff/gateway 挂鉴权」，复核后**只在 bff 挂**：mall 的 `pkg/auth` 包注释已论证「转发时逐跳头只剔 Connection/Proxy-*，`Authorization` 会原样透到 bff，故网关侧不需要再验一次」。网关只转 `/api → srv-bff`（`config.yaml:32-37`），判决点唯一且在 bff；网关再挂一份等于两张凭据表、两处轮换 |
 
 ### 10.4 反向探针（判据不是空壳的证据）
@@ -378,6 +379,11 @@
 | pb 幂等键的序列化 | `OrderNo` 的 tag 改 `protobuf:"-"` | FAIL（`unknown tag type`，往返丢字段） |
 | bff 是否真传了幂等键 | 注释掉 `OrderNo: orderNo` 一行 | 首版判据**没红**（命中注释里的同名串）→ 收紧为逐行匹配后 FAIL |
 | 订单域用谁的单号 | `resolveOrderNo` 改无条件生成 | FAIL（调用方给的号被丢弃） |
+| monolith 回环判定 | `loopbackOnly` 改恒 `true` | FAIL（对外监听不再拦，两条用例一起红） |
+| monolith 监听地址来源 | `cfg.GetString("webx.addr")` 换成字面量 | FAIL（静态判据红 —— 写死回环字面量会让裁决形同虚设） |
+| monolith 鉴权路径前缀 | `TrimPrefix(..., "/secure")` 换成不摘前缀 | FAIL（注册出 `/secure/secure/orders`） |
+| `micro/srv` 冻结声明 | README 里「冻结」全替换成「停用」 | FAIL（声明被删/改写即红） |
+| `micro/srv` 不上线 | 往 `deploy/micro.yaml` 加一行 `image: ...micro/srv:v1` | FAIL（冻结样例进部署清单即红） |
 
 ### 10.5 判据连锁反应（修判据不是终点）
 
@@ -403,3 +409,19 @@
 判据共四组（两侧各一套）：pb 序列化往返（字段真的过线）、`resolveOrderNo` 的取舍与留痕、bff 静态判据（真的传了）、仓储 sqlite 重放用例（真的幂等）。全部经过反向探针。
 
 ⚠️ **静态判据首版是空壳**：用 `strings.Contains(片段, "OrderNo:")` 会命中**注释里**的同名串 —— 实测把字段整行注释掉后判据照样绿。已收紧为「逐行 + 去缩进后以 `OrderNo:` 开头」。与 `route_layer_test.go` 那条（函数名会命中自己的定义）是同一类陷阱：**源码级判据必须匹配"只有真接线才有的那一段"**。
+
+### 10.7 monolith 写接口鉴权：落成方式（与第 9 章建议不同）
+
+第 9 章建议「`route.Entry` 加 `Insecure` 字段 + 非本地地址拒绝注册」。复核后**没有照做**，改用「按监听地址裁决」，理由如下。
+
+**为什么不加 `Insecure` 字段**：`Secure` 已经表达了"是否走鉴权"，`Insecure` 是它的逻辑非 —— 两个反向字段必然能构造出矛盾态（`Secure:true` + `Insecure:true` 到底算哪个？）。真正的约束是"对外监听时不得存在免鉴权路径"，用 `!Secure` 判定即可；少一个字段少一类矛盾态。
+
+**实际落点**（`app/routes.go`）：
+
+1. `loopbackOnly(addr)` —— 判定监听地址是否只对本机可见。`127.0.0.0/8` 全段、`::1`、`localhost` 为真；`0.0.0.0`、网卡地址、**空 host / 缺端口 / 非法串**一律按非回环处理（收紧，与 `selfAddr` 拒空 host 同口径）。
+2. `RegisterRoutes` 增参 `listenAddr`，非回环时两条硬裁决：路由表里还有免鉴权路径 → 报错中止装配；`auth == nil`（缓存降级 / 令牌为空，连 `/secure` 都注册不上）→ 报错中止装配。
+3. 回环下**维持现状**（E1 / T13 的验收入口不变），只在真正对外监听时收紧 —— 否则"旁路边车挂了把主流程带走"，那是注释里明写要避免的姿态。
+
+**顺带修掉的既有 bug**：`e.Group("/secure", auth)` 自带前缀，而表里那条 Entry 的 Pattern 也写了 `/secure/orders`，注册出来的实际路径是 **`/secure/secure/orders`**（hertz 启动日志可见）—— 鉴权路径挂在了谁都访问不到的地址上，`/secure/orders` 一直是 404，而 T13 的判据只验「分组存在 / 无凭据 401」，从不真的请求它，所以一直绿。修法是注册时摘前缀（**不能改表里的 Pattern**：route 层按 `c.FullPath()` 查表，改了会让每笔鉴权请求都记成 `route.order.Unregistered`）。
+
+⇒ 若不修这个 bug，新加的回环约束就是在保护一条**不存在的路径**。
