@@ -355,7 +355,7 @@
 
 | 条目 | 状态 | 理由 / 需要作者决定的点 |
 |---|---|---|
-| **mesh apps 的同源下单幂等** | ❌ 未同步 | micro / mall 已打通，mesh apps 未动：它的 bff 侧**根本没有幂等键生成点**（下单不经同步的库存/积分调用，异步链走 outbox），补它等于新增能力而不是补接线。建议单列一个变更，与「bff 是否该生成号」一起设计 |
+| **mesh apps 的同源下单幂等** | ✅ 已补齐（见 10.8） | 原判断「没有幂等键生成点、补它等于新增能力」**不成立** —— 复核发现更糟的事实：订单号是 service 层现编的 `M%s%06d`（时间戳 + `userID%1000000`），**同一用户同一秒下两单必然撞号**。现已按 micro/mall 同形补齐：入口生成键 → pb 透传 → 订单域事务内查重（含 outbox 事件不重插） |
 | mall 异步消费端 | ❌ | 需 kafka 真机才能验收；已把注释改成「当前只有生产端」而不是假装存在消费方 |
 | `pipeline.Shutdown` 零调用 | ❌ | 与 `App.Close` 是两份退出链。建议二选一（删掉 / 让 `Close` 把七步包成 `[]Step` 交给它），属结构性改动，本轮不动 |
 | 缓存穿透回填空值哨兵 | ❌ | 8 处（micro/mall 各四域），需先统一各域 cache 封装再改，否则会抄出八份不同的哨兵 |
@@ -384,6 +384,11 @@
 | monolith 鉴权路径前缀 | `TrimPrefix(..., "/secure")` 换成不摘前缀 | FAIL（注册出 `/secure/secure/orders`） |
 | `micro/srv` 冻结声明 | README 里「冻结」全替换成「停用」 | FAIL（声明被删/改写即红） |
 | `micro/srv` 不上线 | 往 `deploy/micro.yaml` 加一行 `image: ...micro/srv:v1` | FAIL（冻结样例进部署清单即红） |
+| mesh 订单域查重 | 幂等分支改 `false &&` | FAIL（重放返回新 ID，orders 变 2 行） |
+| mesh 用谁的单号 | `resolveOrderNo` 改无条件生成 | FAIL（调用方给的号被丢弃） |
+| mesh pb 幂等键序列化 | `OrderNo` 的 tag 改 `protobuf:"-"` | FAIL（往返丢字段） |
+| mesh bff 是否真传了键 | 整行注释掉 `OrderNo: orderNo,` | FAIL（逐行判据红 —— 用 `strings.Contains` 会命中注释、假绿） |
+| mesh 单号是否带随机段 | 去掉随机段（只留时间戳） | FAIL（2000 次生成出现重复） |
 
 ### 10.5 判据连锁反应（修判据不是终点）
 
@@ -425,3 +430,26 @@
 **顺带修掉的既有 bug**：`e.Group("/secure", auth)` 自带前缀，而表里那条 Entry 的 Pattern 也写了 `/secure/orders`，注册出来的实际路径是 **`/secure/secure/orders`**（hertz 启动日志可见）—— 鉴权路径挂在了谁都访问不到的地址上，`/secure/orders` 一直是 404，而 T13 的判据只验「分组存在 / 无凭据 401」，从不真的请求它，所以一直绿。修法是注册时摘前缀（**不能改表里的 Pattern**：route 层按 `c.FullPath()` 查表，改了会让每笔鉴权请求都记成 `route.order.Unregistered`）。
 
 ⇒ 若不修这个 bug，新加的回环约束就是在保护一条**不存在的路径**。
+
+### 10.8 mesh apps 下单幂等：补完 + 顺带修掉必撞的单号
+
+原判断是「bff 侧没有幂等键生成点，补它等于新增能力而不是补接线，建议单列变更」。复核后**推翻**：真正的问题不在"缺生成点"，而在订单号本身。
+
+**必撞的单号**：`service.CreateOrder` 里是
+
+```go
+OrderNo: fmt.Sprintf("M%s%06d", time.Now().Format("20060102150405"), in.UserID%1000000)
+```
+
+时间精度只到秒、用户段只取后 6 位 —— **同一用户同一秒下两单，号完全相同**。撞号在有唯一键时表现为第二单 duplicate error（用户看到下单失败），没唯一键时表现为两单同号（后续按 `order_no` 查询 / 对账串单）。这比"幂等没打通"更具体，也更难自查：它只在并发下偶发。
+
+**补齐的四段**（与 micro / mall 同形）：
+
+1. `CreateOrderReq` 加 `OrderNo`（字段 3）+ `GetOrderNo()`；同样手工追加到生成码，注释写明"重新生成必须同步加回"。
+2. bff 在**入口**生成 `orderNo` 并传入 —— 入口才知道"这是一次重试还是一笔新单"。
+3. 订单域 `CreateOrderInput.OrderNo` → handler 透传 → `resolveOrderNo`（给了就用；没给才生成并打 `order.idempotent_key_missing=true` + Warn）。
+4. 仓储 `Create` **事务内**按 `order_no` 查重，命中即 `Idempotent=true`，**一行都不插（含 outbox 事件）** —— 只查订单表而漏掉 outbox，会出现"订单没重复、但积分域又收到一次『订单已完成』"，那才是最难查的重复。
+
+**出参类型放 `model` 而不是 `repository`**：service 用窄接口面向 repository 编程（不 import 它），而接口方法签名要求返回类型完全相同，故 `model.CreateOutput` 必须是两边都认的共享类型。
+
+**判据四组**（pb 往返 / `resolveOrderNo` 取舍 / 仓储 sqlite 重放 + 反向语义"不同号各落一单" / bff 静态判据逐行匹配），全部经反向探针验证真红后还原。
