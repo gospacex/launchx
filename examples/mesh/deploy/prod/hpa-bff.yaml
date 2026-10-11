@@ -1,0 +1,29 @@
+# =============================================================================
+# bff HPA（生产用，教学集群不 apply）
+# -----------------------------------------------------------------------------
+# 只给 bff 配：它是唯一入口面，流量弹性最大；无状态（凭据在 redis），
+# 扩缩容无副作用。四域 srv 要配 HPA 得先解决单副本 + kafka 消费组分区数
+# （3 分区）这个容量天花板，那是容量规划话题，不是 HPA 清单话题。
+#
+# 教学集群不跑的原因：minikube 默认不带 metrics-server，HPA 取不到
+# utilization 会一直报 <unknown> 并不工作 —— 放着不用比跑个坏的干净。
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: bff
+  namespace: launchx-mesh
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bff
+  minReplicas: 2 # 与 PDB 的 minAvailable: 1 联动：缩到 2 为止，不会缩出单点
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

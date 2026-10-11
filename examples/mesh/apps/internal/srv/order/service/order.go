@@ -1,7 +1,11 @@
 // Package service ★ 唯一允许出现业务判断的层。
 //
-// 句柄在这里汇合：cache（详情缓存）、lock（同用户下单互斥）、mq（事件投递）。
+// 句柄在这里汇合：cache（详情缓存）、lock（同用户下单互斥）。
 // 全部按「缺失即降级 + 留日志」处理；db 是硬前提（app.Setup 已用 VerifyOrError 挡过）。
+//
+// 事件投递不走本层：2026-10-10 起下单事件与业务行同事务落 outbox 表，
+// 由 app.Setup 装配的 outbox.Runner 后台补发（此前事务外直发 producer，
+// 「订单提交成功、事件丢失」只值一条 Warn —— 那是不能接受的一致性缺口）。
 package service
 
 import (
@@ -15,13 +19,13 @@ import (
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
-	"github.com/gospacex/mqx"
 	"github.com/gospacex/otelx/layer"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/events"
+	"github.com/gospacex/launchx/examples/pkg/traceparent"
 )
 
 // orderRepo 是 service 真正依赖的窄接口：只含它调用的四个方法。
@@ -30,7 +34,10 @@ import (
 // 不关心句柄从哪来；这也让业务判断能脱离真实库被直接驱动到（见 order_test.go）。
 // *repository.OrderRepository 天然满足它，装配层无需额外适配。
 type orderRepo interface {
-	Create(ctx context.Context, o *model.Order, items []model.OrderItem) error
+	// Create 的第三参是 outbox 事件回调（事务内、订单 ID 已知后调用），
+	// nil 时 outbox 行 payload 为空、由 Runner 放弃该行。
+	Create(ctx context.Context, o *model.Order, items []model.OrderItem,
+		fill func(orderID uint64) (payload, traceparent string)) error
 	FindByID(ctx context.Context, id uint64) (*model.Order, error)
 	ItemsByOrderID(ctx context.Context, id uint64) ([]model.OrderItem, error)
 	UpdateStatus(ctx context.Context, id uint64, from, to string) error
@@ -38,18 +45,18 @@ type orderRepo interface {
 
 // OrderService 订单业务。
 type OrderService struct {
-	repo     orderRepo
-	cache    cachex.Cache
-	lock     lockx.Locker
-	producer mqx.Producer
-	logger   logx.Logger
-	traceOn  bool // trace.enabled（总闸），由装配层注入
+	repo    orderRepo
+	cache   cachex.Cache
+	lock    lockx.Locker
+	logger  logx.Logger
+	traceOn bool // trace.enabled（总闸），由装配层注入
 }
 
-// New 注入全部句柄；cache / lock / producer 允许为 nil（各有降级路径）。
+// New 注入全部句柄；cache / lock 允许为 nil（各有降级路径）。
+// MQ 生产者不再是本层依赖：事件经 outbox 表由 Runner 投递（见包注释）。
 func New(repo orderRepo, cache cachex.Cache, lock lockx.Locker,
-	producer mqx.Producer, logger logx.Logger, traceOn bool) *OrderService {
-	return &OrderService{repo: repo, cache: cache, lock: lock, producer: producer,
+	logger logx.Logger, traceOn bool) *OrderService {
+	return &OrderService{repo: repo, cache: cache, lock: lock,
 		logger: logger, traceOn: traceOn}
 }
 
@@ -77,25 +84,41 @@ type OrderView struct {
 	Cached bool // 是否命中缓存，便于验收时判断缓存是否真的生效
 }
 
-// CreateOrder 下单：加锁 → 落库 → 投事件。
-func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (id uint64, err error) {
+// CreateOrderResult 下单结果：**创建时就已经持有**的那几个字段。
+//
+// 让 CreateOrder 直接把它们交出来，是为了消掉一次无谓的回读：此前 handler 在
+// 创建成功后又调 GetOrder(id) 去填响应，等于白多两次 SQL（FindByID +
+// ItemsByOrderID）加一次缓存回填，而它要的 order_no / total_amount 在创建那一刻
+// 就在手里（见 2026-10-10 code review §5.8）。顺带把「读路径」留给真正的读请求。
+//
+// 只有三个字段、没有 Items：创建响应用不到明细，把 Items 也带出来等于让 service
+// 去关心「响应长什么样」——那是 handler 的事。
+type CreateOrderResult struct {
+	ID          uint64
+	OrderNo     string
+	TotalAmount int64
+}
+
+// CreateOrder 下单：加锁 → 落库（订单 + 明细 + 流转日志 + outbox 事件，同一事务）。
+// 事件投递由 outbox.Runner 异步补发，不在请求路径上。
+func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (res CreateOrderResult, err error) {
 	ctx, end := layer.Begin(ctx, "service", "order", "CreateOrder", s.traceOn, nil)
 	defer func() { end(err) }()
 
 	if len(in.Items) == 0 {
-		return 0, codes.New(codes.InvalidArgument, "items must not be empty")
+		return CreateOrderResult{}, codes.New(codes.InvalidArgument, "items must not be empty")
 	}
 	var total int64
 	for _, it := range in.Items {
 		if it.Quantity <= 0 {
-			return 0, codes.New(codes.InvalidArgument, "quantity must be positive")
+			return CreateOrderResult{}, codes.New(codes.InvalidArgument, "quantity must be positive")
 		}
 		total += it.UnitPrice * int64(it.Quantity)
 	}
 
 	unlock, err := s.acquire(ctx, in.UserID)
 	if err != nil {
-		return 0, err
+		return CreateOrderResult{}, err
 	}
 	if unlock != nil {
 		defer unlock()
@@ -114,12 +137,23 @@ func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (id
 			Quantity: it.Quantity, UnitPrice: it.UnitPrice,
 		})
 	}
-	if err := s.repo.Create(ctx, o, items); err != nil {
-		return 0, codes.Wrap(codes.OrderCreateFail, "create order", err)
+	// traceparent 在事务外取好：它只依赖 ctx 里的 span context，与库无关；
+	// fill 在事务内被回调时直接闭包引用。
+	tp := traceparent.Of(ctx, s.traceOn)
+	if err := s.repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
+		payload, mErr := events.OrderCompleted{
+			OrderID: orderID, UserID: in.UserID, TotalAmount: total, OccurredAt: time.Now(),
+		}.Marshal()
+		if mErr != nil {
+			// 序列化失败不阻断下单主流程：空 payload 的行 Runner 直接放弃。
+			s.logger.Warn("mesh-order: marshal event failed", logx.Err(mErr))
+			return "", tp
+		}
+		return string(payload), tp
+	}); err != nil {
+		return CreateOrderResult{}, codes.Wrap(codes.OrderCreateFail, "create order", err)
 	}
-
-	s.publish(ctx, o)
-	return o.ID, nil
+	return CreateOrderResult{ID: o.ID, OrderNo: o.OrderNo, TotalAmount: o.TotalAmount}, nil
 }
 
 // GetOrder 查单：先缓存，未命中回源并回填。
@@ -152,6 +186,11 @@ func (s *OrderService) GetOrder(ctx context.Context, id uint64) (v *OrderView, e
 }
 
 // MarkPaid 改状态：库层条件更新 → 缓存失效。
+//
+// **单测驱动、非隐藏入口**（2026-10-10 code review §5.9）：本方法只被
+// service/order_test.go 直接调用，未在 rpc / handler 接线（IDL 里没有对应的
+// 支付回调）。保留它是为演示「条件更新 + 缓存失效」这一写路径形态，与
+// product.UpdatePrice / stock.Decrease 同类。
 func (s *OrderService) MarkPaid(ctx context.Context, id uint64) (err error) {
 	ctx, end := layer.Begin(ctx, "service", "order", "MarkPaid", s.traceOn, nil)
 	defer func() { end(err) }()
@@ -190,31 +229,6 @@ func (s *OrderService) acquire(ctx context.Context, userID uint64) (func(), erro
 			s.logger.Warn("mesh-order: unlock failed, ttl will expire it", logx.Err(rerr))
 		}
 	}, nil
-}
-
-// publish 投递订单完成事件。失败只告警：本例不带 outbox 表，
-// 投递失败由上层重试；真实系统这里必须落 outbox（见 apps/README「删不掉的四类」）。
-func (s *OrderService) publish(ctx context.Context, o *model.Order) {
-	if s.producer == nil {
-		s.logger.Warn("mesh-order: mq producer unavailable, event not published",
-			logx.String("order_no", o.OrderNo),
-			logx.String("consequence", "积分域收不到该订单"))
-		return
-	}
-	payload, err := events.OrderCompleted{
-		OrderID: o.ID, UserID: o.UserID, TotalAmount: o.TotalAmount, OccurredAt: time.Now(),
-	}.Marshal()
-	if err != nil {
-		s.logger.Warn("mesh-order: marshal event failed", logx.Err(err))
-		return
-	}
-	// mqx.Producer.Send 收的是 *mqx.Message（topic 是消息字段，不是位置参数）。
-	if err := s.producer.Send(ctx, &mqx.Message{
-		Topic: events.TopicOrderCompleted,
-		Value: payload,
-	}); err != nil {
-		s.logger.Warn("mesh-order: publish event failed", logx.Err(err))
-	}
 }
 
 func (s *OrderService) key(id uint64) string {

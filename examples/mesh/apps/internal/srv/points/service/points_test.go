@@ -13,23 +13,31 @@ import (
 )
 
 // fakeRepo 是 service 依赖的窄接口（pointsRepo）的手写假件。
+//
+// 只假一个写方法（CreditOnce）而不是两个：幂等与原子性收口在仓储的一个事务里，
+// service 只消费「入账了没有」这个答案 —— 假件跟着收窄，才不会出现「service
+// 单测全绿但仓储没开事务」这种判据与实现脱节的形态。
 type fakeRepo struct {
-	addErr    error
+	creditErr error
 	balErr    error
-	logErr    error
 	balResult *model.PointAccount
 
-	addCalls int
-	addUser  uint64
-	addDelta int64
-	logged   *model.PointsLog
+	creditCalls   int
+	creditUser    uint64
+	creditOrderID uint64
+	creditDelta   int64
+	// dup=true 表示「本笔此前已入账」（幂等命中）→ CreditOnce 回 applied=false。
+	dup      bool
 	balCalls int
 }
 
-func (f *fakeRepo) AddBalance(_ context.Context, userID uint64, delta int64) error {
-	f.addCalls++
-	f.addUser, f.addDelta = userID, delta
-	return f.addErr
+func (f *fakeRepo) CreditOnce(_ context.Context, userID, orderID uint64, delta int64) (bool, error) {
+	f.creditCalls++
+	f.creditUser, f.creditOrderID, f.creditDelta = userID, orderID, delta
+	if f.creditErr != nil {
+		return false, f.creditErr
+	}
+	return !f.dup, nil
 }
 
 func (f *fakeRepo) Balance(context.Context, uint64) (*model.PointAccount, error) {
@@ -40,19 +48,16 @@ func (f *fakeRepo) Balance(context.Context, uint64) (*model.PointAccount, error)
 	return f.balResult, nil
 }
 
-func (f *fakeRepo) AddLog(_ context.Context, l *model.PointsLog) error {
-	f.logged = l
-	return f.logErr
-}
-
 func newSvc(repo *fakeRepo, traceOn bool) *PointsService {
-	return New(repo, traceOn)
+	// logger 传 nil：service 对 logger 判空（幂等命中才用），传 nil 能顺带把
+	// 「忘记判空」这类 panic 在单测里暴露出来。
+	return New(repo, nil, traceOn)
 }
 
 // ---------- ConsumeOrderCompleted ----------
 
-// 主路径：加余额 + 记一条流水，且都以事件里的 user_id / order_id / 金额为准。
-func TestConsumeOrderCompletedAddsBalanceAndLog(t *testing.T) {
+// 主路径：以事件里的 user_id / order_id / 金额为准入账一次。
+func TestConsumeOrderCompletedCreditsOnce(t *testing.T) {
 	repo := &fakeRepo{}
 	svc := newSvc(repo, false)
 
@@ -62,14 +67,25 @@ func TestConsumeOrderCompletedAddsBalanceAndLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConsumeOrderCompleted: %v", err)
 	}
-	if repo.addCalls != 1 || repo.addUser != 9 || repo.addDelta != 100 {
-		t.Fatalf("AddBalance 参数错误: calls=%d user=%d delta=%d", repo.addCalls, repo.addUser, repo.addDelta)
+	if repo.creditCalls != 1 || repo.creditUser != 9 || repo.creditOrderID != 42 || repo.creditDelta != 100 {
+		t.Fatalf("CreditOnce 参数错误: calls=%d user=%d order=%d delta=%d",
+			repo.creditCalls, repo.creditUser, repo.creditOrderID, repo.creditDelta)
 	}
-	if repo.logged == nil {
-		t.Fatal("应落一条积分流水")
+}
+
+// 幂等命中（applied=false）不是错误：吞掉并按正常消费处理，否则驱动会无限重投
+// 一条已经入过账的消息。
+func TestConsumeOrderCompletedDuplicateIsNoop(t *testing.T) {
+	repo := &fakeRepo{dup: true}
+	svc := newSvc(repo, false)
+
+	if err := svc.ConsumeOrderCompleted(context.Background(), events.OrderCompleted{
+		OrderID: 42, UserID: 9, TotalAmount: 100,
+	}); err != nil {
+		t.Fatalf("幂等命中必须回 nil（否则驱动无限重投），实际 %v", err)
 	}
-	if repo.logged.OrderID != 42 || repo.logged.UserID != 9 || repo.logged.Delta != 100 {
-		t.Fatalf("流水 = %+v", repo.logged)
+	if repo.creditCalls != 1 {
+		t.Fatalf("仍应尝试入账一次（由仓储判重复），实际 calls=%d", repo.creditCalls)
 	}
 }
 
@@ -84,34 +100,35 @@ func TestConsumeOrderCompletedRejectsNonPositiveAmount(t *testing.T) {
 		if c, _ := codes.From(err); c != codes.InvalidArgument {
 			t.Fatalf("amount=%d 应回 InvalidArgument，实际 %v (err=%v)", amount, c, err)
 		}
-		if repo.addCalls != 0 || repo.logged != nil {
-			t.Fatalf("amount=%d 不得触碰存储: addCalls=%d", amount, repo.addCalls)
+		if repo.creditCalls != 0 {
+			t.Fatalf("amount=%d 不得触碰存储: calls=%d", amount, repo.creditCalls)
 		}
 	}
 }
 
-func TestConsumeOrderCompletedPropagatesAddBalanceError(t *testing.T) {
-	repo := &fakeRepo{addErr: errors.New("db down")}
+// order_id=0 没有幂等闸门可言：确定性拒绝，同样不触碰存储。
+func TestConsumeOrderCompletedRejectsZeroOrderID(t *testing.T) {
+	repo := &fakeRepo{}
 	svc := newSvc(repo, false)
 	err := svc.ConsumeOrderCompleted(context.Background(), events.OrderCompleted{
-		OrderID: 42, UserID: 9, TotalAmount: 100,
+		OrderID: 0, UserID: 9, TotalAmount: 100,
 	})
-	if c, _ := codes.From(err); c != codes.Internal {
-		t.Fatalf("加余额失败应回 Internal，实际 %v (err=%v)", c, err)
+	if c, _ := codes.From(err); c != codes.InvalidArgument {
+		t.Fatalf("order_id=0 应回 InvalidArgument，实际 %v (err=%v)", c, err)
 	}
-	if repo.logged != nil {
-		t.Fatal("加余额失败不得再写流水")
+	if repo.creditCalls != 0 {
+		t.Fatalf("order_id=0 不得触碰存储: calls=%d", repo.creditCalls)
 	}
 }
 
-func TestConsumeOrderCompletedPropagatesAddLogError(t *testing.T) {
-	repo := &fakeRepo{logErr: errors.New("db down")}
+func TestConsumeOrderCompletedPropagatesCreditError(t *testing.T) {
+	repo := &fakeRepo{creditErr: errors.New("db down")}
 	svc := newSvc(repo, false)
 	err := svc.ConsumeOrderCompleted(context.Background(), events.OrderCompleted{
 		OrderID: 42, UserID: 9, TotalAmount: 100,
 	})
 	if c, _ := codes.From(err); c != codes.Internal {
-		t.Fatalf("写流水失败应回 Internal，实际 %v (err=%v)", c, err)
+		t.Fatalf("入账失败应回 Internal，实际 %v (err=%v)", c, err)
 	}
 }
 
@@ -164,7 +181,7 @@ func TestConsumeOrderCompletedTraceFlagDoesNotChangeBehavior(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("traceOn=%v 行为异常: %v", traceOn, err)
 		}
-		if repo.addCalls != 1 || repo.logged == nil {
+		if repo.creditCalls != 1 {
 			t.Fatalf("traceOn=%v 业务未走通", traceOn)
 		}
 	}

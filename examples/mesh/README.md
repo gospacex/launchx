@@ -7,6 +7,20 @@
 | **对照组** | 无（复用 `examples/micro`） | `deploy/micro/` | `launchx-demo:dev` | C4/T8「换形态不改代码」—— 与 micro 共用同一份二进制，差异全在部署面 |
 | **原生组** | `apps/`（独立 module，**无 gateway 进程**） | `deploy/apps/` | `launchx-mesh-apps:dev` | 「为网格写的应用有多瘦」—— 入口转发整块交 Istio，减法清单见 `apps/README.md` §4 |
 
+> **⚠️ 对照组现状：已失效，暂不可用（2026-10-10 实测）**。上表「与 micro 共用同一份二进制、
+> 差异全在部署面」这条，**对 gateway/srv 成立、对 bff 不成立**：
+> - `deploy/micro/10-configmap.yaml` 的 `bff` 块比 `examples/micro/bff/config.yaml` **少 18 个叶子键**
+>   （缺整段 `auth`/`demo`、缺 `xmiddleware.cachex`、缺 `service.upstream.demo-{order,points,product,stock}`，
+>   并残留已废弃的 `service.upstream.demo-srv`）；`gateway`/`srv` 两块与源 0 漂移。
+> - 而 `bring-up.sh` 在 `VARIANT=micro` 下用**当前源码**重建二进制，当前 bff 在 `demo.auth_token`
+>   为空时**启动即失败**（`examples/micro/bff/app/setup.go:179`）⇒ `VARIANT=micro` 起不来。
+> - 拓扑也已落后：`deploy/micro/` 仍是**单 `srv`** 的 3 进程，微服现为 `bff` + 4×`srv-*` 五进程，
+>   两者**不再同构**。
+>
+> **可跑通并满足验收的是原生组（`VARIANT=apps`，默认）**。对照组的取舍与跟进建议见
+> `docs/code-review-2026-10-10.md` §9.10（要么升到五进程重新同构，要么整组连镜像一起冻结，
+> 现状「清单冻结 + 二进制不冻结」是唯一不可持续的组合）。
+
 **清单目录零 Go 代码** 仍是硬约束：`deploy/**` 下不许出现实现。Go 代码只允许在
 `apps/` 子树，由根包 `examples_layout_test.go` 的 `TestMeshGoCodeOnlyUnderApps`
 钉住（`TestMicroNotCoupledToMesh` 继续断言 `examples/micro` 不引用本目录）。
@@ -30,20 +44,30 @@ examples/mesh/
 │   │   ├── 00-namespace.yaml       # launchx-mesh + istio-injection=enabled
 │   │   ├── 10-consul.yaml          # consul 进集群（对照组仍需要）
 │   │   ├── 20-host-middleware.yaml # 宿主中间件门面（Service + 手工 Endpoints）
-│   │   └── 40-telemetry.yaml       # 采样率 100%（Istio 默认极低，T10 假阴性头号来源）
+│   │   ├── 40-telemetry.yaml       # 采样率 100%（Istio 默认极低，T10 假阴性头号来源）
+│   │   └── 50-peer-authn.yaml      # PeerAuthentication：mTLS STRICT
 │   ├── istio/
 │   │   └── operator.yaml           # istioctl install -f 的入参（**不是** kubectl 对象）
-│   ├── micro/                #   对照组清单（3 Deployment，含 gateway）
-│   └── apps/                 #   原生组清单（8 个文件）
-│                             #     10-configmap（五份配置的逐字镜像）
-│                             #     20/21/22/23-srv-{order,points,product,stock}（4 Deployment + Service）
-│                             #     30-bff（Deployment + Service + ServiceAccount bff）
-│                             #     40-gateway（Istio Gateway + VirtualService：入口转发）
-│                             #     50-authz（AuthorizationPolicy ×4：四域只受 bff 调用）
+│   ├── micro/                #   对照组清单（含 gateway 进程）
+│   │   └── 10-configmap / 20-srv / 30-bff / 40-gateway
+│   ├── apps/                 #   原生组清单（10 个文件）
+│   │                         #     05-secret（演示令牌）/ 10-configmap（五份配置的键值镜像）
+│   │                         #     20/21/22/23-srv-{order,points,product,stock}（4 Deployment + Service）
+│   │                         #     30-bff（Deployment + Service + ServiceAccount bff）
+│   │                         #     40-gateway（Istio Gateway + VirtualService：入口转发）
+│   │                         #     50-authz（AuthorizationPolicy ×4：四域只受 bff 调用）
+│   │                         #     60-pdb（PodDisruptionBudget）
+│   └── prod/                 #   生产加固底稿（**未 apply**）
+│                             #     prometheusrule.yaml + podmonitor.yaml（告警/看板）
+│                             #     hpa-bff.yaml + networkpolicy.yaml
 ├── scripts/bring-up.sh       # check / image / install / deploy / verify / status / down
 ├── scripts/route-matrix-{apps,micro}.txt  # 入口链条矩阵定义（判据与 PROBE_ROUTES 两处同源）
 └── docs/verify.md            # T10–T13 证据落盘（T13 在 §6）
 ```
+
+> 注：`10-configmap.yaml` 是五份 `apps/conf/*.yaml` 的**逐字镜像**（改 conf 后必须同步本文件；
+> 判据：把每个 `  <svc>.yaml: |` 块脱去 4 空格缩进后与 `apps/conf/<svc>.yaml` **逐行相等**）。
+> 本轮曾出现「键值一致但注释漂移」（4 份 srv 配置各少 2 行注释），已重新生成对齐。
 
 ## 2. 一条命令跑通
 

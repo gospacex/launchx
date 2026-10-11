@@ -1,5 +1,6 @@
-// repository 层单测（sqlite cgo 驱动）：验证 3 表事务原子性、ErrRecordNotFound
-// 原样上抛、以及 UpdateStatus 的 RowsAffected==0（状态机竞态）分支。
+// repository 层单测（sqlite cgo 驱动）：验证 4 表事务原子性（orders +
+// order_items + order_status_log + outbox）、ErrRecordNotFound 原样上抛、
+// 以及 UpdateStatus 的 RowsAffected==0（状态机竞态）分支。
 // 需要 CGO_ENABLED=1（mattn/go-sqlite3）。
 package repository
 
@@ -13,9 +14,10 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
 )
 
-// newTestDB 建 sqlite 内存库并迁移三张表。
+// newTestDB 建 sqlite 内存库并迁移四张表（含 outbox：事件与业务行同事务）。
 func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
@@ -24,14 +26,17 @@ func newTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}); err != nil {
+	if err := db.AutoMigrate(
+		&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}, &outbox.Event{},
+	); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
 	return db
 }
 
-// Create 必须在一个事务里落 orders + order_items + 首条 order_status_log。
-func TestCreatePersistsThreeTables(t *testing.T) {
+// Create 必须在一个事务里落 orders + order_items + 首条 order_status_log
+// + outbox 待发事件（四张表），且 fill 在订单 ID 已知后被回调。
+func TestCreatePersistsFourTables(t *testing.T) {
 	db := newTestDB(t)
 	repo := New(db, false)
 	ctx := context.Background()
@@ -43,11 +48,18 @@ func TestCreatePersistsThreeTables(t *testing.T) {
 		{ProductID: 1, ProductName: "p1", Quantity: 2, UnitPrice: 100},
 		{ProductID: 2, ProductName: "p2", Quantity: 1, UnitPrice: 100},
 	}
-	if err := repo.Create(ctx, o, items); err != nil {
+	filledID := uint64(0)
+	if err := repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
+		filledID = orderID
+		return `{"order_id":` + "1" + `}`, "00-trace"
+	}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if o.ID == 0 {
 		t.Fatal("Create 应回填自增 ID")
+	}
+	if filledID != o.ID {
+		t.Fatalf("fill 应在自增 ID 已知后回调：got %d, want %d", filledID, o.ID)
 	}
 
 	// 主表
@@ -81,6 +93,24 @@ func TestCreatePersistsThreeTables(t *testing.T) {
 	if len(logs) != 1 || logs[0].FromStatus != "" || logs[0].ToStatus != model.StatusCreated {
 		t.Fatalf("status logs = %+v", logs)
 	}
+
+	// outbox 待发事件：与业务行同事务落库（status=pending，payload/traceparent 由 fill 给出）。
+	var evs []outbox.Event
+	if err := db.Order("id ASC").Find(&evs).Error; err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("outbox 行数 = %d, want 1", len(evs))
+	}
+	if evs[0].Status != outbox.StatusPending {
+		t.Fatalf("outbox.status = %d, want pending(%d)", evs[0].Status, outbox.StatusPending)
+	}
+	if evs[0].Payload != `{"order_id":1}` || evs[0].Traceparent != "00-trace" {
+		t.Fatalf("outbox 事件体/traceparent 未被 fill 写入: %+v", evs[0])
+	}
+	if evs[0].Topic == "" || evs[0].EventType == "" {
+		t.Fatalf("outbox topic/event_type 不应为空: %+v", evs[0])
+	}
 }
 
 // 明细为空时只落主表 + 流转日志（不因 items 空而跳过日志）。
@@ -90,7 +120,7 @@ func TestCreateWithNoItemsStillLogs(t *testing.T) {
 	ctx := context.Background()
 
 	o := &model.Order{UserID: 1, OrderNo: "M-2", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil); err != nil {
+	if err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	var n int64
@@ -121,7 +151,7 @@ func TestUpdateStatusHappyPath(t *testing.T) {
 	ctx := context.Background()
 
 	o := &model.Order{UserID: 1, OrderNo: "M-3", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil); err != nil {
+	if err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := repo.UpdateStatus(ctx, o.ID, model.StatusCreated, model.StatusPaid); err != nil {
@@ -151,7 +181,7 @@ func TestUpdateStatusRaceRidesOnRowsAffected(t *testing.T) {
 	ctx := context.Background()
 
 	o := &model.Order{UserID: 1, OrderNo: "M-4", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil); err != nil {
+	if err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	// 第一次成功：created → paid
@@ -197,7 +227,7 @@ func TestCreateFailsWhenOrdersTableMissing(t *testing.T) {
 	}
 	err := repo.Create(context.Background(),
 		&model.Order{UserID: 1, OrderNo: "M-X", Status: model.StatusCreated},
-		[]model.OrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}})
+		[]model.OrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}}, nil)
 	if err == nil {
 		t.Fatal("orders 表缺失时 Create 应报错")
 	}
@@ -212,7 +242,7 @@ func TestCreateRollsBackWhenItemInsertFails(t *testing.T) {
 	}
 	err := repo.Create(context.Background(),
 		&model.Order{UserID: 1, OrderNo: "M-RB", Status: model.StatusCreated},
-		[]model.OrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}})
+		[]model.OrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}}, nil)
 	if err == nil {
 		t.Fatal("order_items 表缺失时 Create 应报错")
 	}
@@ -233,7 +263,7 @@ func TestCreateRollsBackWhenStatusLogInsertFails(t *testing.T) {
 		t.Fatalf("drop order_status_log: %v", err)
 	}
 	err := repo.Create(context.Background(),
-		&model.Order{UserID: 1, OrderNo: "M-SL", Status: model.StatusCreated}, nil)
+		&model.Order{UserID: 1, OrderNo: "M-SL", Status: model.StatusCreated}, nil, nil)
 	if err == nil {
 		t.Fatal("order_status_log 表缺失时 Create 应报错")
 	}
@@ -246,7 +276,28 @@ func TestCreateRollsBackWhenStatusLogInsertFails(t *testing.T) {
 	}
 }
 
-// ItemsByOrderID 的库错误分支（表缺失）→ 错误上抛。
+// outbox 表缺失 → 事件与业务行同事务的铁证：整事务回滚，orders 行不得残留。
+// 这条是「事件不再事务外直发」的判据 —— 若事件仍走事务外发送，缺 outbox 表
+// 也不会让 Create 报错。
+func TestCreateRollsBackWhenOutboxInsertFails(t *testing.T) {
+	db := newTestDB(t)
+	repo := New(db, false)
+	if err := db.Migrator().DropTable(&outbox.Event{}); err != nil {
+		t.Fatalf("drop outbox: %v", err)
+	}
+	err := repo.Create(context.Background(),
+		&model.Order{UserID: 1, OrderNo: "M-OB", Status: model.StatusCreated}, nil, nil)
+	if err == nil {
+		t.Fatal("outbox 表缺失时 Create 应报错（事件须与业务行同事务）")
+	}
+	var n int64
+	if err := db.Model(&model.Order{}).Where("order_no = ?", "M-OB").Count(&n).Error; err != nil {
+		t.Fatalf("count orders: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("事务应回滚，orders 残留 %d 行", n)
+	}
+}
 func TestItemsByOrderIDPropagatesDBError(t *testing.T) {
 	db := newTestDB(t)
 	repo := New(db, false)
@@ -276,7 +327,7 @@ func TestUpdateStatusRollsBackWhenLogInsertFails(t *testing.T) {
 	repo := New(db, false)
 	ctx := context.Background()
 	o := &model.Order{UserID: 1, OrderNo: "M-UB", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil); err != nil {
+	if err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := db.Migrator().DropTable(&model.OrderStatusLog{}); err != nil {
@@ -315,7 +366,7 @@ func TestTraceOnDoesNotChangeBehavior(t *testing.T) {
 
 	// 命中路径
 	o := &model.Order{UserID: 1, OrderNo: "M-T", Status: model.StatusCreated}
-	if err := repo.Create(ctx, o, nil); err != nil {
+	if err := repo.Create(ctx, o, nil, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if got, err := repo.FindByID(ctx, o.ID); err != nil || got.OrderNo != "M-T" {

@@ -10,7 +10,6 @@ import (
 
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
-	"github.com/gospacex/mqx"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
@@ -37,13 +36,21 @@ type fakeRepo struct {
 	updTo      string
 	updID      uint64
 	updCalls   int
+
+	// fill 产物（outbox 事件体与 traceparent），模拟真库「事务内 ID 已知后回调」。
+	fillPayload string
+	fillTP      string
 }
 
-func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.OrderItem) error {
+func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.OrderItem,
+	fill func(orderID uint64) (payload, traceparent string)) error {
 	f.createCall++
 	f.created, f.createdIts = o, items
 	if f.createErr == nil && o.ID == 0 {
 		o.ID = 777
+	}
+	if f.createErr == nil && fill != nil {
+		f.fillPayload, f.fillTP = fill(o.ID)
 	}
 	return f.createErr
 }
@@ -127,20 +134,6 @@ func (h *fakeHandle) Renew(context.Context) error      { return nil }
 func (h *fakeHandle) Key() string                      { return "k" }
 func (h *fakeHandle) Expired() bool                    { return false }
 
-// fakeProducer 实现 mqx.Producer，记录发出的 topic 与 payload。
-type fakeProducer struct {
-	mqx.Producer
-	sendErr error
-	topics  []string
-	values  [][]byte
-}
-
-func (p *fakeProducer) Send(_ context.Context, msg *mqx.Message) error {
-	p.topics = append(p.topics, msg.Topic)
-	p.values = append(p.values, msg.Value)
-	return p.sendErr
-}
-
 // fakeLogger 只覆写 Warn，用于断言「降级必留痕」。
 type fakeLogger struct {
 	logx.Logger
@@ -161,7 +154,7 @@ func warned(l *fakeLogger, substr string) bool {
 // ---------- CreateOrder ----------
 
 func TestCreateOrderRejectsEmptyItems(t *testing.T) {
-	svc := New(&fakeRepo{}, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(&fakeRepo{}, nil, nil, &fakeLogger{}, false)
 	_, err := svc.CreateOrder(context.Background(), CreateOrderInput{UserID: 1})
 	if c, _ := codes.From(err); c != codes.InvalidArgument {
 		t.Fatalf("空明细应回 InvalidArgument，实际 %v (err=%v)", c, err)
@@ -169,7 +162,7 @@ func TestCreateOrderRejectsEmptyItems(t *testing.T) {
 }
 
 func TestCreateOrderRejectsNonPositiveQuantity(t *testing.T) {
-	svc := New(&fakeRepo{}, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(&fakeRepo{}, nil, nil, &fakeLogger{}, false)
 	_, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 1,
 		Items:  []CreateOrderItem{{ProductID: 1, Quantity: 0}},
@@ -182,10 +175,9 @@ func TestCreateOrderRejectsNonPositiveQuantity(t *testing.T) {
 // 多明细：总额 = Σ quantity×unit_price，明细原样下传。
 func TestCreateOrderHappyPathMultiItems(t *testing.T) {
 	repo := &fakeRepo{}
-	prod := &fakeProducer{}
-	svc := New(repo, nil, nil, prod, &fakeLogger{}, false)
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
 
-	id, err := svc.CreateOrder(context.Background(), CreateOrderInput{
+	res, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 42,
 		Items: []CreateOrderItem{
 			{ProductID: 1, ProductName: "p1", Quantity: 2, UnitPrice: 100},
@@ -195,8 +187,13 @@ func TestCreateOrderHappyPathMultiItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
-	if id != 777 {
-		t.Fatalf("id = %d, want 777", id)
+	if res.ID != 777 {
+		t.Fatalf("id = %d, want 777", res.ID)
+	}
+	// 返回值必须是「创建时就持有的那三个字段」——handler 靠它拼响应，
+	// 少了 order_no / total_amount 就会退回到多读一次库的老路（§5.8）。
+	if res.OrderNo == "" || res.TotalAmount != 2*100+3*50 {
+		t.Fatalf("CreateOrderResult = %+v, want order_no 非空且 total=350", res)
 	}
 	if repo.created.TotalAmount != 2*100+3*50 {
 		t.Fatalf("total = %d, want 350", repo.created.TotalAmount)
@@ -210,16 +207,32 @@ func TestCreateOrderHappyPathMultiItems(t *testing.T) {
 	if repo.created.OrderNo == "" {
 		t.Fatal("order_no 应已生成")
 	}
-	// 事件已投递到约定的 topic
-	if len(prod.topics) != 1 || prod.topics[0] != events.TopicOrderCompleted {
-		t.Fatalf("topics = %v, want [%s]", prod.topics, events.TopicOrderCompleted)
-	}
+	// outbox 事件体已由 fill 在事务内产出（投递归 outbox.Runner，不在本层；
+	// 本层要钉住的是事件内容本身）。
 	var ev events.OrderCompleted
-	if err := json.Unmarshal(prod.values[0], &ev); err != nil {
-		t.Fatalf("event payload 非法: %v", err)
+	if err := json.Unmarshal([]byte(repo.fillPayload), &ev); err != nil {
+		t.Fatalf("event payload 非法: %v (raw=%q)", err, repo.fillPayload)
 	}
 	if ev.OrderID != 777 || ev.UserID != 42 || ev.TotalAmount != 350 {
 		t.Fatalf("event = %+v", ev)
+	}
+}
+
+// trace 关闭时 fill 给出的 traceparent 必须为空：落库的 tp 指向一条
+// 根本没被采样的链是脏数据；但事件体本身不受 trace 开关影响。
+func TestCreateOrderFillTraceparentEmptyWhenTraceOff(t *testing.T) {
+	repo := &fakeRepo{}
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
+	if _, err := svc.CreateOrder(context.Background(), CreateOrderInput{
+		UserID: 1, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
+	}); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if repo.fillTP != "" {
+		t.Fatalf("trace 关闭时 traceparent 应为空，实际 %q", repo.fillTP)
+	}
+	if repo.fillPayload == "" {
+		t.Fatal("trace 开关不该影响事件体本身")
 	}
 }
 
@@ -227,7 +240,7 @@ func TestCreateOrderHappyPathMultiItems(t *testing.T) {
 func TestCreateOrderFailOpenWhenLockMissing(t *testing.T) {
 	lg := &fakeLogger{}
 	repo := &fakeRepo{}
-	svc := New(repo, nil, nil, nil, lg, false)
+	svc := New(repo, nil, nil, lg, false)
 	if _, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 7, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
 	}); err != nil {
@@ -244,7 +257,7 @@ func TestCreateOrderFailOpenWhenLockMissing(t *testing.T) {
 // 锁可用：按 user 维度加锁并释放。
 func TestCreateOrderUsesLock(t *testing.T) {
 	lk := &fakeLock{}
-	svc := New(&fakeRepo{}, nil, lk, nil, &fakeLogger{}, false)
+	svc := New(&fakeRepo{}, nil, lk, &fakeLogger{}, false)
 	if _, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 99, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
 	}); err != nil {
@@ -262,7 +275,7 @@ func TestCreateOrderUsesLock(t *testing.T) {
 func TestCreateOrderWarnsWhenUnlockFails(t *testing.T) {
 	lg := &fakeLogger{}
 	lk := &fakeLock{unlockErr: errors.New("lock backend down")}
-	svc := New(&fakeRepo{}, nil, lk, nil, lg, false)
+	svc := New(&fakeRepo{}, nil, lk, lg, false)
 	if _, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 5, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
 	}); err != nil {
@@ -276,7 +289,7 @@ func TestCreateOrderWarnsWhenUnlockFails(t *testing.T) {
 func TestCreateOrderPropagatesLockError(t *testing.T) {
 	lk := &fakeLock{lockErr: errors.New("lock backend down")}
 	repo := &fakeRepo{}
-	svc := New(repo, nil, lk, nil, &fakeLogger{}, false)
+	svc := New(repo, nil, lk, &fakeLogger{}, false)
 	_, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 1, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
 	})
@@ -290,40 +303,12 @@ func TestCreateOrderPropagatesLockError(t *testing.T) {
 
 func TestCreateOrderPropagatesRepoError(t *testing.T) {
 	repo := &fakeRepo{createErr: errors.New("db down")}
-	svc := New(repo, nil, nil, &fakeProducer{}, &fakeLogger{}, false)
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
 	_, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 		UserID: 1, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
 	})
 	if c, _ := codes.From(err); c != codes.OrderCreateFail {
 		t.Fatalf("落库失败应回 OrderCreateFail，实际 %v (err=%v)", c, err)
-	}
-}
-
-// producer 为 nil：只告警不报错，下单仍成功。
-func TestCreateOrderPublishDegradesWhenProducerNil(t *testing.T) {
-	lg := &fakeLogger{}
-	svc := New(&fakeRepo{}, nil, nil, nil, lg, false)
-	if _, err := svc.CreateOrder(context.Background(), CreateOrderInput{
-		UserID: 1, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
-	}); err != nil {
-		t.Fatalf("producer 缺失不应失败: %v", err)
-	}
-	if !warned(lg, "producer unavailable") {
-		t.Fatalf("producer 缺失必须留 Warn，实际 %v", lg.warns)
-	}
-}
-
-// producer 发送失败：只告警，不把下单打成失败。
-func TestCreateOrderPublishFailureOnlyWarns(t *testing.T) {
-	lg := &fakeLogger{}
-	svc := New(&fakeRepo{}, nil, nil, &fakeProducer{sendErr: errors.New("broker down")}, lg, false)
-	if _, err := svc.CreateOrder(context.Background(), CreateOrderInput{
-		UserID: 1, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
-	}); err != nil {
-		t.Fatalf("发送失败不应让下单失败: %v", err)
-	}
-	if !warned(lg, "publish event failed") {
-		t.Fatalf("发送失败必须留 Warn，实际 %v", lg.warns)
 	}
 }
 
@@ -337,7 +322,7 @@ func TestGetOrderCacheHitSkipsRepoButLoadsItems(t *testing.T) {
 		itemsResult: []model.OrderItem{{OrderID: 5, ProductID: 1, Quantity: 1}},
 	}
 	ca := &fakeCache{val: string(raw)}
-	svc := New(repo, ca, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, ca, nil, &fakeLogger{}, false)
 
 	v, err := svc.GetOrder(context.Background(), 5)
 	if err != nil {
@@ -360,7 +345,7 @@ func TestGetOrderCacheHitSkipsRepoButLoadsItems(t *testing.T) {
 func TestGetOrderCacheMissLoadsAndFills(t *testing.T) {
 	repo := &fakeRepo{findResult: &model.Order{ID: 6, UserID: 1, OrderNo: "M-6"}}
 	ca := &fakeCache{} // Get 返回 "" → miss
-	svc := New(repo, ca, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, ca, nil, &fakeLogger{}, false)
 
 	v, err := svc.GetOrder(context.Background(), 6)
 	if err != nil {
@@ -381,7 +366,7 @@ func TestGetOrderCacheMissLoadsAndFills(t *testing.T) {
 func TestGetOrderCorruptCacheFallsBack(t *testing.T) {
 	repo := &fakeRepo{findResult: &model.Order{ID: 7, OrderNo: "M-7"}}
 	ca := &fakeCache{val: `{"order_no":"broken"}`} // 缺 ID
-	svc := New(repo, ca, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, ca, nil, &fakeLogger{}, false)
 
 	v, err := svc.GetOrder(context.Background(), 7)
 	if err != nil {
@@ -398,7 +383,7 @@ func TestGetOrderCorruptCacheFallsBack(t *testing.T) {
 // 查不到 → OrderNotFound（而非 Internal）。
 func TestGetOrderNotFound(t *testing.T) {
 	repo := &fakeRepo{findErr: gorm.ErrRecordNotFound}
-	svc := New(repo, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
 	_, err := svc.GetOrder(context.Background(), 404)
 	if c, _ := codes.From(err); c != codes.OrderNotFound {
 		t.Fatalf("ErrRecordNotFound 应回 OrderNotFound，实际 %v (err=%v)", c, err)
@@ -408,7 +393,7 @@ func TestGetOrderNotFound(t *testing.T) {
 // 库/网络类错误 → Internal（与「查不到」区分开）。
 func TestGetOrderRepoErrorIsInternal(t *testing.T) {
 	repo := &fakeRepo{findErr: errors.New("connection reset")}
-	svc := New(repo, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
 	_, err := svc.GetOrder(context.Background(), 1)
 	if c, _ := codes.From(err); c != codes.Internal {
 		t.Fatalf("库错误应回 Internal，实际 %v (err=%v)", c, err)
@@ -421,7 +406,7 @@ func TestGetOrderItemsErrorIsInternal(t *testing.T) {
 		findResult: &model.Order{ID: 8, OrderNo: "M-8"},
 		itemsErr:   errors.New("items query failed"),
 	}
-	svc := New(repo, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
 	_, err := svc.GetOrder(context.Background(), 8)
 	if c, _ := codes.From(err); c != codes.Internal {
 		t.Fatalf("明细读取失败应回 Internal，实际 %v (err=%v)", c, err)
@@ -433,7 +418,7 @@ func TestGetOrderFillFailureOnlyWarns(t *testing.T) {
 	lg := &fakeLogger{}
 	repo := &fakeRepo{findResult: &model.Order{ID: 9, OrderNo: "M-9"}}
 	ca := &fakeCache{setErr: errors.New("cache down")}
-	svc := New(repo, ca, nil, nil, lg, false)
+	svc := New(repo, ca, nil, lg, false)
 	if _, err := svc.GetOrder(context.Background(), 9); err != nil {
 		t.Fatalf("回填失败不应影响请求: %v", err)
 	}
@@ -448,7 +433,7 @@ func TestGetOrderFillFailureOnlyWarns(t *testing.T) {
 func TestMarkPaidInvalidatesAfterDBWrite(t *testing.T) {
 	repo := &fakeRepo{}
 	ca := &fakeCache{}
-	svc := New(repo, ca, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, ca, nil, &fakeLogger{}, false)
 
 	if err := svc.MarkPaid(context.Background(), 11); err != nil {
 		t.Fatalf("MarkPaid: %v", err)
@@ -465,7 +450,7 @@ func TestMarkPaidInvalidatesAfterDBWrite(t *testing.T) {
 func TestMarkPaidDoesNotInvalidateWhenDBFails(t *testing.T) {
 	repo := &fakeRepo{updErr: errors.New("status changed by another request")}
 	ca := &fakeCache{}
-	svc := New(repo, ca, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, ca, nil, &fakeLogger{}, false)
 
 	err := svc.MarkPaid(context.Background(), 12)
 	if c, _ := codes.From(err); c != codes.OrderCreateFail {
@@ -480,7 +465,7 @@ func TestMarkPaidDoesNotInvalidateWhenDBFails(t *testing.T) {
 func TestMarkPaidDeleteFailureOnlyWarns(t *testing.T) {
 	lg := &fakeLogger{}
 	ca := &fakeCache{delErr: errors.New("cache down")}
-	svc := New(&fakeRepo{}, ca, nil, nil, lg, false)
+	svc := New(&fakeRepo{}, ca, nil, lg, false)
 	if err := svc.MarkPaid(context.Background(), 13); err != nil {
 		t.Fatalf("删缓存失败不应报错: %v", err)
 	}
@@ -491,7 +476,7 @@ func TestMarkPaidDeleteFailureOnlyWarns(t *testing.T) {
 
 // cache 为 nil：MarkPaid 仍成功（无缓存可失效）。
 func TestMarkPaidNilCacheOK(t *testing.T) {
-	svc := New(&fakeRepo{}, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(&fakeRepo{}, nil, nil, &fakeLogger{}, false)
 	if err := svc.MarkPaid(context.Background(), 14); err != nil {
 		t.Fatalf("无缓存时 MarkPaid 应成功: %v", err)
 	}
@@ -500,7 +485,7 @@ func TestMarkPaidNilCacheOK(t *testing.T) {
 // GetOrder 无缓存：直接回源，且不 panic。
 func TestGetOrderNilCache(t *testing.T) {
 	repo := &fakeRepo{findResult: &model.Order{ID: 15, OrderNo: "M-15"}}
-	svc := New(repo, nil, nil, nil, &fakeLogger{}, false)
+	svc := New(repo, nil, nil, &fakeLogger{}, false)
 	v, err := svc.GetOrder(context.Background(), 15)
 	if err != nil {
 		t.Fatalf("GetOrder: %v", err)
@@ -516,12 +501,12 @@ func TestGetOrderNilCache(t *testing.T) {
 func TestCreateOrderTraceFlagDoesNotChangeBehavior(t *testing.T) {
 	for _, traceOn := range []bool{true, false} {
 		repo := &fakeRepo{}
-		svc := New(repo, nil, nil, nil, &fakeLogger{}, traceOn)
-		id, err := svc.CreateOrder(context.Background(), CreateOrderInput{
+		svc := New(repo, nil, nil, &fakeLogger{}, traceOn)
+		res, err := svc.CreateOrder(context.Background(), CreateOrderInput{
 			UserID: 1, Items: []CreateOrderItem{{ProductID: 1, Quantity: 1, UnitPrice: 1}},
 		})
-		if err != nil || id != 777 {
-			t.Fatalf("traceOn=%v 行为异常：id=%d err=%v", traceOn, id, err)
+		if err != nil || res.ID != 777 {
+			t.Fatalf("traceOn=%v 行为异常：id=%d err=%v", traceOn, res.ID, err)
 		}
 		if repo.created == nil || repo.created.TotalAmount != 1 {
 			t.Fatalf("traceOn=%v 业务未走通：%+v", traceOn, repo.created)
@@ -532,7 +517,7 @@ func TestCreateOrderTraceFlagDoesNotChangeBehavior(t *testing.T) {
 // 错误路径同样不受开关影响：miss → OrderNotFound 在两种取值下一致。
 func TestGetOrderTraceFlagDoesNotChangeBehavior(t *testing.T) {
 	for _, traceOn := range []bool{true, false} {
-		svc := New(&fakeRepo{findErr: gorm.ErrRecordNotFound}, nil, nil, nil, &fakeLogger{}, traceOn)
+		svc := New(&fakeRepo{findErr: gorm.ErrRecordNotFound}, nil, nil, &fakeLogger{}, traceOn)
 		_, err := svc.GetOrder(context.Background(), 404)
 		if c, _ := codes.From(err); c != codes.OrderNotFound {
 			t.Fatalf("traceOn=%v 应回 OrderNotFound，实际 %v (err=%v)", traceOn, c, err)

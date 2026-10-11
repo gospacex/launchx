@@ -87,6 +87,11 @@ func (h *MallHandler) ping(ctx context.Context, c *app.RequestContext) {
 // 不存在 srv-order → srv-product/stock 这一跳：apps 的跨域编排全在 bff
 // （见 mesh-entry-chain 的同名 Requirement），故这一条路由的 trace 里
 // 只应出现 order 一个域的 service span。
+//
+// 归属校验（IDOR 防护）在**订单域**做，不在这里：bff 只知道「谁在调」，
+// 不知道「这单是谁的」—— 要判归属必然要先读到订单行，那个数据在 srv-order。
+// 故本方法只负责把主体经 metainfo 透传下去（withIdentity），越权由 srv-order
+// 的 rpc 层比对订单归属后回 403（见 internal/srv/order/rpc/order.go）。
 func (h *MallHandler) getOrder(ctx context.Context, c *app.RequestContext) {
 	ctx, end := layer.Begin(ctx, "handler", "bff", "GetOrder", h.traceOn, nil)
 	var err error
@@ -126,7 +131,9 @@ type placeOrderItem struct {
 // 「异步链」那一行的触发点）：本方法只把请求交给订单域，事件投递发生在
 // srv-order 的 service 层；积分入账由 srv-points 的消费循环完成，不经 HTTP。
 //
-// 本示例不带 outbox：投递失败只告警（见 apps/README「删不掉的四类」）。
+// 事件投递走**事务发件箱**（2026-10-10 起）：订单行与 outbox 行在 srv-order 的
+// 同一事务内落库，之后由 outbox.Runner 补发到 kafka —— 故本方法既不碰 MQ，也不会
+// 「落库成功但事件丢失」。此前注释「本示例不带 outbox：投递失败只告警」已作废。
 func (h *MallHandler) createOrder(ctx context.Context, c *app.RequestContext) {
 	ctx, end := layer.Begin(ctx, "handler", "bff", "CreateOrder", h.traceOn, nil)
 	var err error
@@ -141,16 +148,34 @@ func (h *MallHandler) createOrder(ctx context.Context, c *app.RequestContext) {
 		writeErr(c, err)
 		return
 	}
-	// 归属用户**优先取边界解析出的身份**：请求体里的 user_id 是调用方自己声明的，
-	// 信它就等于把「我是谁」交给客户端决定。身份取不到时（本机无 Authorization
-	// 的排障路径）才回落到请求体 —— 这一档与 mesh-app-handles 的 fail-open 口径
-	// 一致：apps 把传输层身份下沉给 Istio，应用侧对匿名请求不拒绝。
+	// 归属用户**只取边界解析出的身份**：请求体里的 user_id 是调用方自己声明的，
+	// 信它就等于把「我是谁」交给客户端决定。
+	//
+	// 2026-10-10 企业级加固前后这里的行为不同，别照旧注释读：加固前 identity 是
+	// fail-open 反查，匿名时**回落信任 body 的 user_id**（任何人可替任意用户下单）；
+	// 现在 identity 层是**强制闸门**（解析不出主体即 401，见 pkg/routing 与
+	// app/setup.go 的 identitySkipPaths），走到这里的主体必然非零。故「取不到身份
+	// 就回落」这条路径已删除 —— 留下它就是留一个未鉴权的旁路。
+	//
 	// 这是**边界授权**判断，不是业务判断（业务判断只允许出现在 srv 的 service 层）。
-	if id := routing.IdentityFrom(ctx); id.UserID != 0 {
-		in.UserID = int64(id.UserID)
+	id := routing.IdentityFrom(ctx)
+	if id.UserID == 0 {
+		// 理论不可达（闸门已拦）；但宁可在本地再判一次，也不让「中间件没挂上」
+		// 这类装配错误变成「匿名可下单」——那种失效不报错、只失守。
+		err = codes.New(codes.Unauthorized, "no authenticated subject on request")
+		writeErr(c, err)
+		return
 	}
-	if in.UserID == 0 || len(in.Items) == 0 {
-		err = codes.New(codes.InvalidArgument, "user_id and items are required")
+	// body 带了 user_id 且与主体不符 ⇒ 显式 403。静默改写会让调用方以为
+	// 「代别人下单成功了」；静默忽略则让越权尝试无痕。两种静默都不可取。
+	if in.UserID != 0 && in.UserID != int64(id.UserID) {
+		err = codes.New(codes.Forbidden, "body user_id does not match the authenticated subject")
+		writeErr(c, err)
+		return
+	}
+	in.UserID = int64(id.UserID)
+	if len(in.Items) == 0 {
+		err = codes.New(codes.InvalidArgument, "items are required")
 		writeErr(c, err)
 		return
 	}
@@ -291,6 +316,8 @@ func statusOf(code codes.Code) int {
 		return http.StatusBadRequest // 400：参数不合法
 	case codes.Unauthorized:
 		return http.StatusUnauthorized // 401：身份非法（metainfo 解析不出来）
+	case codes.Forbidden:
+		return http.StatusForbidden // 403：身份合法但无权访问该资源（IDOR 防护）
 	case codes.OrderNotFound, codes.ProductNotFound:
 		return http.StatusNotFound // 404：目标不存在
 	case codes.StockNotEnough, codes.PointsNotEnough:

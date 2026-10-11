@@ -27,14 +27,13 @@ const (
 
 // NewTokenResolver 产出「从 `Authorization: Bearer <token>` 反查主体」的解析器。
 //
-// **反查是 best-effort，失败一律匿名（fail-open），不拒绝请求。** 这不是偷懒：
-// apps 把传输层鉴权下沉给 Istio（RequestAuthentication + AuthorizationPolicy，
-// mTLS 身份），应用侧再拦一道只会得到两个真相。反查的用途是**给下游限流分桶**
-// —— 反查到了就按 `u<id>` 计数，没反查到就按 `svc` 计数；bff 自己那一跳的限流
-// 由 webx 按 client IP 做，与主体无关。
+// **本函数只负责取证，不负责裁决。** 查不到就是零值身份；「零值要不要拒」由
+// `WithRequiredIdentity` 在 identityLayer 里决定（见 routing.go 包注释）。
+// 拆开是因为这两件事的失败姿态相反：取证要**宽容**（一次缓存抖动不该变成 401），
+// 裁决要**严格**（匿名不能下单）。
 //
 // 三种「取不到」分开处理，是为了让**排查有信号**：
-//   - 没带凭据（最常见）：静默匿名，不刷日志；
+//   - 没带凭据（最常见）：静默匿名 —— 是否被拒由调用方配；
 //   - 头格式不对 / 缓存里存的不是数字：Warn —— 这两种都是**配错了**。
 //     静默会让「token 播种写错值」变成一个查不出的匿名退化；
 //   - 缓存查询报错 / 未命中：Warn —— 前者是一次抖动（装配期已对 bff 的 cache
@@ -42,6 +41,8 @@ const (
 //     不起作用」会被误读成限流器坏了。
 //
 // store 为 nil 时返回 nil Resolver（identity 层退化为只开 span 的骨架）。
+// ⚠️ 此时若上层开了 `WithRequiredIdentity`，所有非豁免路径都会被 401 ——
+// 这正是 bff 的 app.Setup 对 store == nil **报错不起**的原因。
 func NewTokenResolver(store cachex.Cache, logger logx.Logger) Resolver {
 	if store == nil {
 		return nil
@@ -80,7 +81,7 @@ func NewTokenResolver(store cachex.Cache, logger logx.Logger) Resolver {
 		if v == "" {
 			warn("credential not found, treated as anonymous",
 				logx.String("bucket", "svc"),
-				logx.String("hint", "凭据播种见 conf 的 demo.auth_token"))
+				logx.String("hint", "凭据播种见 bff 的 conf `demo.auth_token` → `demo.seed_user_id`（bff app.Setup 启动期写入 cachex）"))
 			return ctx
 		}
 		uid, err := strconv.ParseUint(v, 10, 64)

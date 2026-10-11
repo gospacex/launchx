@@ -28,7 +28,7 @@ import (
 // *service.OrderService 天然满足它。抽接口是为了让「只做转换」这件事能被
 // 单独驱动到（见 order_test.go），而不是把 handler 绑死在 service 的具体类型上。
 type orderService interface {
-	CreateOrder(ctx context.Context, in service.CreateOrderInput) (uint64, error)
+	CreateOrder(ctx context.Context, in service.CreateOrderInput) (service.CreateOrderResult, error)
 	GetOrder(ctx context.Context, id uint64) (*service.OrderView, error)
 }
 
@@ -44,10 +44,15 @@ func New(svc orderService, traceOn bool) *OrderHandler {
 }
 
 // CreateOrder RPC 入口。这是 `POST /order` 的下游，也是 `order → MQ → points`
-// 异步链的起点（service 层在落库后调 publish）。
+// 异步链的起点：事件与业务行**同事务**落 outbox 表（service/repository 内），
+// 之后由 outbox.Runner 补发到 kafka —— 投递不在请求路径上，本层也不碰 MQ。
 //
 // 用生成的 Get* 取值而非直接读字段：kitex 传进来的 req 可能是 nil（客户端
 // 空请求），getter 对 nil 安全，直接取字段会当场 panic。
+//
+// 响应直接由 service 交出的 CreateOrderResult 拼装，**不再回读订单**：
+// order_no / total_amount 在创建那一刻就已确定，此前用 GetOrder(id) 回读
+// 白白多出两次 SQL 加一次缓存回填（2026-10-10 code review §5.8）。
 //
 // 结果列表命名，供 defer 里的 end(err) 覆盖所有 return 路径（Go 要求「全命名
 // 或全不命名」）。traceOn=false 时 layer.Begin 返回空闭包，行为不变。
@@ -64,17 +69,13 @@ func (h *OrderHandler) CreateOrder(ctx context.Context, req *orderpb.CreateOrder
 			UnitPrice:   it.GetUnitPrice(),
 		})
 	}
-	id, cerr := h.svc.CreateOrder(ctx, in)
+	res, cerr := h.svc.CreateOrder(ctx, in)
 	if cerr != nil {
 		return nil, cerr
 	}
-	v, verr := h.svc.GetOrder(ctx, id)
-	if verr != nil {
-		return nil, verr
-	}
 	return &orderpb.CreateOrderResp{
-		UserId: int64(v.Order.UserID), OrderId: int64(v.Order.ID),
-		OrderNo: v.Order.OrderNo, TotalAmount: v.Order.TotalAmount,
+		UserId: int64(in.UserID), OrderId: int64(res.ID),
+		OrderNo: res.OrderNo, TotalAmount: res.TotalAmount,
 	}, nil
 }
 

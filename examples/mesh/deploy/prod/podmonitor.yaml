@@ -1,0 +1,85 @@
+# =============================================================================
+# PodMonitor ×5 —— prometheus-operator 采集声明（生产用，教学集群不 apply）
+# -----------------------------------------------------------------------------
+# 为什么选 PodMonitor 而不是 ServiceMonitor：四域 srv 的 Service 里 RPC 口与
+# 采集口并列，ServiceMonitor 按 Service 选、再按端口名过滤也能做，但
+# PodMonitor 直接按容器端口名说话，跟「excludeInboundPorts 为什么排除的是
+# 容器口」这条注释链更贴。
+#
+# 端口名即采集契约：bff 的 http / 四域的 tcp-metrics。改名会导致 target 消失
+# 且**不报错**（Prometheus 侧只是少一个 target），改名前先看这里。
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: bff
+  namespace: launchx-mesh
+  labels:
+    release: prometheus # 按生产 Prometheus 的 podMonitorSelector 调整
+spec:
+  selector:
+    matchLabels:
+      app: bff
+  podMetricsEndpoints:
+    - port: http # Service/容器端口名，不是数字
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: srv-order
+  namespace: launchx-mesh
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: srv-order
+  podMetricsEndpoints:
+    - port: metrics # 容器端口名（Deployment 里 containerPort 9031 的名字）
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: srv-points
+  namespace: launchx-mesh
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: srv-points
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: srv-product
+  namespace: launchx-mesh
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: srv-product
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: srv-stock
+  namespace: launchx-mesh
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: srv-stock
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics

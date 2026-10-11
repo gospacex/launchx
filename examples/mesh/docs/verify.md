@@ -382,24 +382,29 @@ kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
 第 3 条回的 `order_id=1053` 是本轮新建的订单，它的 `order_no` 前缀 `M2026…` 与
 §6.1 第 7 行的消费 span 一一对应。
 
-### 6.4 判据脚本输出原文（第三次跑）
+### 6.4 判据脚本输出原文（**第七次跑**，矩阵已扩到 8 行）
 
 ```
 === 路由矩阵判据（入口 → bff → 目标域业务层 + sidecar）===
 #  路由                        方法     HTTP   域 span   sidecar  trace     年龄
-13 /api/ping                 GET    200    ✓        2 跳      6ce73903  0.5m  PASS
-14 /api/order/2              GET    200    ✓        2 跳      3fbb04e3  0.4m  PASS
-15 /api/order                POST   200    ✓        2 跳      b470f1ef  0.4m  PASS
-16 /api/points/1             GET    200    ✓        2 跳      d3452ef3  0.4m  PASS
-17 /api/product/1            GET    200    ✓        2 跳      2af90ab5  0.3m  PASS
-18 /api/stock/1              GET    200    ✓        2 跳      ff82acf9  0.3m  PASS
-19 +async(service.points.Con -      200    ✓        2 跳      b470f1ef  0.4m  PASS
-矩阵：7/7 行通过
+16 /api/ping                 GET    200    ✓        2 跳      0c869865  0.4m  PASS
+17 /api/order/2              GET    200    ✓        2 跳      4593da9c  0.4m  PASS
+18 /api/order                POST   200    ✓        2 跳      e4b81665  0.4m  PASS
+19 /api/points/1             GET    200    ✓        2 跳      38b604fe  0.4m  PASS
+20 /api/product/1            GET    200    ✓        2 跳      34cb5f47  0.3m  PASS
+21 /api/stock/1              GET    200    ✓        2 跳      1606a1da  0.3m  PASS
+25 +cache(/api/product/1)    GET    200    ✓命中      2 跳      34cb5f47  0.3m  PASS
+26 +async(service.points.Con -      200    ✓        2 跳      e4b81665  0.4m  PASS
+矩阵：8/8 行通过
 
 结论：PASS
 ```
 
-### 6.5 可复跑自检（连跑三次，判据必须每次都过）
+第 25 行的 `+cache` 是 2026-10-10 补的**第八条判据**（见 §6.8）：product 详情读了两次，
+较早那次回源（含 `db.query` / `repository.product.FindByID`）、最近这次只剩
+`db.redis.GET` —— 它的 traceID `34cb5f47` 与第 20 行相同，正是第二次读本身。
+
+### 6.5 可复跑自检（连跑七次，判据必须每次都过）
 
 | 跑次 | 时间 | 矩阵 | 首行 traceID | 异步链 traceID |
 |---|---|---|---|---|
@@ -407,12 +412,15 @@ kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- \
 | 2 | 19:02 | 7/7 PASS | `b4c3850f` | `2aab670a` |
 | 3 | 19:02 | 7/7 PASS | `6ce73903` | `b470f1ef` |
 | 4 | 19:10 | 7/7 PASS | `07281b9d` | `ca4b175a` |
-| 5 | **10-10 12:40** | **8/8 PASS**（矩阵新增 +cache 行） | `cb816620` | `e94be917` |
+| 5 | 10-10 12:40 | 8/8 PASS（矩阵新增 +cache 行） | `cb816620` | `e94be917` |
+| 6 | 10-10 下午（本轮第 1 次） | 8/8 PASS | `ef74f1cd` | `299ce8d3` |
+| 7 | 10-10 下午（本轮第 2 次，**缓存已热**且紧接连跑） | 8/8 PASS | `0c869865` | `e4b81665` |
 
-第 5 次是集群重建（k8s v1.33.1）+ §8 三处修复后的完整复跑；+cache 行要求首读回源，
-复跑前需清 apps 组缓存键 `mesh:product:detail:1`（**不是** micro 组的 `hot:product:1`）。
+第 5 次是集群重建（k8s v1.33.1）+ §8 三处修复后的完整复跑。
+第 7 次特意安排在**缓存仍是热的**时候紧接第 6 次跑 —— 它验的是 `+cache` 行不会因为
+窗口里堆了历史 trace 而误报（这条脆弱性是真的存在过并已修，见 §6.8）。
 
-四次 traceID **各不相同**，且异步链 traceID 每次都与当次 `POST /order` 行一致 ——
+七次 traceID **各不相同**，且异步链 traceID 每次都与当次 `POST /order` 行一致 ——
 这条防的是「第一次 PASS 是陈旧 trace 凑出来的」：若第二次结果不稳定，说明
 `--lookback` 时间窗或 flush 等待不足。
 
@@ -429,17 +437,117 @@ echo "rc=$?"     # 期望 1（非零 = 判据生效）
 
 实测 `rc=1` 且报「窗口内没有该 span」—— 判据方向为真，不是恒真判据。
 
+#### 反例 2：`+cache` 行必须识破「没有缓存却冒充命中」
+
+`srv-stock` **没有**商品详情缓存（读一次一次回源）。把 `+cache` 行套到它身上，
+连打两次 `/api/stock/1` 造足样本：
+
+```bash
+# 先连打两次，让窗口里有 2 条该路由的 trace
+POD=$(kubectl -n launchx-mesh get pods -o name | grep '^pod/bff' | head -1 | sed 's|pod/||')
+BASE=http://istio-ingressgateway.istio-system.svc.cluster.local
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- curl -s -o /dev/null "$BASE/api/stock/1"
+sleep 2
+kubectl -n launchx-mesh exec "$POD" -c istio-proxy -- curl -s -o /dev/null "$BASE/api/stock/1"
+sleep 12
+
+cat > /tmp/bad-cache.txt <<'EOF'
++cache|stock|/api/stock/1|GET|service.stock.GetStock|db.query repository.stock.FindByProductID
+EOF
+python3 scripts/trace-audit.py --base http://127.0.0.1:16686 \
+  --route-matrix /tmp/bad-cache.txt --lookback 2m --mesh
+echo "rc=$?"
+```
+
+实测：
+
+```
+2  +cache(/api/stock/1)      GET    200    MISS     2 跳      1606a1da  0.4m  FAIL
+      ✗ 最近一次读仍含回源 span db.query repository.stock.FindByProductID —— 缓存未命中
+矩阵：0/1 行通过
+```
+
+`rc=1`，且失败原因**精确命中**真因（不是「样本不足」那种万能解释）—— 判据能区分
+「真命中」与「根本没缓存」。
+
+> 只证这一点是不够的：第一次跑这个反例时窗口里只有 1 条 trace，脚本报的是
+> 「只有 1 条 trace」—— 那验的是**样本不足分支**，不是内容判定分支。补连打两次
+> 之后才验到真正想验的东西。做反向探针时也要问一句「它到底 FAIL 在哪」。
+
 ### 6.7 本轮实测踩到并修掉的三个真因（留给后来人）
 
 | 症状 | 真因 | 修法 |
 |---|---|---|
-| `POST /order` 返回 **504** | 宿主 Kafka 的 `PLAINTEXT` 监听器 advertised 为 `127.0.0.1:9092`；Pod 里 bootstrap 能连上，**元数据一返回就 `dial tcp 127.0.0.1:9092`（连的是 Pod 自己）** | 给 kafka 加一个专供网格的监听器 `MESH://:9094`（advertised 为 `kafka:9094`），宿主 9092 不动；`conf` 与 ConfigMap 的 brokers 改 9094；`20-host-middleware.yaml` 暴露 9094 |
+| `POST /order` 返回 **504** | 宿主 Kafka 的 `PLAINTEXT` 监听器 advertised 为 `127.0.0.1:9092`；Pod 里 bootstrap 能连上，**元数据一返回就 `dial tcp 127.0.0.1:9092`（连的是 Pod 自己）** | 给 kafka 加一个专供网格的监听器 `MESH://:9094`，advertised 写**集群内 FQDN**
+`host-middleware.launchx-mesh.svc.cluster.local:9094`；宿主 9092 不动；`conf` 与 ConfigMap 的 brokers 改 9094；`20-host-middleware.yaml` 暴露 9094。
+⚠️ advertised **不许写成容器名 `kafka`**：Pod 里解析不到宿主 compose 的容器名，会退化成同一个
+「连不上」症状；这里要的是「Pod 能解析的地址」，即 K8s Service 的 FQDN（由
+`20-host-middleware.yaml` 的 headless/ClusterIP Service 提供） |
 | 异步链**时有时无**（约 2/3 命中） | `srv-order` 与 `srv-points` 共用消费组 `mqx-group`：kafka-go 的 Reader 在**创建时**就以 GroupID 加入并占住分区，order 侧占住 partition 0 却从不读取 ⇒ 落进该分区的消息永远不处理 | 两域各配独立 `group_id`（`srv-order` / `srv-points`），互不抢分区 |
 | 6 条路由的 trace **一条都匹配不上** | 网格下根 span 是 **Envoy 的 proxy span**，`operationName` 是 `bff.launchx-mesh.svc.cluster.local:8081/*` 这类，路径只存在于 `http.url` **标签**里 —— 按 `GET /order/2` 匹配根 span 名必然零命中 | 改按「根 span 的 `http.method` + `http.url`/`http.target` 标签」绑定路由，而不是按 span 名 |
 
 > 另外一条口径坑（判据脚本自身）：micro 组的根 span 是应用侧 `GET /api/order/2`，
 > apps 组因为 VirtualService 有 `rewrite.uri: /`，根 span 路径不带 `/api`。脚本两种写法
 > 都认，改判据时别只留一种。
+
+### 6.8 第八条判据（2026-10-10 补）：product 详情缓存「回源 → 命中」
+
+**为什么补**：矩阵原先 7 行只判「入口 → bff → 目标域业务层」。product 读两次的缓存
+行为在排查阶段肉眼比对过 trace（第一次 `db.redis.GET → db.query → db.redis.SET →
+repository.product.FindByID`，第二次只剩 `db.redis.GET`），但**没有落到可执行
+判据** —— 属于「证据有了、判据没固化」。
+
+**判据形态**（矩阵文件的 `+cache` 行）：
+
+```
++cache|product|/api/product/1|GET|service.product.GetProduct|db.query repository.product.FindByID
+```
+
+语义：最近一次读**不得**含任何回源 span；且在它之前必须存在一次含回源 span 的读
+——两条合起来才证明「回源 → 回填 → 命中」真的发生过。`bring-up.sh` 的 `PROBE_ROUTES`
+里 `/api/product/1` 出现**两次**就是为了给它喂样本（连续重复路径会自动插 2s 间隔）。
+
+**踩到的脆弱性（已修）**：初版取「窗口内最后两条」做对比。若窗口里缓存早已是热的
+（历史多次读都命中），最后两条就都是命中 ⇒ older 侧找不到回源 span ⇒ **误判 FAIL**，
+而这个 FAIL 骂的根本不是真问题。改为：newer = 最后一条（必须命中），older = newer
+之前**最近的一条回源读**；实在找不到就明确 FAIL 并写明「等 TTL（product 详情缓存
+5 分钟）过期或换个商品 id 再跑」——按项目纪律，这种情况不许写成 SKIP 或 PASS。
+
+修复的验收方式就是 §6.5 的第 7 次：**缓存已热时紧接连跑仍 8/8 PASS**。
+
+### 6.9 第九条判据（2026-10-10 补）：`srv-stock` 的 `Lock()` 真的互斥
+
+**覆盖边界（如实说明）**：按 `mesh-entry-chain` 规格，stock 的 6 个 IDL 方法 MUST 显式
+返回 `Unimplemented`；`service.Decrease`（内部走 `Lock()`）虽然存在，**不经 RPC 面
+暴露**，bff 的路由表里也没有写库存的入口 —— 所以 `Lock()` 在运行期**没有从入口触达的
+路径**。这不是缺陷，是规格决定的姿态；拿运行期 trace 去验它，本身是不可能的。
+
+于是补齐做在**单测**层，并把缺口精确到「哪一层没验过」：
+
+| 用例 | 注入 | 证明的是 |
+|---|---|---|
+| `TestDecreaseConcurrentNoOversell`（既有） | **nil 锁** | 缺锁时条件 UPDATE 仍兜得住（不超卖） |
+| `TestDecreaseConcurrentWithLockIsMutuallyExclusive`（新增） | `mutexLocker`（真 `sync.Mutex`，按 key 分桶） | `Lock()` 取到后确实把扣减**串行化**了 |
+
+新用例的三条断言：取锁次数 == 20、锁 key 是 `stock:product:1`（同商品维度而非全局
+一把）、**临界区并发峰值恒为 1**。第三条是核心 —— 它把「锁是摆设」和「锁真互斥」分开。
+
+```bash
+cd examples/mesh/apps
+CGO_ENABLED=1 go test -count=20 -run TestDecreaseConcurrentWithLockIsMutuallyExclusive \
+  -race ./internal/srv/stock/service/
+```
+
+**反向探针**：把 `mutexLocker` 的加/解锁**成对**去掉（锁退化成只记次数的摆设）⇒
+必须 FAIL。实测报 `临界区并发峰值 = 20, want 1 —— 锁没有真正串行化扣减（等于没加锁）`，
+精确命中。（第一次做这个探针时只去掉了加锁、保留解锁，结果是 panic「unlock of
+unlocked mutex」—— FAIL 是 FAIL 了，但那是**锁不对称**而不是判据在说话。）
+
+**判据自己也有过 bug，留个档**：`keySeen` 的计数最初写成「先 `Load` 判空、再 `Store`
+新值」，这是典型的 check-then-act 竞态 —— 单跑 PASS，**全模块跑偶发 FAIL**，实测拿到
+的取用次数是 16 / 19 / 甚至 1。改用 `sync.Map.LoadOrStore` 之后 `-count=20 -race`
+稳定通过。教训两条：① 用来证明锁的判据，自己先得是并发安全的；②「单跑通过」不等于
+稳，并发用例要重复跑才算验过。
 
 ---
 

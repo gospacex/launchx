@@ -44,6 +44,7 @@ import (
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
 	orderpb "github.com/gospacex/launchx/examples/mesh/apps/pkg/kitex_gen/order"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/routing"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
 )
 
 // nopLogger 内嵌接口 + 只覆写 Warn：service / route 在这两条路径上只用 Warn。
@@ -52,12 +53,18 @@ type nopLogger struct{ logx.Logger }
 func (nopLogger) Warn(string, ...logx.Field) {}
 
 // fakeRepo 结构性满足 service 依赖的（未导出）仓储窄接口。
+//
+// owner 是「FindByID 返回的订单归属用户」，供归属校验（IDOR 防护）用例构造
+// 「订单属于某个主体」的场景：GetOrder 在主体可信时会比对 resp.user_id 与主体，
+// owner 不匹配即 403。
 type fakeRepo struct {
 	created   *model.Order
 	createErr error
+	owner     uint64
 }
 
-func (f *fakeRepo) Create(_ context.Context, o *model.Order, _ []model.OrderItem) error {
+func (f *fakeRepo) Create(_ context.Context, o *model.Order, _ []model.OrderItem,
+	_ func(orderID uint64) (payload, traceparent string)) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
@@ -69,7 +76,7 @@ func (f *fakeRepo) FindByID(_ context.Context, id uint64) (*model.Order, error) 
 	if f.created != nil {
 		return f.created, nil
 	}
-	return &model.Order{ID: id, OrderNo: "M-X", Status: model.StatusCreated}, nil
+	return &model.Order{ID: id, UserID: f.owner, OrderNo: "M-X", Status: model.StatusCreated}, nil
 }
 func (f *fakeRepo) ItemsByOrderID(context.Context, uint64) ([]model.OrderItem, error) {
 	return nil, nil
@@ -99,7 +106,7 @@ func (denyStore) Set(context.Context, string, string, time.Duration) error {
 // newServer 组装入向适配层：恒放行的闸门（nil store → fail-open）。
 func newServer(repo *fakeRepo, traceOn bool) *Server {
 	g := route.New(middleware.New(nil, nopLogger{}), nopLogger{})
-	svc := service.New(repo, nil, nil, nil, nopLogger{}, traceOn)
+	svc := service.New(repo, nil, nil, nopLogger{}, traceOn)
 	return New(handler.New(svc, traceOn), g, traceOn)
 }
 
@@ -127,7 +134,7 @@ func TestCreateOrderDelegatesWhenAdmitted(t *testing.T) {
 func TestCreateOrderRejectedReturnsRateLimited(t *testing.T) {
 	repo := &fakeRepo{}
 	g := route.New(middleware.New(denyStore{}, nopLogger{}), nopLogger{})
-	svc := service.New(repo, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(repo, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	resp, err := s.CreateOrder(context.Background(), &orderpb.CreateOrderReq{
@@ -148,7 +155,7 @@ func TestCreateOrderRejectedReturnsRateLimited(t *testing.T) {
 // GetOrder 被拒：同样回 RateLimited（闸门对所有已接线方法一致）。
 func TestGetOrderRejectedReturnsRateLimited(t *testing.T) {
 	g := route.New(middleware.New(denyStore{}, nopLogger{}), nopLogger{})
-	svc := service.New(&fakeRepo{}, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(&fakeRepo{}, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	_, err := s.GetOrder(context.Background(), &orderpb.GetOrderReq{UserId: 1, OrderId: 1})
@@ -259,7 +266,7 @@ func TestTraceOffEmitsNoLayerSpans(t *testing.T) {
 	})
 
 	g := route.New(middleware.New(nil, nopLogger{}), nopLogger{})
-	svc := service.New(repository.New(newRpcTestDB(t), false), nil, nil, nil, nopLogger{}, false)
+	svc := service.New(repository.New(newRpcTestDB(t), false), nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	if _, err := s.CreateOrder(context.Background(), &orderpb.CreateOrderReq{
@@ -282,7 +289,7 @@ func TestTraceOffEmitsNoLayerSpans(t *testing.T) {
 	}
 }
 
-// newRpcTestDB 建 sqlite 内存库并迁移三张表（与 repository 层单测同款）。
+// newRpcTestDB 建 sqlite 内存库并迁移四张表（与 repository 层单测同款，含 outbox）。
 // 父子链单测需要真实 repository（它才会开 repository.order.Create span）。
 func newRpcTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -292,7 +299,9 @@ func newRpcTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}); err != nil {
+	if err := db.AutoMigrate(
+		&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}, &outbox.Event{},
+	); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
 	return db
@@ -304,7 +313,7 @@ func newRpcTestDB(t *testing.T) *gorm.DB {
 func newServerWithRepo(t *testing.T, db *gorm.DB) *Server {
 	t.Helper()
 	g := route.New(middleware.New(nil, nopLogger{}), nopLogger{})
-	svc := service.New(repository.New(db, true), nil, nil, nil, nopLogger{}, true)
+	svc := service.New(repository.New(db, true), nil, nil, nopLogger{}, true)
 	return New(handler.New(svc, true), g, true)
 }
 
@@ -375,10 +384,13 @@ func TestLayerSpanChain(t *testing.T) {
 //
 // 它的值过不了进程边界，所以线上这条通常是空的 —— 正因如此它最容易在重构里
 // 被误删而不被发现，必须有用例钉住。
+//
+// 订单 owner 设为 42：主体可信时 GetOrder 会执行归属校验（2026-10-10 IDOR 加固），
+// owner 与主体一致才放行 —— 这条用例的落点是**限流分桶**，故让归属校验通过。
 func TestAdmitUsesInProcessIdentity(t *testing.T) {
 	st := &recStore{}
 	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
-	svc := service.New(&fakeRepo{}, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(&fakeRepo{owner: 42}, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	ctx := routing.WithIdentity(context.Background(), routing.Identity{UserID: 42})
@@ -391,10 +403,12 @@ func TestAdmitUsesInProcessIdentity(t *testing.T) {
 }
 
 // metainfo 里的身份优先（跨进程载体），req.user_id 为 0 也应落到 u7 桶。
+//
+// owner 设为 7，理由同 TestAdmitUsesInProcessIdentity（让归属校验通过）。
 func TestAdmitUsesMetainfoIdentity(t *testing.T) {
 	st := &recStore{}
 	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
-	svc := service.New(&fakeRepo{}, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(&fakeRepo{owner: 7}, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	ctx := metainfo.WithValue(context.Background(), identityMetaKey, "7")
@@ -410,7 +424,7 @@ func TestAdmitUsesMetainfoIdentity(t *testing.T) {
 func TestAdmitFallsBackToRequestUserID(t *testing.T) {
 	st := &recStore{}
 	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
-	svc := service.New(&fakeRepo{}, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(&fakeRepo{}, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	if _, err := s.GetOrder(context.Background(), &orderpb.GetOrderReq{UserId: 42, OrderId: 1}); err != nil {
@@ -428,7 +442,7 @@ func TestAdmitFallsBackToRequestUserID(t *testing.T) {
 func TestAdmitFallsBackToServiceBucket(t *testing.T) {
 	st := &recStore{}
 	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
-	svc := service.New(&fakeRepo{}, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(&fakeRepo{}, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	if _, err := s.GetOrder(context.Background(), &orderpb.GetOrderReq{UserId: 0, OrderId: 1}); err != nil {
@@ -449,7 +463,7 @@ func TestCreateOrderRejectsMalformedIdentity(t *testing.T) {
 			st := &recStore{}
 			g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
 			repo := &fakeRepo{}
-			svc := service.New(repo, nil, nil, nil, nopLogger{}, false)
+			svc := service.New(repo, nil, nil, nopLogger{}, false)
 			s := New(handler.New(svc, false), g, false)
 
 			ctx := metainfo.WithValue(context.Background(), identityMetaKey, bad)
@@ -479,7 +493,7 @@ func TestCreateOrderAdmitsAnonymousRequest(t *testing.T) {
 	st := &recStore{}
 	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
 	repo := &fakeRepo{}
-	svc := service.New(repo, nil, nil, nil, nopLogger{}, false)
+	svc := service.New(repo, nil, nil, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	resp, err := s.CreateOrder(context.Background(), &orderpb.CreateOrderReq{
@@ -494,5 +508,68 @@ func TestCreateOrderAdmitsAnonymousRequest(t *testing.T) {
 	}
 	if len(st.keys) != 1 || !strings.Contains(st.keys[0], ":u9:") {
 		t.Fatalf("应回落 req.user_id 到 u9 桶，实际 %v", st.keys)
+	}
+}
+
+// -------- 归属校验（IDOR 防护，Forbidden 的真实生产者） --------
+
+// 主体可信但订单不属于它 → Forbidden（403）。
+//
+// 2026-10-10 企业级加固：此前 GetOrder 只校验 id 是正整数，任何人可读任意订单
+// （BOLA/IDOR）。现在主体可信时比对订单归属。这条用例钉住「读路径也有授权」。
+func TestGetOrderRejectsForeignOrder(t *testing.T) {
+	st := &recStore{}
+	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
+	svc := service.New(&fakeRepo{owner: 9}, nil, nil, nopLogger{}, false) // 订单属于 9
+	s := New(handler.New(svc, false), g, false)
+
+	ctx := routing.WithIdentity(context.Background(), routing.Identity{UserID: 7}) // 主体是 7
+	resp, err := s.GetOrder(ctx, &orderpb.GetOrderReq{OrderId: 5})
+	if resp != nil {
+		t.Fatalf("归属不符不应返回响应体，实际 %+v", resp)
+	}
+	if c, _ := codes.From(err); c != codes.Forbidden {
+		t.Fatalf("读他人订单应回 Forbidden，实际 %v (err=%v)", c, err)
+	}
+}
+
+// 主体可信、订单归属一致 → 放行（反向断言：别把归属校验做成一律拒绝）。
+func TestGetOrderAdmitsOwnOrder(t *testing.T) {
+	st := &recStore{}
+	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
+	svc := service.New(&fakeRepo{owner: 7}, nil, nil, nopLogger{}, false)
+	s := New(handler.New(svc, false), g, false)
+
+	ctx := routing.WithIdentity(context.Background(), routing.Identity{UserID: 7})
+	resp, err := s.GetOrder(ctx, &orderpb.GetOrderReq{OrderId: 5})
+	if err != nil {
+		t.Fatalf("读自己的订单应放行，实际 %v", err)
+	}
+	if resp == nil || resp.GetUserId() != 7 {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+// 主体可信但请求体声明的 user_id 与主体不符 → Forbidden（不得静默改写，也不得放行）。
+func TestCreateOrderRejectsSubjectMismatch(t *testing.T) {
+	st := &recStore{}
+	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
+	repo := &fakeRepo{}
+	svc := service.New(repo, nil, nil, nopLogger{}, false)
+	s := New(handler.New(svc, false), g, false)
+
+	ctx := metainfo.WithValue(context.Background(), identityMetaKey, "7")
+	resp, err := s.CreateOrder(ctx, &orderpb.CreateOrderReq{
+		UserId: 9, // 与主体 7 不符
+		Items:  []*orderpb.OrderItem{{ProductId: 1, Name: "a", Quantity: 1, UnitPrice: 1}},
+	})
+	if resp != nil {
+		t.Fatalf("归属不符不应返回响应体，实际 %+v", resp)
+	}
+	if c, _ := codes.From(err); c != codes.Forbidden {
+		t.Fatalf("body user_id 与主体不符应回 Forbidden，实际 %v (err=%v)", c, err)
+	}
+	if repo.created != nil {
+		t.Fatal("归属不符不得触碰业务（repo 不应收到 Create）")
 	}
 }

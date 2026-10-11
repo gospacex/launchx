@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
 )
 
 // OrderRepository 订单存储。
@@ -26,8 +27,18 @@ func New(db *gorm.DB, traceOn bool) *OrderRepository {
 // quietNotFound 「查不到」不是故障：一次未命中是正常 miss，不该污染错误率。
 func quietNotFound(err error) bool { return errors.Is(err, gorm.ErrRecordNotFound) }
 
-// Create 落一张订单 + 明细 + 首条流转日志（同一事务）。
-func (r *OrderRepository) Create(ctx context.Context, o *model.Order, items []model.OrderItem) (err error) {
+// Create 落一张订单 + 明细 + 首条流转日志 + outbox 待发事件（同一事务）。
+//
+// outbox 是 2026-10-10 加固补的：此前事件在事务外直接 producer.Send，
+// 「订单已提交、事件投递失败」= 积分域永远收不到（只留一条 Warn）。
+// 现在事件与业务行同事务落库，投递由后台 Runner 补发（app.Setup 装配）。
+//
+// fill 在事务内、订单行落库后（自增 ID 已知）回调，产出事件体与随事件落库的
+// traceparent；传 nil 或返回空 payload 时该行由 Runner 直接放弃（不占重试配额）。
+// 投递目标 topic 由 Runner 的 producer 绑定（mqx 配置侧键位），这里只登记
+// 逻辑 topic 供对账。
+func (r *OrderRepository) Create(ctx context.Context, o *model.Order, items []model.OrderItem,
+	fill func(orderID uint64) (payload, traceparent string)) (err error) {
 	ctx, end := layer.Begin(ctx, "repository", "order", "Create", r.traceOn, quietNotFound)
 	defer func() { end(err) }()
 
@@ -43,9 +54,20 @@ func (r *OrderRepository) Create(ctx context.Context, o *model.Order, items []mo
 				return err
 			}
 		}
-		return tx.Create(&model.OrderStatusLog{
+		if err := tx.Create(&model.OrderStatusLog{
 			OrderID: o.ID, FromStatus: "", ToStatus: o.Status,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		ev := outbox.Event{
+			Topic:     "order.completed.v1", // = events.TopicOrderCompleted；repository 不 import 事件包（分层纪律），对账时两处必须一致
+			EventType: "order.completed",
+			Status:    outbox.StatusPending,
+		}
+		if fill != nil {
+			ev.Payload, ev.Traceparent = fill(o.ID)
+		}
+		return tx.Create(&ev).Error
 	})
 }
 

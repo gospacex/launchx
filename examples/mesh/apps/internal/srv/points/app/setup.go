@@ -27,6 +27,7 @@ import (
 	"github.com/cloudwego/kitex/server"
 	"github.com/gospacex/logx"
 	"github.com/gospacex/mqx"
+	"github.com/gospacex/otelx/layer"
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx"
@@ -94,7 +95,7 @@ func Setup(a *launchx.App) error {
 
 	// ---- 3. 分层装配：自下而上 ----
 	repo := repository.New(db, traceOn)
-	svc := service.New(repo, traceOn)
+	svc := service.New(repo, logger, traceOn)
 	guard := route.New(middleware.New(a.KV()[name], logger), logger)
 
 	// ---- 4. 建服务端并回存 ----
@@ -127,7 +128,7 @@ func Setup(a *launchx.App) error {
 			defer close(done)
 			// Consume(ctx, handler) 只有两个参数 —— topic 不是入参，它在构造消费端时
 			// 从 consumer.topic 取（见 apps/pkg/events 的键位口径注释）。
-			if err := consumer.Consume(ctx, consumeHandler(svc, logger)); err != nil && ctx.Err() == nil {
+			if err := consumer.Consume(ctx, consumeHandler(svc, logger, traceOn)); err != nil && ctx.Err() == nil {
 				logger.Error("srv-points: consume loop exited", logx.Err(err))
 			}
 		}()
@@ -166,14 +167,22 @@ func Setup(a *launchx.App) error {
 //
 // 契约上「能过 Unmarshal 的都可处理」并不成立：total_amount ≤ 0 能过 Unmarshal，
 // 却被 service 判为 InvalidArgument（见 service.ConsumeOrderCompleted）。
-func consumeHandler(svc *service.PointsService, logger logx.Logger) func(context.Context, *mqx.Message) error {
-	return func(c context.Context, msg *mqx.Message) error {
-		e, err := events.UnmarshalOrderCompleted(msg.Value)
-		if err != nil {
-			logger.Warn("srv-points: bad event payload, skipped", logx.Err(err))
+func consumeHandler(svc *service.PointsService, logger logx.Logger, traceOn bool) func(context.Context, *mqx.Message) error {
+	return func(c context.Context, msg *mqx.Message) (err error) {
+		// 消费侧补一层应用 span（2026-10-10 加固）：kafka 的**消费侧没有 driver span**
+		// —— mqx/kafka 只在生产侧开 messaging.kafka.send，消费侧仅 ExtractTrace 续链。
+		// 少了这一层，异步链在消费端的入口就直接是业务 span，「消息从 broker 取出到
+		// 进入业务」这段（outbox 3s 轮询 + broker 排队，实际是这条链延迟的大头）
+		// 在 Jaeger 里完全不可见。SDK 侧补 span 之前，这是成本最低的替代。
+		c, end := layer.Begin(c, "messaging", "points", "Consume", traceOn, nil)
+		defer func() { end(err) }()
+
+		e, uerr := events.UnmarshalOrderCompleted(msg.Value)
+		if uerr != nil {
+			logger.Warn("srv-points: bad event payload, skipped", logx.Err(uerr))
 			return nil // 坏载荷不重投：重投只会无限循环
 		}
-		if err := svc.ConsumeOrderCompleted(c, e); err != nil {
+		if err = svc.ConsumeOrderCompleted(c, e); err != nil {
 			if nonRetryable(err) {
 				// 确定性失败：重投只会把消息在队列里转圈，故记 Warn 后吞掉（等价于死信）。
 				logger.Warn("srv-points: event not processable, dropped",

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -614,6 +615,175 @@ func TestDecreaseConcurrentNoOversell(t *testing.T) {
 	}
 	if got.Available < 0 {
 		t.Fatalf("available 不得为负，实际 %d", got.Available)
+	}
+}
+
+// ---------- Step 3 第 3 层：注入**真互斥**的锁，验「锁不是摆设」 ----------
+
+// mutexLocker 是与 fakeLocker 分工不同的第二个锁替身。
+//
+// 分工（别合并成一个，合并后两条判据会互相遮蔽）：
+//
+//	fakeLocker   —— 只能证明「走了锁路径」：它每次 Lock 都直接返回一把新锁、
+//	                从不阻塞，故无论如何都观察不到互斥效果。
+//	mutexLocker  —— 按 key 分桶持真 sync.Mutex，并记录临界区的并发峰值。
+//
+// 为什么要单独造这一个：本文件的并发用例此前注入的是 nil 锁，故「并发不超卖」
+// 的证据只覆盖了「条件 UPDATE 兜底」这一层 —— 锁那段（`acquire`）从来没有被
+// 并发验证过。换成本替身后，扣减的临界区从 acquire 返回一直持有到 defer unlock，
+// 只要锁真的串行化了扣减，并发峰值 MUST 恒为 1 —— 这条断言把「锁是摆设」和
+// 「锁真互斥」区分开，是 `Lock()` 句柄存在的唯一行为级证据。
+type mutexLocker struct {
+	lockx.Locker
+	mu       sync.Mutex
+	buckets  map[string]*sync.Mutex
+	calls    int32
+	inflight int32
+	peak     int32
+	keySeen  sync.Map // key -> *int32
+}
+
+func newMutexLocker() *mutexLocker {
+	return &mutexLocker{buckets: map[string]*sync.Mutex{}}
+}
+
+func (l *mutexLocker) bucket(key string) *sync.Mutex {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.buckets == nil {
+		l.buckets = map[string]*sync.Mutex{}
+	}
+	m, ok := l.buckets[key]
+	if !ok {
+		m = &sync.Mutex{}
+		l.buckets[key] = m
+	}
+	return m
+}
+
+func (l *mutexLocker) Lock(_ context.Context, key string, _ ...lockx.LockOption) (lockx.Lock, error) {
+	atomic.AddInt32(&l.calls, 1)
+	// ⚠️ 这里 MUST 用 LoadOrStore 而不是「先 Load 判空、再 Store」：后者是
+	// check-then-act 竞态，并发首取时会各自 Store 一份新计数并互相覆盖
+	// （实测：20 并发下算出来的取用次数会掉到 16~19，甚至 1）。判据自己有
+	// 竞态的话，它证明不了任何东西 —— 这个坑是本用例开发过程中真实踩到的。
+	n := int32(0)
+	v, _ := l.keySeen.LoadOrStore(key, &n)
+	atomic.AddInt32(v.(*int32), 1)
+	l.bucket(key).Lock()
+	// 进入临界区：inflight 的峰值 = 同时在临界区里的 goroutine 数。
+	cur := atomic.AddInt32(&l.inflight, 1)
+	for {
+		old := atomic.LoadInt32(&l.peak)
+		if cur <= old || atomic.CompareAndSwapInt32(&l.peak, old, cur) {
+			break
+		}
+	}
+	return &mutexLock{owner: l, key: key}, nil
+}
+
+func (l *mutexLocker) callCount() int32       { return atomic.LoadInt32(&l.calls) }
+func (l *mutexLocker) peakConcurrency() int32 { return atomic.LoadInt32(&l.peak) }
+
+func (l *mutexLocker) countFor(key string) int32 {
+	if v, ok := l.keySeen.Load(key); ok {
+		return atomic.LoadInt32(v.(*int32))
+	}
+	return 0
+}
+
+// mutexLock 持锁句柄；Unlock 用 once 兜住重复释放（service 侧是 defer 单点释放，
+// 但并发用例里多一层保护也不改变语义）。
+type mutexLock struct {
+	lockx.Lock
+	owner *mutexLocker
+	key   string
+	once  sync.Once
+}
+
+func (l *mutexLock) Unlock(context.Context) error {
+	l.once.Do(func() {
+		atomic.AddInt32(&l.owner.inflight, -1)
+		l.owner.bucket(l.key).Unlock()
+	})
+	return nil
+}
+
+func (l *mutexLock) Key() string                 { return l.key }
+func (l *mutexLock) Expired() bool               { return false }
+func (l *mutexLock) Renew(context.Context) error { return nil }
+
+// TestDecreaseConcurrentWithLockIsMutuallyExclusive 带真互斥锁的并发不超卖。
+//
+// 与上面的 TestDecreaseConcurrentNoOversell 是**对照**，不是重复：那条注入 nil 锁，
+// 证明的是「缺锁时条件 UPDATE 仍兜得住」；本条注入真互斥锁，证明的是
+// 「`Lock()` 句柄取到后确实把扣减串行化了」—— 这让 mesh-app-handles
+// 句柄表里那一行「srv-stock / Lock() / 同商品扣减互斥」有了行为级证据，而不只是「代码里取到了句柄」。
+func TestDecreaseConcurrentWithLockIsMutuallyExclusive(t *testing.T) {
+	db := newTestDB(t)
+	seedStock(t, db, model.Stock{ProductID: 1, Total: 10, Available: 10})
+	lk := newMutexLocker()
+	lg := &recLogger{}
+	svc := New(repository.New(db, false), nil, lk, lg, false)
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	var success, notEnough, other int32
+	var mu sync.Mutex
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.Decrease(context.Background(), 1, 1)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				success++
+			default:
+				if c, _ := codes.From(err); c == codes.StockNotEnough {
+					notEnough++
+				} else {
+					other++
+					t.Errorf("并发扣减出现非预期错误：%v", err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if success != 10 {
+		t.Fatalf("成功数 = %d, want 10（超卖或少卖）", success)
+	}
+	if notEnough != 10 {
+		t.Fatalf("未命中数 = %d, want 10", notEnough)
+	}
+	if other != 0 {
+		t.Fatalf("非预期错误数 = %d, want 0", other)
+	}
+
+	// 判据 1：每一次扣减都真的去取了锁（不是「有句柄但没人用」）。
+	if got := lk.callCount(); got != goroutines {
+		t.Fatalf("取锁次数 = %d, want %d —— 有 goroutine 没走锁路径", got, goroutines)
+	}
+	// 判据 2：锁 key 必须落在商品维度（同商品互斥，而不是全局一把锁）。
+	if got := lk.countFor("stock:product:1"); got != goroutines {
+		t.Fatalf("锁 key stock:product:1 的取用次数 = %d, want %d", got, goroutines)
+	}
+	// 判据 3（本用例的核心）：临界区并发峰值恒为 1 —— 锁真的串行化了扣减。
+	if got := lk.peakConcurrency(); got != 1 {
+		t.Fatalf("临界区并发峰值 = %d, want 1 —— 锁没有真正串行化扣减（等于没加锁）", got)
+	}
+	if lg.hasWarn("lock unavailable") {
+		t.Fatalf("注入了锁不应出现缺锁 Warn，实际 %v", lg.warns)
+	}
+
+	var got model.Stock
+	if err := db.First(&got, "product_id = ?", 1).Error; err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got.Available != 0 {
+		t.Fatalf("终值 available = %d, want 0", got.Available)
 	}
 }
 

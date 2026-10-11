@@ -83,38 +83,65 @@ data:
     logx:
       level: info
       otel:
+        # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+        # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+        # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
         enable_trace: true
 
     # 指标（Prometheus 拉取式）。装配期建 MeterProvider 并设为 otel 全局 ——
-    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流）。
-    # 关掉（false 或不写）即不建 provider，meter 退回 noop。
+    # HTTP 面自动挂到 webx 的 MetricsPrefix（缺省 /metrics，并豁免入口限流），
+    # RPC 客户端/服务端中间件也按这一开关挂。**关掉（false 或不写）即不建 provider**，
+    # meter 退回 noop：不产生指标、不留采集口，但 Instrument 调用点仍在（不会少埋点）。
     metrics:
       enabled: true
+    # 入口鉴权（2026-10-10 企业级加固）：**应用侧自己做**，与 examples/micro 同口径。
+    #
+    # 曾经这里写着「不设 auth 段，传输层身份下沉给 Istio（RequestAuthentication）」
+    # —— 但 examples/mesh 里从来没有 RequestAuthentication 资源（Istio 需要真实
+    # issuer + JWKS，本示例没有身份提供方），于是那句话描述的是一个**不存在**的
+    # 防护：入口实际无鉴权，匿名可下单、可读任意订单。现在把闸门关在应用侧。
+    #
+    # 三条失败姿态（与 micro 的判定同源，逐条都有理由）：
+    #   - require: false → 放行但 Warn：这是运维决定，留痕即可；
+    #   - require: true 而无 auth_token → 装配期报错不起（挂上闸门却人人 401，
+    #     比起不来更难查）；
+    #   - seed_user_id 为 0 → 同样报错不起（反查拿到 0 会被闸门当匿名拒掉）。
+    auth:
+      require: true # 显式声明（缺省也是 true）；置 false 会让六条路由对任何调用方开放
+    demo:
+      auth_token: "mesh-demo-token" # 演示令牌；生产里这活属于签发服务（含轮换/吊销）
+      seed_user_id: 1 # 令牌绑定的用户；必须是数据面里**有订单可读**的用户（order 2 属 user 1）
     # 刻意**不设** strict：bff 的硬前提只有凭据缓存，缺了由 app.Setup 显式报错
     # （handles.VerifyOrError(a, "cache")），不靠 strict 兜。
-    # 也**不设** auth 段：apps 的传输层身份下沉给 Istio（RequestAuthentication +
-    # AuthorizationPolicy），应用侧对匿名请求 fail-open（identity 层只做 best-effort
-    # 反查、供下游限流分桶），故这里没有 require 这类开关可配。
     xmiddleware:
       # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
-      # 不是组件：三项都只在客户端选项装配那一刻起作用，配置面收在 rpcx、
-      # 由 mode 在装配期读进 App.RPCClientOptions。零值全关，不写 = 不加选项。
+      # 它不是组件：三项都只在客户端选项装配那一刻起作用，故配置面收在 rpcx、
+      # 由 mode 在装配期读进 App.RPCClientOptions 产出的选项里。**零值全关**，
+      # 不写这一段 = 产生的 client.Option 与引入治理之前逐字相同。
       rpcx:
-        # 熔断：服务级 + 实例级两道闸。阈值写出来是为了让生效值可见。
-        # 打开它不改成功路径，作用是在持续故障时快速失败。
+        # 熔断：服务级（调用方/被调方）+ 实例级两道闸。阈值写出来是为了让当前
+        # 生效值可见（不写则用 kitex 缺省，同样是 0.5 / 200）。打开它**不改成功
+        # 路径**，作用是在持续故障时快速失败，而不是继续把请求打到坏实例上。
         circuit_breaker:
           enabled: true
-          error_rate: 0.5
-          min_sample: 200
-        # 重试：故意不开 —— 链路上有非幂等写（下单/扣减/入账），超时重试会重复落库；
-        # 且网格侧若也开 HTTP 跳重试，故障期双侧重试互相放大（ACCEPTANCE §13.5 硬规则 1）。
-        # 超时预算也不够：三试 ≈ 3 × RPCTimeout（rpcx 缺省 3s）= 9s > 入口 webx.timeout 5s。
+          error_rate: 0.5      # 触发熔断的错误率阈值，取值 (0,1]
+          min_sample: 200      # 触发熔断所需的最小样本数
+        # 重试：本档**故意不开**。这条链路上有非幂等写（下单 / 扣减 / 入账），
+        # 传输层超时重试会产生重复落库；且一旦网格侧也开了 HTTP 跳重试，
+        # 故障期双侧重试会互相放大（ACCEPTANCE §13.5 硬规则 1）。
+        # 开启前先确认两件事：max_attempts ≤ 5（kitex 越界即 panic，装配期已拦）、
+        # Istio VirtualService 的 retries 为空。
+        # 再看一眼预算：单次业务调用最坏耗时 ≈ (1 + max_attempts) × RPCTimeout
+        #（rpcx 缺省 3s），三试就是 9s —— 已盖过入口的 webx.timeout(5s)，
+        # 表现为引擎先 504、而重试还在后台跑。真开重试须同时收紧 max_duration_ms。
         retry:
           enabled: false
-          max_attempts: 2
-          backoff_ms: 10
+          max_attempts: 2      # 不含首次调用
+          backoff_ms: 10       # 固定退避；0 = 不退避
         # 负载均衡：闭集 weighted_random（缺省）/ weighted_round_robin /
-        # interleaved_weighted_round_robin；不给 consistent_hash（需业务 key 函数）。
+        # interleaved_weighted_round_robin。刻意**不给** consistent_hash ——
+        # 它需要业务侧的 key 函数，没有默认值，配了只会把请求全打到同一实例上。
+        # 不写这一项即用 kitex 缺省（weighted_random）。
       # ----- cachex：边界凭据存储（token → user_id），bff 唯一的数据面 -----
       # 为什么边界要有进程外存储：用本地 map 会让「一次签发要能被所有 bff 实例认」
       # 不成立，多实例部署时表现为「请求随机 401」。这里存的不是业务数据
@@ -127,8 +154,6 @@ data:
             addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
             db: 2 # 与其他域的 0/1/3 分开：凭据被逐出 = 全员 401
             pool_size: 30
-
-  # -------- srv-order —— 订单域（生产 order.completed.v1） --------
   srv-order.yaml: |
     # =============================================================================
     # 订单域（apps 组）—— srv 档配置
@@ -161,12 +186,14 @@ data:
     logx:
       level: info
       otel:
+        # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+        # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+        # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
         enable_trace: true
 
-    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
     # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
-    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
-    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    # enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
     metrics:
       enabled: true
       addr: "0.0.0.0:9031"
@@ -250,7 +277,6 @@ data:
               #   写进该分区 ⇒ 积分域永远收不到（症状是异步链时灵时不灵，且两侧日志
               #   都不报错）。各域一个 group 后，points 独占全部三个分区。
               group_id: mesh-order-v1
-
   # -------- srv-points —— 积分域（消费 order.completed.v1） --------
   srv-points.yaml: |
     # =============================================================================
@@ -284,12 +310,14 @@ data:
     logx:
       level: info
       otel:
+        # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+        # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+        # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
         enable_trace: true
 
-    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
     # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
-    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
-    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    # enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
     metrics:
       enabled: true
       addr: "0.0.0.0:9032"
@@ -341,7 +369,6 @@ data:
               # 独立消费组（理由见 srv-order 同处注释）：不与任何「只创建不消费」的
               # 域共用 group，否则会被抢走分区，表现为「下单消息时灵时不灵地收不到」。
               group_id: mesh-points-v1
-
   # -------- srv-product —— 商品域（缓存侧） --------
   srv-product.yaml: |
     # =============================================================================
@@ -372,12 +399,14 @@ data:
     logx:
       level: info
       otel:
+        # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+        # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+        # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
         enable_trace: true
 
-    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
     # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
-    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
-    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    # enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
     metrics:
       enabled: true
       addr: "0.0.0.0:9033"
@@ -420,7 +449,6 @@ data:
             addr: "host-middleware.launchx-mesh.svc.cluster.local:6379"
             db: 1
             pool_size: 30
-
   # -------- srv-stock —— 库存域（KV + 锁） --------
   srv-stock.yaml: |
     # =============================================================================
@@ -453,12 +481,14 @@ data:
     logx:
       level: info
       otel:
+        # 组件级 span 开关。**故意不写 exporter/endpoint**：logx.Config 虽能解析这两键，
+        # 但 launchx 装配路径从不读它们（span 出口由 trace.endpoint 决定，见
+        # internal/telemetry.Init），写了只会让人误以为「日志走 otlp」。
         enable_trace: true
 
-    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故显式给采集口地址：
+    # 指标（Prometheus 拉取式）。srv 档**没有 HTTP 面**，故必须显式给采集口地址：
     # 装配期单起一个只服务 /metrics 的监听，不占服务端口、不参与业务路由。
-    # enabled=true 却漏配 addr 时装配期即退（否则指标被采集却无人能读，且不报错）。
-    # 容器内必须监听全地址 —— 绑 127.0.0.1 在 Pod 外不可达（见 bring-up.sh check）。
+    # enabled=true 却漏配 addr 时**装配期即退**（否则指标被采集却无人能读，且不报错）。
     metrics:
       enabled: true
       addr: "0.0.0.0:9034"

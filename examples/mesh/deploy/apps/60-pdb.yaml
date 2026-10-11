@@ -1,0 +1,28 @@
+# =============================================================================
+# PodDisruptionBudget（2026-10-10 企业级加固）
+# -----------------------------------------------------------------------------
+# 只给 bff 配：它是双副本（30-bff.yaml），PDB 保证「自愿干扰」（滚动更新、
+# 节点 drain、集群缩容）期间至少 1 个副本在线 —— 没有它，kubectl drain
+# 会把两个副本一起赶走，入口断流。
+#
+# 四域 srv 不配 PDB 的原因要说清楚，防止后来人照抄：
+#   srv 当前是单副本，单副本配 PDB（minAvailable: 1）不会提高可用性，
+#   只会让 drain **永远卡住**（驱逐必然违反 PDB）—— 那不是高可用，是死锁。
+#   srv 要提可用性，正确顺序是先评估有源副本性再加副本，副本数 ≥2 之后才轮到 PDB。
+#   已具备多实例安全的三处（srv-order 提副本前逐条核）：
+#     * kafka 消费组：consumer.group_id 按服务命名，多副本自然分摊分区；
+#     * lockx：分布式锁按资源键互斥，跨实例有效；
+#     * outbox 补发器（srv-order）：pending() 走**行级认领**（status=claimed + 租约
+#       ClaimLease），两个 Runner 不会捞到同一行、各发一次（examples/pkg/outbox）。
+#     三处齐了再提副本；缺任一条就提副本 = 数据正确性回归。
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bff
+  namespace: launchx-mesh
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: bff

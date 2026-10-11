@@ -1,0 +1,78 @@
+# =============================================================================
+# K8s NetworkPolicy —— 东西向隔离的 K8s 层兜底（生产用，教学集群不 apply）
+# -----------------------------------------------------------------------------
+# 与 Istio AuthorizationPolicy 的关系：两层各管一段，不是重复。
+#   - Istio authz 认 SPIFFE 身份、能管 L7，但它**只管经过 sidecar 的流量**：
+#     9031-9034 采集口被 excludeInboundPorts 排除在 sidecar 外，authz 够不着；
+#     sidecar 本身被攻破或注入被关掉（sidecar.istio.io/inject=false）时同样够不着。
+#   - NetworkPolicy 工作在 CNI 层、按 Pod/IP 算，不管 sidecar 在不在都生效。
+# 代价：CNI 必须能执行 NetworkPolicy（Calico/Cilium 等；minikube 默认的不行）。
+#
+# 注意：kubelet 探针（liveness/readiness）来自节点，多数 CNI 对节点流量默认
+# 放行或需单独放行 —— 上生产前用真实 CNI 验证探针不断，否则 Pod 永远 NotReady。
+# =============================================================================
+
+# 默认拒绝：launchx-mesh 内一切入向流量先全拒，下面逐条开。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: launchx-mesh
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# bff：只收 ingressgateway（istio-system）打到 8081 的流量。
+# 8081 同时服务 /metrics（同口复用），故采集也走这条 —— 生产 Prometheus
+# 若在集群外，需另加一条按 ipBlock 放行采集源的规则。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bff-from-ingressgateway
+  namespace: launchx-mesh
+spec:
+  podSelector:
+    matchLabels:
+      app: bff
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              istio: ingressgateway
+      ports:
+        - port: 8081
+---
+# 四域 srv：只收 bff 打到 RPC 口的流量（与 Istio authz 的 sa/bff 同一语义，
+# 但这一层连「关掉注入的旁路 Pod」也拦得住）。采集口对全集群放行：
+# metrics 不含业务数据，且 Prometheus 部署位置不该反过来约束被采方。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srv-from-bff
+  namespace: launchx-mesh
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [srv-order, srv-points, srv-product, srv-stock]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: bff
+      ports:
+        - port: 9021
+        - port: 9022
+        - port: 9023
+        - port: 9024
+    - ports: # 采集口（9031-9034）：无 from = 集群内任意来源
+        - port: 9031
+        - port: 9032
+        - port: 9033
+        - port: 9034

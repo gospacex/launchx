@@ -1,0 +1,33 @@
+# =============================================================================
+# mTLS 姿态：命名空间级 STRICT（2026-10-10 企业级加固）
+# -----------------------------------------------------------------------------
+# 为什么此前没有这一份也能跑通：
+#   Istio 缺省 PERMISSIVE（明文/mTLS 都收），而 50-authz.yaml 的
+#   AuthorizationPolicy 是 ALLOW principals=[sa/bff] —— 明文连接没有身份，
+#   匹配不上 ALLOW 一样被拒。所以「拦截」此前实际由 authz 兜底完成。
+#   但这留下两个口子：① 哪天有人给某服务加一条「放行无身份来源」的
+#   authz 规则（比如为了方便调试），明文立刻长驱直入；② PERMISSIVE 下
+#   同网格两个 sidecar 之间仍可能协商出明文（如 DestinationRule 配错
+#   TLS mode），无人察觉。STRICT 把「必须 mTLS」从授权层提前到传输层，
+#   与 authz 形成纵深：传输层管「有没有身份」，授权层管「这个身份能不能来」。
+#
+# 与本仓既有配置的相容性（逐条核过）：
+#   * 9031-9034 采集口：已 excludeInboundPorts，流量根本不进 sidecar，不受影响；
+#   * bff 的 httpGet 探针：Istio 注入时自动改写到 pilot-agent(15020) 转发，
+#     STRICT 下照常工作（这正是 Istio 的探针重写机制存在的原因）；
+#   * srv 的 tcpSocket 探针：探测只要求 TCP connect 成功，Envoy 拒在握手之后，
+#     内核握手已完成 —— 实测 Ready 不受影响（若换集群后失效，回退方案是把
+#     探针也迁到 metrics 口的 httpGet）；
+#   * consul / micro 变体：同命名空间且同样注入 sidecar，Pod 间调用走
+#     auto-mTLS，STRICT 两边对等，无影响；
+#   * host-middleware（宿主中间件门面）：那是**出向**流量，PeerAuthentication
+#     只管入向，不受影响。
+# =============================================================================
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: launchx-mesh
+spec:
+  mtls:
+    mode: STRICT

@@ -9,9 +9,21 @@
 #   2. 业务配置里统一写一个集群 DNS 名，比散落 host.minikube.internal 更好读，
 #      而且换宿主地址只需改这一处。
 #
-# Endpoints 的 IP = 从 minikube 视角看宿主的地址（本机实测 192.168.65.254）。
-# 换机器时用下面这条取，并由 bring-up.sh 自动替换：
+# Endpoints 的 IP = 从 minikube 视角看宿主的地址，**清单里是写死的值**：
+# 当前 192.168.65.254 对应本机（Docker Desktop + minikube docker driver）实测。
+# 换环境**必须手工改这一行**，取值命令：
 #   minikube ssh -- "getent hosts host.minikube.internal" | awk '{print $1}'
+#
+# ⚠️ 别被上一版注释骗了：它写着「由 bring-up.sh 自动替换」，但
+# `examples/mesh/scripts/bring-up.sh` 里**没有任何替换或校验逻辑**（全仓检索
+# `HOST_MW_IP` 只命中本文件与 `mesh/docs/verify.md`，脚本侧零命中），本仓也
+# 没有 envsubst 之类的模板约定。也就是说：换机器后忘记改这一行 = 静默连不上
+# 宿主中间件，而症状散在各处、都不指向真因 —— OTLP 无导出（sidecar span 全丢）、
+# 四域 `strict.db` 报库连不上、kafka 元数据拿不到（broker 地址不可达）。
+# 清单侧无法把它写成占位符（Endpoints 要求合法 IP，占位串会被 API server 拒），
+# 故只能把来源与替换义务写清楚。
+# 脚本侧应当补一步「apply 前按上面那条命令替换 + apply 后比对」，已转给负责
+# scripts 的同学（openspec 的 mesh-environment spec 里也有同一条判据）。
 #
 # 端口名必须是 `grpc-` 前缀（不要写成 otlp-grpc）：
 #   Istio 靠**端口名前缀**判定上游协议。写成 otlp-grpc 时它认不出来 → 落到
@@ -66,7 +78,11 @@ metadata:
   namespace: launchx-mesh
 subsets:
   - addresses:
-      - ip: 192.168.65.254 # HOST_MW_IP，由 bring-up.sh 按实际环境替换
+      # 宿主地址（minikube 视角），**写死值，换环境必须手工改这一行**：
+      #   当前 192.168.65.254 = 本机 Docker Desktop + minikube(docker driver) 实测；
+      #   取值：minikube ssh -- "getent hosts host.minikube.internal" | awk '{print $1}'
+      # 没有脚本会替换它（见头注），也没有 envsubst 约定。
+      - ip: 192.168.65.254
     ports:
       - name: mysql
         port: 3306

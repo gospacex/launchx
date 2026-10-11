@@ -1,0 +1,58 @@
+# =============================================================================
+# PrometheusRule —— 告警底稿（生产用，教学集群不 apply）
+# -----------------------------------------------------------------------------
+# 只写「能从现有指标面直接算出来」的告警，不臆造指标名：
+#   - rpcx_requests_total{rpc_role="client"|"server"}（bff/srv 的 RPC 计数，
+#     verify.md §7 实测存在）；
+#   - istio_requests_total（sidecar 自带，入口跳 L7）；
+#   - up（Prometheus 抓取健康）。
+# kafka 消费 lag 需要 kafka-exporter，本案例没装，故不写 lag 告警（写了也是
+# 永远静默的死规则，比没有更糟）。
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: launchx-mesh-apps
+  namespace: launchx-mesh
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: launchx-mesh.availability
+      rules:
+        - alert: MeshAppTargetDown
+          # 任一业务 target 连续 3 分钟抓不到。采集口失效的最早信号通常在这里，
+          # 而不是在业务指标本身（指标没了和它抓不到是两回事，先报抓不到）。
+          expr: up{namespace="launchx-mesh"} == 0
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "launchx-mesh 采集目标下线：{{ $labels.job }}/{{ $labels.instance }}"
+
+        - alert: MeshBffHigh5xx
+          # 入口跳 5xx 占比（sidecar 视角）。bff 是唯一 L7 可观察跳，
+          # 故这条用 istio_requests_total 而不是应用指标。
+          expr: |
+            sum(rate(istio_requests_total{destination_service_name="bff",response_code=~"5.."}[5m]))
+              /
+            sum(rate(istio_requests_total{destination_service_name="bff"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "bff 入口 5xx 占比超 5%（5m 窗口）"
+
+        - alert: MeshRpcServerErrors
+          # 域服 RPC 侧错误率：rpcx 计数器带 rpc_role/code 标签，
+          # 非 OK 占比超阈即报。标签名以 rpcx SDK 实际产出为准，上生产前先
+          # 在 Prometheus 里跑通 expr 再启用。
+          expr: |
+            sum(rate(rpcx_requests_total{namespace="launchx-mesh",rpc_role="server",code!="OK"}[5m]))
+              /
+            sum(rate(rpcx_requests_total{namespace="launchx-mesh",rpc_role="server"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "域服 RPC 错误率超 5%（5m 窗口）"

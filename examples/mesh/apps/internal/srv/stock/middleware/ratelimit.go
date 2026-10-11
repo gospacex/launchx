@@ -15,6 +15,8 @@ import (
 
 	"github.com/gospacex/kvx"
 	"github.com/gospacex/logx"
+	"github.com/gospacex/otelx/layer"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -47,8 +49,16 @@ func New(store kvx.KVStore, logger logx.Logger) *RateLimiter {
 // 失败姿态是**放行**而不是拒绝：限流是自保护，不该因为计数后端抖动就把正常
 // 请求打成 429（那等于把限流器自己变成故障源）。但必须打 Warn ——
 // 「限了却被打穿且无痕可查」是最难排查的形态。
+//
+// 自带 span（2026-10-10 加固）：返回 429 时，Jaeger 上要能一眼看出**拒在哪一层**
+// 以及**按谁计的数**。span 恒定开启（与 bff 的 routing.rate_limit 同口径）。
 func (r *RateLimiter) Allow(ctx context.Context, subject string) bool {
+	ctx, span := layer.Start(ctx, "middleware", "stock", "RateLimit")
+	defer span.End()
+	span.SetAttributes(attribute.String("rate_limit.subject", subject))
+
 	if r == nil || r.store == nil || subject == "" {
+		span.SetAttributes(attribute.Bool("rate_limit.degraded", true))
 		r.warn("mesh-stock: rate limiter unavailable, request allowed",
 			logx.String("subject", subject),
 			logx.String("consequence", "本轮不受限流保护"),
@@ -58,10 +68,15 @@ func (r *RateLimiter) Allow(ctx context.Context, subject string) bool {
 	key := fmt.Sprintf("%s:%s:%d", namespace, subject, time.Now().Unix()/int64(r.window.Seconds()))
 	n, err := r.store.Incr(ctx, key)
 	if err != nil {
+		span.SetAttributes(attribute.Bool("rate_limit.degraded", true))
 		r.warn("mesh-stock: rate limit counter failed, request allowed",
 			logx.String("subject", subject), logx.Err(err))
 		return true
 	}
+	allowed := n <= r.limit
+	span.SetAttributes(attribute.Int64("rate_limit.count", n),
+		attribute.Int64("rate_limit.limit", r.limit),
+		attribute.Bool("rate_limit.allowed", allowed))
 	if n == 1 {
 		// 首次计数才设过期：每次 Incr 都 Expire/Set 会让窗口永不滚动。
 		//
@@ -74,7 +89,7 @@ func (r *RateLimiter) Allow(ctx context.Context, subject string) bool {
 			r.warn("mesh-stock: set rate limit ttl failed", logx.Err(err))
 		}
 	}
-	return n <= r.limit
+	return allowed
 }
 
 // warn 统一收口 logger 判空：New 允许传 nil logger，装配期不该因日志缺失而 panic。

@@ -4,11 +4,15 @@
 //   - 实现生成的 order.Order 接口**全部方法**（kitex 按接口签名约束 NewServer 入参，
 //     少一个方法编译期即失败）；
 //   - 开 rpc.order.<Op> 分层 span，把 kitex 带进来的 ctx 接进链路；
-//   - 经 route.Guard 走准入闸门，被拒时回**对应的**拒绝码（身份非法 401 / 被限流 429）；
+//   - 经 route.Guard 走准入闸门，被拒时回**对应的**拒绝码（身份非法 401 / 越权 403 /
+//     被限流 429）；
 //   - 把请求原样交给 handler（不做任何字段加工）。
 //
 // 本层不做出向调用：apps 的 srv 之间不互调（见 mesh-entry-chain 的同名 Requirement），
 // 且 srv 档没有出向客户端的装配来源，故这里只负责入向。
+//
+// 2026-10-10 起本层还承担**归属校验**（IDOR 防护）：身份是传输层的事，只有本层
+// 认识 metainfo；service 层按纪律只认入参，不该去解析 metainfo。详见 GetOrder 注释。
 package rpc
 
 import (
@@ -49,21 +53,50 @@ func (s *Server) CreateOrder(ctx context.Context, req *orderpb.CreateOrderReq) (
 	ctx, end := layer.Begin(ctx, "rpc", "order", "CreateOrder", s.traceOn, nil)
 	defer func() { end(err) }()
 
-	if aerr := s.admit(ctx, req.GetUserId()); aerr != nil {
+	id, authed, aerr := s.resolveSubject(ctx, req.GetUserId())
+	if aerr != nil {
 		return nil, aerr
+	}
+	// 主体可信时，请求里声明的 user_id MUST 与它一致：bff 正常会把 body 的
+	// user_id 覆盖成主体，一旦两者不等，只可能是 bff 漏改或有人绕过 bff 直连
+	// —— 都是不该放行的形态。静默改写等于把「代他人下单」变成一条无痕路径。
+	if authed && uint64(req.GetUserId()) != id.UserID {
+		return nil, codes.New(codes.Forbidden,
+			"user_id does not match the authenticated subject")
+	}
+	if !s.guard.Admit(ctx, id) {
+		return nil, codes.New(codes.RateLimited, "rate limited")
 	}
 	return s.handler.CreateOrder(ctx, req)
 }
 
 // GetOrder 查单。
+//
+// 归属校验（IDOR 防护，2026-10-10 加固）：主体可信且订单不属于该主体时回 403。
+// 校验点放在**本层**而不是 service：身份是传输层的事（metainfo / kitex），
+// service 层不该认识 metainfo —— 那会把「业务判断只认入参」这条纪律破掉。
+// 代价是多读一次订单行来比对归属；它与 handler 本来就要读的那次是同一行，
+// 后续若成为热点再考虑把归属下推到 SQL 的 WHERE（`AND user_id = ?`）。
 func (s *Server) GetOrder(ctx context.Context, req *orderpb.GetOrderReq) (resp *orderpb.GetOrderResp, err error) {
 	ctx, end := layer.Begin(ctx, "rpc", "order", "GetOrder", s.traceOn, nil)
 	defer func() { end(err) }()
 
-	if aerr := s.admit(ctx, req.GetUserId()); aerr != nil {
+	id, authed, aerr := s.resolveSubject(ctx, req.GetUserId())
+	if aerr != nil {
 		return nil, aerr
 	}
-	return s.handler.GetOrder(ctx, req)
+	if !s.guard.Admit(ctx, id) {
+		return nil, codes.New(codes.RateLimited, "rate limited")
+	}
+	resp, err = s.handler.GetOrder(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if authed && uint64(resp.GetUserId()) != id.UserID {
+		return nil, codes.New(codes.Forbidden,
+			"order does not belong to the authenticated subject")
+	}
+	return resp, nil
 }
 
 // ListOrders 未接线：本示例不提供列表页。与 CreateOrder / GetOrder 同形 ——
@@ -82,38 +115,41 @@ func (s *Server) Report(ctx context.Context, req *orderpb.ReportReq) (resp *orde
 	return s.handler.Report(ctx, req)
 }
 
-// admit 走准入闸门。
+// resolveSubject 解析本次调用的主体，并回答「这个主体是不是**可信来源**」。
 //
-// 限流主体的来源按优先级取**四处**（前者非零即短路，不再往下取）：
+// 身份来源按优先级取**三处**（前者非零即短路，不再往下取）：
 //  1. 同进程 ctx 里的 routing identity（`routing.IdentityFrom`）—— 单测 / 直连时有效；
-//     它的值过不了进程边界，所以线上这条通常是空的；
-//  2. kitex metainfo 的 `mesh-user-id`（由 bff 在出向调用前写入 —— 跨进程的身份载体）。
-//     **解析失败即 Unauthorized**：身份头坏了要出声，不许静默降级成匿名；
-//  3. 回落到本次请求 IDL 里的 `user_id`（订单域的请求本就带 user_id，够用作限流主体）；
-//  4. 都没有时按 `"svc"` 分桶（服务级计数）—— 这才是「没带身份」的正当处理：放行 + 服务级计数。
+//     它的值过不了进程边界，所以线上这条通常是空的 → 可信；
+//  2. kitex metainfo 的 `mesh-user-id`（由 bff 在出向调用前写入 —— 跨进程的身份载体）；
+//     **解析失败即 Unauthorized**：身份头坏了要出声，不许静默降级成匿名 → 可信；
+//  3. 回落到本次请求 IDL 里的 `user_id`（订单域的请求本就带 user_id，够用作限流主体）
+//     → **不可信**（这是调用方自己声明的，不是鉴权结果）。
 //
-// 注意 Unauthorized 的语义是「身份**非法**」，不是「没带身份」：没带身份（metainfo
-// 键不存在）走第 3/4 条回落，fail-open。apps 的鉴权口径把传输层身份下沉给 Istio，
-// 故应用侧不因匿名而拒绝（见 Task 3 的 route/route.go 注释）。
-func (s *Server) admit(ctx context.Context, userID int64) error {
-	id := routing.IdentityFrom(ctx) // 同进程内调用时有效（单测 / 直连）
-	if id.UserID == 0 {
-		if v, ok := metainfo.GetValue(ctx, identityMetaKey); ok {
-			n, perr := strconv.ParseUint(v, 10, 64)
-			if perr != nil || n == 0 {
-				return codes.New(codes.Unauthorized,
-					"malformed identity in metainfo key "+identityMetaKey)
-			}
-			id.UserID = n
+// 第三个返回值就是「可信与否」，它决定**归属校验要不要执行**：
+// 只有经鉴权来源得到的主体才拿去和资源比对。若把回落值也当真，越权者只要在
+// 请求里写上被害者的 user_id，归属校验就被自己的入参喂成全真 —— 那种校验
+// 有还不如没有，因为它看起来是防住了。
+//
+// authed=false 且 id 为零（既没身份也没声明）时仍放行并按 "svc" 桶计数，
+// 这一点没变：apps 的鉴权闸门在 **bff**（无凭据 401），srv 侧对「没带身份」
+// 保持 fail-open，只为限流分桶。
+func (s *Server) resolveSubject(ctx context.Context, fallbackUserID int64) (routing.Identity, bool, error) {
+	id := routing.IdentityFrom(ctx)
+	if id.UserID != 0 {
+		return id, true, nil
+	}
+	if v, ok := metainfo.GetValue(ctx, identityMetaKey); ok {
+		n, perr := strconv.ParseUint(v, 10, 64)
+		if perr != nil || n == 0 {
+			return routing.Identity{}, false, codes.New(codes.Unauthorized,
+				"malformed identity in metainfo key "+identityMetaKey)
 		}
+		return routing.Identity{UserID: n}, true, nil
 	}
-	if id.UserID == 0 && userID > 0 {
-		id.UserID = uint64(userID)
+	if fallbackUserID > 0 {
+		return routing.Identity{UserID: uint64(fallbackUserID)}, false, nil
 	}
-	if s.guard.Admit(ctx, id) {
-		return nil
-	}
-	return codes.New(codes.RateLimited, "rate limited")
+	return routing.Identity{}, false, nil
 }
 
 // identityMetaKey bff 透传身份的 kitex metainfo 键名；与 Task 7 的写入侧 MUST 一致。

@@ -48,7 +48,10 @@ metadata:
   name: bff
   namespace: launchx-mesh
 spec:
-  replicas: 1
+  # 双副本（2026-10-10 加固）：bff 是五进程里唯一的入口面，单副本时滚动更新
+  # 与节点维护都会整站断流。配合 60-pdb.yaml 的 minAvailable: 1。
+  # 无状态（凭据在 redis db 2），横向扩容无需任何额外配置。
+  replicas: 2
   selector:
     matchLabels:
       app: bff
@@ -58,6 +61,15 @@ spec:
         app: bff
     spec:
       serviceAccountName: bff # 见头注 3：决定 AuthorizationPolicy 的 principal
+      # Pod 级安全上下文（2026-10-10 加固）：业务容器以 nobody(65534) 运行，
+      # 拒绝 root；seccomp 用运行时默认档案。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: app
           image: launchx-mesh-apps:dev
@@ -67,6 +79,8 @@ spec:
             - name: http
               containerPort: 8081
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: conf
               mountPath: /app/conf/bff.yaml
               subPath: bff.yaml
@@ -78,6 +92,14 @@ spec:
             httpGet: {path: /healthz/ready, port: 8081}
             initialDelaySeconds: 5
             periodSeconds: 5
+          # 容器级安全上下文：只读根文件系统（应用只读 /app/bin 与
+          # ConfigMap 挂载，无写盘需求；临时文件落 /tmp emptyDir）、
+          # 禁止提权、丢弃全部 Linux capabilities。
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: 100m
@@ -86,6 +108,8 @@ spec:
               cpu: 500m
               memory: 384Mi
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: conf
           configMap:
             name: mesh-apps-configs

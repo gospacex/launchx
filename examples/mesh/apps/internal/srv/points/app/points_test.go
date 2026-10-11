@@ -31,14 +31,18 @@ import (
 // fakeRepo 只满足 service 依赖的（未导出）仓储窄接口：用它可以精确制导
 // service 的出错路径，把「可恢复失败」与「确定性失败」分别送到 consumeHandler。
 type fakeRepo struct {
-	addBalanceErr error
+	creditErr error
 }
 
-func (f *fakeRepo) AddBalance(context.Context, uint64, int64) error { return f.addBalanceErr }
+func (f *fakeRepo) CreditOnce(context.Context, uint64, uint64, int64) (bool, error) {
+	if f.creditErr != nil {
+		return false, f.creditErr
+	}
+	return true, nil
+}
 func (f *fakeRepo) Balance(context.Context, uint64) (*model.PointAccount, error) {
 	return nil, nil
 }
-func (f *fakeRepo) AddLog(context.Context, *model.PointsLog) error { return nil }
 
 // nopLogger 内嵌接口 + 覆写 Warn/Error：消费链只在这两条路径上用日志。
 type nopLogger struct{ logx.Logger }
@@ -92,13 +96,13 @@ func mustPayload(t *testing.T, e events.OrderCompleted) []byte {
 // 消费一条合法订单完成事件 → points_log 新增一行（order_id=42）且账户余额增加。
 func TestConsumeLoopPersistsLedger(t *testing.T) {
 	db := newTestDB(t)
-	svc := service.New(repository.New(db, false), false)
+	svc := service.New(repository.New(db, false), nopLogger{}, false)
 
 	c := &fakeConsumer{msgs: []*mqx.Message{{
 		Topic: events.TopicOrderCompleted,
 		Value: mustPayload(t, events.OrderCompleted{OrderID: 42, UserID: 9, TotalAmount: 100}),
 	}}}
-	if err := c.Consume(context.Background(), consumeHandler(svc, nopLogger{})); err != nil {
+	if err := c.Consume(context.Background(), consumeHandler(svc, nopLogger{}, false)); err != nil {
 		t.Fatalf("Consume: %v", err)
 	}
 	if len(c.returned) != 0 {
@@ -131,8 +135,8 @@ func TestConsumeLoopPersistsLedger(t *testing.T) {
 // （不重投，否则无限循环），且库内无新行。
 func TestConsumeBadPayloadNotRetried(t *testing.T) {
 	db := newTestDB(t)
-	svc := service.New(repository.New(db, false), false)
-	h := consumeHandler(svc, nopLogger{})
+	svc := service.New(repository.New(db, false), nopLogger{}, false)
+	h := consumeHandler(svc, nopLogger{}, false)
 
 	err := h(context.Background(), &mqx.Message{Value: []byte(`{}`)})
 	if err != nil {
@@ -153,8 +157,8 @@ func TestConsumeBadPayloadNotRetried(t *testing.T) {
 
 // 非法 JSON 同样跳过（同上）。
 func TestConsumeMalformedJSONNotRetried(t *testing.T) {
-	svc := service.New(repository.New(newTestDB(t), false), false)
-	h := consumeHandler(svc, nopLogger{})
+	svc := service.New(repository.New(newTestDB(t), false), nopLogger{}, false)
+	h := consumeHandler(svc, nopLogger{}, false)
 	if err := h(context.Background(), &mqx.Message{Value: []byte(`not json`)}); err != nil {
 		t.Fatalf("非法 JSON 必须回 nil（不重投），实际 %v", err)
 	}
@@ -166,8 +170,8 @@ func TestConsumeMalformedJSONNotRetried(t *testing.T) {
 // consumeHandler 吞掉（返回 nil）。这类错误重投一万次也是同一个结果，
 // 交给驱动重投即毒丸：永远失败、永远重投，把队列卡死。
 func TestConsumeNonRetryableDropped(t *testing.T) {
-	svc := service.New(&fakeRepo{}, false)
-	h := consumeHandler(svc, nopLogger{})
+	svc := service.New(&fakeRepo{}, nopLogger{}, false)
+	h := consumeHandler(svc, nopLogger{}, false)
 
 	// TotalAmount=0 能过 Unmarshal（order_id 非零），但 service 判为非法。
 	err := h(context.Background(), &mqx.Message{
@@ -180,9 +184,9 @@ func TestConsumeNonRetryableDropped(t *testing.T) {
 
 // 可恢复失败（repo 报 Internal，如 DB 抖动）必须原样外抛，交给驱动按策略重投。
 func TestConsumeRecoverableFailureReturnsError(t *testing.T) {
-	repo := &fakeRepo{addBalanceErr: codes.Wrap(codes.Internal, "add balance", errors.New("db down"))}
-	svc := service.New(repo, false)
-	h := consumeHandler(svc, nopLogger{})
+	repo := &fakeRepo{creditErr: codes.Wrap(codes.Internal, "add balance", errors.New("db down"))}
+	svc := service.New(repo, nopLogger{}, false)
+	h := consumeHandler(svc, nopLogger{}, false)
 
 	err := h(context.Background(), &mqx.Message{
 		Value: mustPayload(t, events.OrderCompleted{OrderID: 42, UserID: 9, TotalAmount: 100}),
@@ -197,11 +201,14 @@ func TestConsumeRecoverableFailureReturnsError(t *testing.T) {
 
 // ---------- 3. span 父子链 ----------
 
-// 消费链的 span 父子链：service.points.ConsumeOrderCompleted →
-// repository.points.AddBalance / repository.points.AddLog。
+// 消费链的 span 父子链：
 //
-// 判据是「每个 repository span 的 Parent() 是 service span」—— 少了这条，
-// 各层各自成根也能通过「名字都在」的检查。
+//	messaging.points.Consume → service.points.ConsumeOrderCompleted →
+//	repository.points.CreditOnce → repository.points.AddLog / AddBalance
+//
+// 判据是「每个子 span 的 Parent() 是上一层」—— 少了这条，各层各自成根也能通过
+// 「名字都在」的检查。根是 **messaging.points.Consume**（2026-10-10 加固补的
+// 消费侧应用 span，替代 SDK 侧缺失的消费 driver span），不再是 service 层。
 func TestConsumeChainSpanParentChild(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
@@ -212,8 +219,8 @@ func TestConsumeChainSpanParentChild(t *testing.T) {
 		_ = tp.Shutdown(context.Background())
 	})
 
-	svc := service.New(repository.New(newTestDB(t), true), true)
-	h := consumeHandler(svc, nopLogger{})
+	svc := service.New(repository.New(newTestDB(t), true), nopLogger{}, true)
+	h := consumeHandler(svc, nopLogger{}, true)
 	if err := h(context.Background(), &mqx.Message{
 		Value: mustPayload(t, events.OrderCompleted{OrderID: 42, UserID: 9, TotalAmount: 100}),
 	}); err != nil {
@@ -227,24 +234,43 @@ func TestConsumeChainSpanParentChild(t *testing.T) {
 		names = append(names, sp.Name())
 	}
 
-	parent, ok := seen["service.points.ConsumeOrderCompleted"]
+	chain := []string{
+		"messaging.points.Consume",
+		"service.points.ConsumeOrderCompleted",
+		"repository.points.CreditOnce",
+		"repository.points.AddLog",
+	}
+	root, ok := seen[chain[0]]
 	if !ok {
-		t.Fatalf("缺少 service.points.ConsumeOrderCompleted，实际=%v", names)
+		t.Fatalf("缺少根 span %q，实际=%v", chain[0], names)
 	}
-	if parent.Parent().IsValid() {
-		t.Fatalf("service span 应为根（无父），实际父=%s", parent.Parent().SpanID())
+	if root.Parent().IsValid() {
+		t.Fatalf("消费侧根 span 不应有父，实际父=%s", root.Parent().SpanID())
 	}
-	for _, childName := range []string{"repository.points.AddBalance", "repository.points.AddLog"} {
-		child, ok := seen[childName]
+	traceID := root.SpanContext().TraceID()
+	for i := 1; i < len(chain); i++ {
+		parent, ok := seen[chain[i-1]]
 		if !ok {
-			t.Fatalf("缺少 %s，实际=%v", childName, names)
+			t.Fatalf("缺少 span %q，实际=%v", chain[i-1], names)
+		}
+		child, ok := seen[chain[i]]
+		if !ok {
+			t.Fatalf("缺少 span %q，实际=%v", chain[i], names)
 		}
 		if got, want := child.Parent().SpanID(), parent.SpanContext().SpanID(); got != want {
-			t.Fatalf("%s 的父 span 应为 service：child.Parent=%s，parent.SpanID=%s（spans=%v）",
-				childName, got, want, names)
+			t.Fatalf("%s 的父 span 应为 %s：child.Parent=%s，parent.SpanID=%s（spans=%v）",
+				chain[i], chain[i-1], got, want, names)
 		}
-		if got, want := child.SpanContext().TraceID(), parent.SpanContext().TraceID(); got != want {
-			t.Fatalf("%s 的 TraceID 应与 service 相同：%s != %s", childName, got, want)
+		if got, want := child.SpanContext().TraceID(), traceID; got != want {
+			t.Fatalf("%s 的 TraceID 应与根相同：%s != %s", chain[i], got, want)
 		}
+	}
+	// AddBalance 的父是 CreditOnce（同一事务里的第二个写语句），仍在同一条链上。
+	bal, ok := seen["repository.points.AddBalance"]
+	if !ok {
+		t.Fatalf("缺少 span repository.points.AddBalance，实际=%v", names)
+	}
+	if got, want := bal.Parent().SpanID(), seen["repository.points.CreditOnce"].SpanContext().SpanID(); got != want {
+		t.Fatalf("AddBalance 的父应为 CreditOnce：child.Parent=%s，want=%s（spans=%v）", got, want, names)
 	}
 }

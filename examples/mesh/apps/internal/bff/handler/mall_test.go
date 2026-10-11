@@ -137,31 +137,37 @@ func call(t *testing.T, ctx context.Context, fn app.HandlerFunc, params map[stri
 // Scenario 的可执行形式。关键在判据的形状：断言的是「对应域的调用数 +1」而不是
 // 「拿到了 200」—— 把 `/product/:id` 误接到 `clients.Order`，HTTP 依然 200
 // （订单域会正常回一个订单），只有按域计数才看得出来。
+//
+// POST /order 一行的 ctx 带身份（UserID=1）且 body 的 user_id 也为 1：
+// createOrder 自 2026-10-10 起要求边界解析出主体（匿名 401）、且 body 的 user_id
+// 必须与主体一致（不符 403）。其余只读路由不带身份也能通（本层不拦读）。
 func TestRoutesReachTheirDomain(t *testing.T) {
 	o, p, pr, s := &fakeOrder{}, &fakePoints{}, &fakeProduct{}, &fakeStock{}
 	h := New(&downstream.Clients{Order: o, Points: p, Product: pr, Stock: s}, false)
 
+	authed := routing.WithIdentity(context.Background(), routing.Identity{UserID: 1})
 	cases := []struct {
 		route  string
 		fn     app.HandlerFunc
+		ctx    context.Context
 		params map[string]string
 		body   string
 		hits   func() int
 		domain string
 	}{
-		{"GET /order/:id", h.getOrder, map[string]string{"id": "2"}, "", func() int { return o.getCalls }, "srv-order"},
-		{"POST /order", h.createOrder, nil,
+		{"GET /order/:id", h.getOrder, context.Background(), map[string]string{"id": "2"}, "", func() int { return o.getCalls }, "srv-order"},
+		{"POST /order", h.createOrder, authed, nil,
 			`{"user_id":1,"items":[{"product_id":1,"name":"n","quantity":1,"unit_price":100}]}`,
 			func() int { return o.createCalls }, "srv-order"},
-		{"GET /points/:user_id", h.getPoints, map[string]string{"user_id": "1"}, "", func() int { return p.calls }, "srv-points"},
-		{"GET /product/:id", h.getProduct, map[string]string{"id": "1"}, "", func() int { return pr.calls }, "srv-product"},
-		{"GET /stock/:product_id", h.getStock, map[string]string{"product_id": "1"}, "", func() int { return s.calls }, "srv-stock"},
+		{"GET /points/:user_id", h.getPoints, context.Background(), map[string]string{"user_id": "1"}, "", func() int { return p.calls }, "srv-points"},
+		{"GET /product/:id", h.getProduct, context.Background(), map[string]string{"id": "1"}, "", func() int { return pr.calls }, "srv-product"},
+		{"GET /stock/:product_id", h.getStock, context.Background(), map[string]string{"product_id": "1"}, "", func() int { return s.calls }, "srv-stock"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.route, func(t *testing.T) {
 			before := tc.hits()
-			status, _ := call(t, context.Background(), tc.fn, tc.params, tc.body)
+			status, _ := call(t, tc.ctx, tc.fn, tc.params, tc.body)
 			if got := tc.hits(); got != before+1 {
 				t.Fatalf("没有打到 %s 的客户端（调用数 %d → %d）—— 该域的业务逻辑无法从入口触达",
 					tc.domain, before, got)
@@ -178,18 +184,22 @@ func TestRoutesReachTheirDomain(t *testing.T) {
 //  1. 归属用户取**边界解析出的身份**而不是请求体（否则客户端改个 user_id 就能
 //     以别人的名义下单）；
 //  2. 身份同时写进出向 metainfo（跨进程唯一载体，四域 srv 的限流按它分桶）。
+//
+// 请求体的 user_id 写成与主体一致（7）：自 2026-10-10 起，body 与主体不符是**显式
+// 403**（见 TestCreateOrderRejectsBodySubjectMismatch），不再是「静默改写」。
+// 这条用例的落点是「身份是权威来源且跨进程传导」，故让二者一致。
 func TestIdentityWinsOverBodyAndCrossesProcess(t *testing.T) {
 	o := &fakeOrder{}
 	h := New(&downstream.Clients{Order: o}, false)
 	ctx := routing.WithIdentity(context.Background(), routing.Identity{UserID: 7})
 
-	const body = `{"user_id":9,"items":[{"product_id":1,"name":"n","quantity":1,"unit_price":100}]}`
+	const body = `{"user_id":7,"items":[{"product_id":1,"name":"n","quantity":1,"unit_price":100}]}`
 	status, _ := call(t, ctx, h.createOrder, nil, body)
 	if status != 200 {
 		t.Fatalf("status=%d，期望 200", status)
 	}
 	if o.lastCreate.GetUserId() != 7 {
-		t.Fatalf("下单归属 user_id = %d，期望 7（请求体的 9 不应压过身份）", o.lastCreate.GetUserId())
+		t.Fatalf("下单归属 user_id = %d，期望 7（取边界身份，不由请求体决定）", o.lastCreate.GetUserId())
 	}
 	v, ok := metainfo.GetValue(o.gotCtx, rpcwire.IdentityMetaKey)
 	if !ok {
@@ -197,6 +207,49 @@ func TestIdentityWinsOverBodyAndCrossesProcess(t *testing.T) {
 	}
 	if v != "7" {
 		t.Fatalf("身份键值 = %q，期望 \"7\"", v)
+	}
+}
+
+// TestCreateOrderRejectsBodySubjectMismatch body 的 user_id 与主体不符 ⇒ **403**，且不触达下游。
+//
+// 2026-10-10 企业级加固：此前是「静默用主体覆盖 body」，隐蔽的问题是越权尝试
+// 不留痕（调用方以为代他人下单成功了，日志里只有一次 200）。改成显式 403。
+func TestCreateOrderRejectsBodySubjectMismatch(t *testing.T) {
+	o := &fakeOrder{}
+	h := New(&downstream.Clients{Order: o}, false)
+	ctx := routing.WithIdentity(context.Background(), routing.Identity{UserID: 7})
+
+	const body = `{"user_id":9,"items":[{"product_id":1,"name":"n","quantity":1,"unit_price":100}]}`
+	status, rb := call(t, ctx, h.createOrder, nil, body)
+	if status != 403 {
+		t.Fatalf("status=%d，期望 403（响应体 %v）", status, rb)
+	}
+	if int32(rb["code"].(float64)) != int32(codes.Forbidden) {
+		t.Fatalf("响应体 code=%v，期望 %d", rb["code"], int32(codes.Forbidden))
+	}
+	if o.createCalls != 0 {
+		t.Fatalf("归属不符时不应触达下游，实际 createCalls=%d", o.createCalls)
+	}
+}
+
+// TestCreateOrderRejectsAnonymous 匿名（ctx 里无主体）下单 ⇒ **401**，且不触达下游。
+//
+// 这是入口鉴权的最后一道本地兜底：identity 中间件本应已拦下匿名请求（见 app/setup.go），
+// 但「中间件没挂上」这类装配错误若不报错、就会静默变成「匿名可下单」，故本层再判一次。
+func TestCreateOrderRejectsAnonymous(t *testing.T) {
+	o := &fakeOrder{}
+	h := New(&downstream.Clients{Order: o}, false)
+
+	const body = `{"user_id":1,"items":[{"product_id":1,"name":"n","quantity":1,"unit_price":100}]}`
+	status, rb := call(t, context.Background(), h.createOrder, nil, body)
+	if status != 401 {
+		t.Fatalf("status=%d，期望 401（响应体 %v）", status, rb)
+	}
+	if int32(rb["code"].(float64)) != int32(codes.Unauthorized) {
+		t.Fatalf("响应体 code=%v，期望 %d", rb["code"], int32(codes.Unauthorized))
+	}
+	if o.createCalls != 0 {
+		t.Fatalf("匿名不应触达下游，实际 createCalls=%d", o.createCalls)
 	}
 }
 
@@ -261,6 +314,7 @@ func TestStatusOfCoversEveryBizCode(t *testing.T) {
 	want := map[codes.Code]int{
 		codes.InvalidArgument: 400,
 		codes.Unauthorized:    401,
+		codes.Forbidden:       403,
 		codes.OrderNotFound:   404,
 		codes.ProductNotFound: 404,
 		codes.StockNotEnough:  409,

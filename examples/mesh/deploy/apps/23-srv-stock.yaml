@@ -63,6 +63,15 @@ spec:
         # 代价是这一口的连接级遥测也一并没有 —— 采集口不需要，可接受。
         traffic.sidecar.istio.io/excludeInboundPorts: "9034"
     spec:
+      # Pod 级安全上下文（2026-10-10 加固）：业务容器以 nobody(65534) 运行，
+      # 拒绝 root；seccomp 用运行时默认档案。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: app
           image: launchx-mesh-apps:dev
@@ -75,9 +84,15 @@ spec:
               containerPort: 9034
           env:
             # conf/<svc>.yaml 的 sqlx dsn 里是 ${HUBX_DB_PW} 占位，由这里注入。
+            # 值走 Secret（05-secret.yaml）：明文 value 会在 describe/CI 日志里回显。
             - name: HUBX_DB_PW
-              value: hubx123
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-apps-db
+                  key: HUBX_DB_PW
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: conf
               mountPath: /app/conf/srv-stock.yaml
               subPath: srv-stock.yaml
@@ -91,6 +106,14 @@ spec:
               port: 9023
             initialDelaySeconds: 5
             periodSeconds: 5
+          # 容器级安全上下文：只读根文件系统（应用只读 /app/bin 与
+          # ConfigMap 挂载，无写盘需求；临时文件落 /tmp emptyDir）、
+          # 禁止提权、丢弃全部 Linux capabilities。
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: 100m
@@ -99,6 +122,8 @@ spec:
               cpu: 500m
               memory: 384Mi
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: conf
           configMap:
             name: mesh-apps-configs

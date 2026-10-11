@@ -10,6 +10,19 @@
 # 术语注意：这里的 Gateway 是 Istio **资源**，不是应用侧 gateway **进程**。
 # apps 组没有 gateway 进程（对照组的 demo-gateway 保留不动，它是
 # 「换形态不改代码」的对照证据）。
+#
+# ⚠️ retries 只挂在**幂等**的 match 上（本轮修掉的一处缺陷）：
+# 此前 retries 挂在 `prefix: /api` 整条 match 上，而这条前缀里混着写路径 ——
+# `POST /api/order` 是下单（见 scripts/route-matrix-apps.txt:21），落库、发
+# outbox、异步触发积分入账。传输层超时重试（perTryTimeout 2s 即再发一次）
+# 会产生**重复落库**：第一次请求可能已经在库里提交，只是响应没赶回来。
+# 这与同一套配置自己的口径直接冲突（10-configmap.yaml:129-133「链路上有非
+# 幂等写，传输层超时重试会产生重复落库」），也与 ACCEPTANCE §13.5 硬规则 1
+# 冲突 —— 该规则要求「重试不双侧开」，判据是 `VirtualService 的 retries 为空`
+# 或 `xmiddleware.rpcx.retry.enabled 为 false`，二者只能居其一；本仓缺省取
+# 后者（应用侧重试关），那么网格侧这一跳要留 retries，就**必须**把它限定在
+# 幂等路径上，否则等于在写路径上单开了重试。
+# 现在按方法拆开：GET（读，幂等）保留 retries；POST（写）与其余方法一概不重试。
 apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
@@ -32,8 +45,25 @@ spec:
   hosts: ["*"]
   gateways: [mesh-apps]
   http:
+    # ---- ① 写路径：POST /api/order（下单）—— **不带 retries** ----
+    # 下单是非幂等写：落库 + outbox + 异步积分入账。Envoy 在 perTryTimeout 到期
+    # 或收到 5xx/connect-failure/reset 时会重发整条请求，第一次落库可能已经成功，
+    # 只是响应没赶回来 ⇒ 重复下单。这条 match 上 retries 必须为空。
     - match:
         - uri: {prefix: /api}
+          method: {exact: POST}
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: bff
+            port: {number: 8081}
+      timeout: 5s
+    # ---- ② 读路径：GET —— 幂等，可以重试 ----
+    # 重试放大风险仅在故障时，读路径重复执行一次没有副作用，故保留原值。
+    - match:
+        - uri: {prefix: /api}
+          method: {exact: GET}
       rewrite:
         uri: /
       route:
@@ -45,6 +75,19 @@ spec:
         attempts: 2
         perTryTimeout: 2s
         retryOn: 5xx,connect-failure,reset
+    # ---- ③ 兜底：其余方法（PUT / DELETE / HEAD / OPTIONS …）----
+    # 只写①②两条的话，非 GET/POST 的方法会因为没有 match 命中而直接 404 ——
+    # 那是一次「为了修重试顺手改了可达性」的回归。这条不带方法约束、也**不带
+    # retries**（拿不准语义的方法一律按非幂等对待，宁可少一次重试）。
+    - match:
+        - uri: {prefix: /api}
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: bff
+            port: {number: 8081}
+      timeout: 5s
 ---
 # outlier detection 只挂在 bff 上：它是唯一被 Envoy 按 L7 观察的目标。
 # 不要给 srv-* 加 DestinationRule —— 那一跳是 tcp_proxy，没有状态码可判，

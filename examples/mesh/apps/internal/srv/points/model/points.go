@@ -21,11 +21,18 @@ func (PointAccount) TableName() string { return "points_account" }
 
 // PointsLog 积分流水表（append-only）。
 //
-// order_id 记录本笔积分的来源订单，是「一条消息加一笔分」的可对账凭据。
+// order_id 记录本笔积分的来源订单，是「一条消息加一笔分」的**幂等键**：
+// 消息中间件是至少一次投递（kafka + mqx 的重投），同一事件被重复消费是常态，
+// 故 order_id 上必须有唯一索引 —— repository.CreditOnce 依赖它把「第二次投递」
+// 变成一次**冲突**（而不是又一笔加分）。没有这个索引，重投会静默多加分，
+// 而账面上看不出任何异常（余额和流水都自洽，只是各多了一笔）。
+//
+// 唯一索引的落点与 points_account.user_id 相同：由 examples/scripts/order_db.sh
+// 幂等补建（表是在那里建的，AutoMigrate 只服务于单测的 sqlite 内存库）。
 type PointsLog struct {
 	ID        uint64    `gorm:"primaryKey;column:id"`
 	UserID    uint64    `gorm:"column:user_id"`
-	OrderID   uint64    `gorm:"column:order_id"`
+	OrderID   uint64    `gorm:"column:order_id;uniqueIndex"`
 	Delta     int64     `gorm:"column:delta"`
 	CreatedAt time.Time `gorm:"column:created_at"`
 }

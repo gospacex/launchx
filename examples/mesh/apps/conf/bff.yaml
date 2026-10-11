@@ -58,11 +58,25 @@ logx:
 # meter 退回 noop：不产生指标、不留采集口，但 Instrument 调用点仍在（不会少埋点）。
 metrics:
   enabled: true
+# 入口鉴权（2026-10-10 企业级加固）：**应用侧自己做**，与 examples/micro 同口径。
+#
+# 曾经这里写着「不设 auth 段，传输层身份下沉给 Istio（RequestAuthentication）」
+# —— 但 examples/mesh 里从来没有 RequestAuthentication 资源（Istio 需要真实
+# issuer + JWKS，本示例没有身份提供方），于是那句话描述的是一个**不存在**的
+# 防护：入口实际无鉴权，匿名可下单、可读任意订单。现在把闸门关在应用侧。
+#
+# 三条失败姿态（与 micro 的判定同源，逐条都有理由）：
+#   - require: false → 放行但 Warn：这是运维决定，留痕即可；
+#   - require: true 而无 auth_token → 装配期报错不起（挂上闸门却人人 401，
+#     比起不来更难查）；
+#   - seed_user_id 为 0 → 同样报错不起（反查拿到 0 会被闸门当匿名拒掉）。
+auth:
+  require: true # 显式声明（缺省也是 true）；置 false 会让六条路由对任何调用方开放
+demo:
+  auth_token: "mesh-demo-token" # 演示令牌；生产里这活属于签发服务（含轮换/吊销）
+  seed_user_id: 1 # 令牌绑定的用户；必须是数据面里**有订单可读**的用户（order 2 属 user 1）
 # 刻意**不设** strict：bff 的硬前提只有凭据缓存，缺了由 app.Setup 显式报错
 # （handles.VerifyOrError(a, "cache")），不靠 strict 兜。
-# 也**不设** auth 段：apps 的传输层身份下沉给 Istio（RequestAuthentication +
-# AuthorizationPolicy），应用侧对匿名请求 fail-open（identity 层只做 best-effort
-# 反查、供下游限流分桶），故这里没有 require 这类开关可配。
 xmiddleware:
   # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
   # 它不是组件：三项都只在客户端选项装配那一刻起作用，故配置面收在 rpcx、

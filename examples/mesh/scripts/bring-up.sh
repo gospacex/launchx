@@ -18,6 +18,10 @@
 #                         覆盖 verify 的入口前缀、路由矩阵（路径|方法|body）与判据服务名
 #                         （默认随 VARIANT 定；矩阵文件在 scripts/route-matrix-<VARIANT>.txt）
 #   PYTHON=<解释器>      指定跑 trace-audit.py 的解释器（默认 python3；需能 import requests）
+#   AUTH_TOKEN=<token>   覆盖 verify 探针携带的 `Authorization: Bearer` 凭据
+#                        （默认随 VARIANT 定：micro=demo-token / apps=mesh-demo-token，
+#                         与各自 conf 的 demo.auth_token 一致 —— 入口鉴权自 2026-10-10
+#                         起强制，探针不带凭据会全线 401，矩阵必然 FAIL）
 #   E2E_REUSE=1          复用现成进程/集群（见根 README）
 #   MESH_DIR / DEPLOY_DIR / NS / JAEGER  覆盖默认路径与地址
 #
@@ -52,6 +56,8 @@ case "$VARIANT" in
     # 对照组保持单路径：它的入口本来就只有 1 条路由，矩阵在它身上只有一行。
     PROBE_ROUTES=('/api/order/2?user_id=1|GET|')
     TRACE_SERVICE="${TRACE_SERVICE:-demo-gateway}"
+    # 对照组 bff 的 auth.require=true（micro/bff/config.yaml），凭据与它一致。
+    AUTH_TOKEN="${AUTH_TOKEN:-demo-token}"
     ;;
   apps)
     IMAGE="${IMAGE:-launchx-mesh-apps:dev}"
@@ -76,9 +82,37 @@ case "$VARIANT" in
       '/api/stock/1|GET|'
     )
     TRACE_SERVICE="${TRACE_SERVICE:-bff}"
+    # 入口鉴权凭据（2026-10-10 起 apps 组强制）：apps/conf/bff.yaml 的 demo.auth_token，
+    # 由 bff 启动期播种成 `mesh:bff:token:<token> → demo.seed_user_id(=1)`。
+    AUTH_TOKEN="${AUTH_TOKEN:-mesh-demo-token}"
     ;;
   *) echo "ERROR: VARIANT 只能是 micro | apps，收到 '$VARIANT'" >&2; exit 2 ;;
 esac
+
+# ——— 对照组（micro）现状守卫 ———
+# 清单已滞后于微服源码（`deploy/micro/10-configmap.yaml` 的 bff 块缺 auth/demo/cachex/四 upstream，
+# 详见 README「两组现状」与 docs/code-review-2026-10-10.md §9.10）。若照常起它，得到的是一个
+# bff 在 `demo.auth_token` 为空时**启动即失败**的 CrashLoopBackOff —— 症状（Pod 未就绪）与
+# "底座没起好"高度相似，最会把一小时耗在错误的排查方向上。
+# 故这里**显式拒绝**真正起它的动作，而不是让它安静地坏掉。
+# 解除条件：`grep -c 'demo.seed_user_id' "${MESH_DIR}/deploy/micro/10-configmap.yaml"` ≥ 1
+#（即 micro 组配置已按五进程重建）；届时删掉本守卫。
+micro_group_broken_note() {
+  cat >&2 <<'MSG'
+  ⚠️  micro 对照组当前不可用：deploy/micro/10-configmap.yaml 的 bff 块滞后于 examples/micro/bff/config.yaml
+      （缺 auth / demo / xmiddleware.cachex / service.upstream.demo-{order,points,product,stock} 共 18 键，
+        并残留已废弃的 service.upstream.demo-srv；拓扑也仍是单 srv 的 3 进程）。
+      它用当前源码重建 bff ⇒ demo.auth_token 为空 ⇒ 启动即失败（examples/micro/bff/app/setup.go:179）。
+      要跑网格请用默认 VARIANT=apps；恢复方案见 README「两组现状」/docs/code-review-2026-10-10.md §9.10。
+MSG
+}
+guard_micro_variant() {
+  [[ "$VARIANT" == "micro" ]] || return 0
+  echo "ERROR: micro 对照组已失效，拒绝执行本动作。" >&2
+  micro_group_broken_note
+  return 3
+}
+
 
 kubectl() { minikube kubectl -- "$@"; }
 
@@ -123,6 +157,11 @@ PY
 cmd_check() {
   echo "== 前置检查 =="
   local rc=0
+  # 对照组（micro）的配置链已失效：把结论前置，别让人对着一个**不可能就绪**的组查底座。
+  if [[ "$VARIANT" == "micro" ]]; then
+    micro_group_broken_note
+    rc=1
+  fi
   for b in minikube istioctl; do
     if command -v "$b" >/dev/null 2>&1; then
       # istioctl version 默认 --remote=true，会去连 istiod；无集群时**挂起**而不是报错，
@@ -189,6 +228,7 @@ cmd_check() {
 }
 
 cmd_image() {
+  guard_micro_variant || exit 3
   need minikube
   export PATH="${GO_BIN_DIR:-/Users/hyx/sdk/go1.24.3/bin}:$PATH"
 
@@ -262,6 +302,7 @@ cmd_install() {
 }
 
 cmd_deploy() {
+  guard_micro_variant || exit 3
   echo "== apply 共用清单（shared/：命名空间 / consul / 宿主中间件门面 / Telemetry）=="
   # 只 apply shared（**不**含 deploy/istio/operator.yaml —— 那是 istioctl install 的入参，
   # 拿 kubectl apply 会触发 istiod 重配，副作用不在本脚本的可控范围内）。
@@ -276,13 +317,14 @@ cmd_deploy() {
 }
 
 cmd_status() {
+  if [[ "$VARIANT" == "micro" ]]; then micro_group_broken_note; fi
   echo "== Pods =="
   kubectl -n "$NS" get pods -o wide
   echo "== Services =="
   kubectl -n "$NS" get svc
 }
 
-# mesh_curl <url> [method] [body] —— 从集群内发起一次请求。
+# mesh_curl <url> [method] [body] [with_auth] —— 从集群内发起一次请求。
 #
 # 为什么不用 `kubectl run --image=curlimages/curl`（原先的写法）：
 # 本机到 Docker Hub 不通（`registry-1.docker.io` 连接超时），该镜像**永远拉不下来**
@@ -290,11 +332,18 @@ cmd_status() {
 # verify 以一个和真实原因毫无关系的 "timed out waiting for the condition" 失败。
 # 改用集群内**已经在跑的** istio-proxy 容器（proxyv2 自带 curl 8.5）：它就在 Pod
 # 网络里，请求天然经过 outbound sidecar，判据 M1/M3 需要的跳数一条不少。
+#
+# with_auth（第 4 参）：默认 1 = 带 `Authorization: Bearer $AUTH_TOKEN`。
+# 入口鉴权自 2026-10-10 起强制（apps 组 identity 层解析不出主体即 401），
+# 正向判据必须带凭据；反向判据（无凭据必须 401）显式传 0。
 mesh_curl() {
-  local url="$1" method="${2:-GET}" body="${3:-}" pod want=""
+  local url="$1" method="${2:-GET}" body="${3:-}" with_auth="${4:-1}" pod want=""
   # 方法/body 只在非 GET 时带 -X；GET 带 body 是 curl 的错误用法，
   # 而 -X GET 又会关掉 curl 对 -d 的自动方法推断，故分两路拼。
   local -a args=(-s -m 20 -w '\nHTTP=%{http_code}\n')
+  if [[ -n "${AUTH_TOKEN}" && "$with_auth" == "1" ]]; then
+    args+=(-H "Authorization: Bearer ${AUTH_TOKEN}")
+  fi
   if [[ "$method" != "GET" ]]; then
     args+=(-X "$method")
     [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
@@ -318,7 +367,28 @@ mesh_curl() {
 }
 
 cmd_verify() {
-  echo "== 逐路由打请求（${VARIANT} 组，共 ${#PROBE_ROUTES[@]} 条）=="
+  guard_micro_variant || exit 3
+  # ---- 反向断言（先判，失败即退，不进矩阵）----
+  #
+  # 「带对凭据能通」是**正向**判据，一个把鉴权装上去却始终放行的实现照样能过
+  # （中间件没挂上、或 `Engine.Use` 晚于路由注册 —— 后者在 hertz 里完全无声）。
+  # 鉴权必须有「没凭据会被挡」的反向断言，否则上线就是裸奔而门禁还是绿的。
+  # 与 micro/scripts/auth-probe.sh 同一纪律，这里做最小版本（打 /ping，它不豁免鉴权）。
+  if [[ -n "${AUTH_TOKEN}" ]]; then
+    echo "== 反向断言：无凭据请求必须被入口闸门挡下（401）=="
+    local noauth
+    noauth="$(mesh_curl "${PROBE_BASE}/api/ping" GET "" 0 | sed -n 's/^HTTP=//p')"
+    if [[ "$noauth" != "401" ]]; then
+      echo "  ✗ 无凭据返回 ${noauth}，期望 401 —— 入口鉴权没生效（identity 中间件未挂上，" >&2
+      echo "    或 Engine.Use 晚于路由注册）。修好再跑矩阵，否则整轮 200 都是裸奔。" >&2
+      exit 1
+    fi
+    echo "  ✓ 无凭据 → 401"
+  else
+    echo "== 反向断言：跳过（AUTH_TOKEN 为空，本变体未开入口鉴权）=="
+  fi
+
+  echo "== 逐路由打请求（${VARIANT} 组，共 ${#PROBE_ROUTES[@]} 条；带 Authorization: Bearer 凭据）=="
   local line path method body prev_path=""
   for line in "${PROBE_ROUTES[@]}"; do
     IFS='|' read -r path method body <<<"$line"
@@ -349,9 +419,13 @@ cmd_verify() {
   # 该 trace 内出现**目标域**的 service.<域>.* span —— 挡住「六条路由全接到
   # order 域」这类接线错误。判据的来龙去脉见 docs/verify.md §T13。
   # 矩阵文件按变体落盘，与上面的 PROBE_ROUTES 逐条对应。
+  #
+  # 退出码就是结论（2026-10-10 加固）：**不得**吞掉这里的非零退出码。此前尾部挂了
+  # `|| true`，使 trace-audit 判 FAIL 时 cmd_verify 仍返回 0，`bring-up.sh verify`
+  # 全绿 —— 判据等于没接。`set -e` 下这一个尾部命令的退出码即本子命令的退出码。
   "${PYTHON:-python3}" "${LAUNCHX_ROOT}/examples/scripts/trace-audit.py" \
     --base "$JAEGER" --service "$TRACE_SERVICE" --lookback 3m --mesh \
-    --route-matrix "${MESH_DIR}/scripts/route-matrix-${VARIANT}.txt" || true
+    --route-matrix "${MESH_DIR}/scripts/route-matrix-${VARIANT}.txt"
 }
 
 cmd_down() {

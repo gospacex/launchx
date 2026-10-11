@@ -4,10 +4,13 @@
 //
 // 这条链，并把 kitex 服务端回存给 launchx 启动与停止。
 //
-// 与 examples/micro/srv-order/app/setup.go 的装配差异只有三处：
+// 与 examples/micro/srv-order/app/setup.go 的装配差异只剩两处：
 //  1. 不注册/不发现（没有 xmiddleware.coordx 段，launchx 也不会去注册）；
-//  2. 句柄自检用 pkg/handles（micro 用的是自己的 pkg/handlecheck）；
-//  3. 没有 outbox Runner（本例不带 outbox 表，投递失败只告警）。
+//  2. 句柄自检用 pkg/handles（micro 用的是自己的 pkg/handlecheck）。
+//
+// 2026-10-10 起同样装配 outbox Runner（此前第三条差异「不带 outbox 表」
+// 是投递可靠性的已知缺口，已在企业级加固中补齐：事件与业务行同事务落库，
+// Runner 后台补发，语义与 examples/pkg/outbox 包注释一致）。
 package app
 
 import (
@@ -28,6 +31,7 @@ import (
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/handles"
 	orderrpc "github.com/gospacex/launchx/examples/mesh/apps/pkg/kitex_gen/order/order"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/rpcwire"
+	"github.com/gospacex/launchx/examples/pkg/outbox"
 )
 
 // Setup 注册给 App.OnSetup。
@@ -70,12 +74,23 @@ func Setup(a *launchx.App) error {
 			logx.String("joins_trace", strconv.FormatBool(c.Observed)), logx.String("probe", c.Probe))
 	}
 
-	// ---- 3. 分层装配：自下而上 ----
+	// ---- 3. outbox 补发器（先于分层装配，与 micro 同序）----
+	// MQ 生产者经 App.MQ() 取；未装配或降级为 nil 时 Runner 显式 Error 而不是
+	// 静默跳过 —— 那种情况下下单仍在写 status=0 的事件却无人投递，表会无声膨胀。
+	runner := outbox.NewRunner(db, a.MQ(), logger, outbox.Config{
+		TraceOn: cfg.GetBool("trace.on.mq"),
+	})
+	runner.Start()
+	// 退出链：业务回调先于组件停止（此时 DB/MQ 仍可用，本轮补发能收尾）。
+	a.OnStop(func() error { runner.Stop(); return nil })
+
+	// ---- 4. 分层装配：自下而上 ----
+	// service 不再收 MQ 句柄：事件经 outbox 表投递（见 service 包注释）。
 	repo := repository.New(db, traceOn)
-	svc := service.New(repo, a.Cache()[name], a.Lock(), a.MQ(), logger, traceOn)
+	svc := service.New(repo, a.Cache()[name], a.Lock(), logger, traceOn)
 	guard := route.New(middleware.New(a.KV()[name], logger), logger)
 
-	// ---- 4. 建服务端并回存 ----
+	// ---- 5. 建服务端并回存 ----
 	// 身份闸门已移进 rpc/ 层（连同 401/429 两个拒绝码）：rpc/ 实现 order.Order
 	// 全部方法，并在委派 handler 前走 route.Guard。这里只把适配层交给生成的
 	// NewServer —— kitex 按接口签名约束入参，少一个方法编译期即失败。

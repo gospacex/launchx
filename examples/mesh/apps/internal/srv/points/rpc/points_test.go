@@ -5,7 +5,8 @@
 //  2. 闸门放行 → 委派 handler（业务真的走通，读到账户）；
 //  3. 闸门拒绝（超出该主体的窗口上限）→ RateLimited，且不触碰业务；
 //  4. 身份非法（metainfo 写坏）→ Unauthorized，且不触碰业务；
-//  5. 未接线方法（Earn/Consume/ListLedgers/Report）rpc 层只开 span 后委派
+//  5. 越权（主体可信但账户非其所有）→ Forbidden（IDOR 防护，2026-10-10 加固）；
+//  6. 未接线方法（Earn/Consume/ListLedgers/Report）rpc 层只开 span 后委派
 //     handler，由 handler 回显 codes.Unimplemented（Unimplemented 的唯一落点在 handler）。
 //
 // 另断言四层埋点：rpc.points.GetAccount → handler.points.GetAccount →
@@ -48,13 +49,17 @@ type nopLogger struct{ logx.Logger }
 func (nopLogger) Warn(string, ...logx.Field) {}
 
 // fakeRepo 结构性满足 service 依赖的（未导出）仓储窄接口。
+//
+// 写方法只有 CreditOnce（幂等 + 事务收口在仓储内），假件跟着收窄。
 type fakeRepo struct {
 	balResult *model.PointAccount
 	balErr    error
 	balCalls  int
 }
 
-func (f *fakeRepo) AddBalance(context.Context, uint64, int64) error { return nil }
+func (f *fakeRepo) CreditOnce(context.Context, uint64, uint64, int64) (bool, error) {
+	return true, nil
+}
 func (f *fakeRepo) Balance(context.Context, uint64) (*model.PointAccount, error) {
 	f.balCalls++
 	if f.balErr != nil {
@@ -62,7 +67,6 @@ func (f *fakeRepo) Balance(context.Context, uint64) (*model.PointAccount, error)
 	}
 	return f.balResult, nil
 }
-func (f *fakeRepo) AddLog(context.Context, *model.PointsLog) error { return nil }
 
 // recStore 记录限流计数键：本域 GetAccount 读路径经闸门**真实**计数
 // （route.Admit 走 limiter.Allow），recStore 记下计数键以钉住主体口径
@@ -89,7 +93,7 @@ func (denyStore) Set(context.Context, string, string, time.Duration) error {
 // newServer 组装入向适配层：nil store → 闸门 fail-open 放行。
 func newServer(repo *fakeRepo, traceOn bool) *Server {
 	g := route.New(middleware.New(nil, nopLogger{}), nopLogger{})
-	svc := service.New(repo, traceOn)
+	svc := service.New(repo, nopLogger{}, traceOn)
 	return New(handler.New(svc, traceOn), g, traceOn)
 }
 
@@ -114,7 +118,7 @@ func TestGetAccountDelegatesWhenAdmitted(t *testing.T) {
 func TestGetAccountRejectedReturnsRateLimited(t *testing.T) {
 	repo := &fakeRepo{balResult: &model.PointAccount{UserID: 42, Balance: 250}}
 	g := route.New(middleware.New(denyStore{}, nopLogger{}), nopLogger{})
-	svc := service.New(repo, false)
+	svc := service.New(repo, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	resp, err := s.GetAccount(context.Background(), &pointspb.GetAccountReq{UserId: 42})
@@ -126,6 +130,39 @@ func TestGetAccountRejectedReturnsRateLimited(t *testing.T) {
 	}
 	if repo.balCalls != 0 {
 		t.Fatal("被拒不得触碰业务（repo 不应被调用）")
+	}
+}
+
+// 越权（IDOR）：主体可信，但请求的账户不属于该主体 → Forbidden，且不返回响应体。
+//
+// 这是「主体来自 metainfo / 同进程 ctx」与「来自请求字段回落」两条路径的分水岭：
+// 只有前者才触发归属校验（回落值不可信，拿它比等于让调用方自己判自己）。
+func TestGetAccountRejectsForeignAccount(t *testing.T) {
+	repo := &fakeRepo{balResult: &model.PointAccount{UserID: 42, Balance: 250}}
+	s := newServer(repo, false)
+
+	ctx := metainfo.WithValue(context.Background(), identityMetaKey, "7")
+	resp, err := s.GetAccount(ctx, &pointspb.GetAccountReq{UserId: 42})
+	if resp != nil {
+		t.Fatalf("越权不应返回响应体，实际 %+v", resp)
+	}
+	if c, _ := codes.From(err); c != codes.Forbidden {
+		t.Fatalf("越权应回 Forbidden，实际 %v (err=%v)", c, err)
+	}
+}
+
+// 匿名（无身份、仅请求字段有 user_id）不做归属校验：这一档是 fail-open，
+// 由 bff 的入口闸门负责拦（见 routing.WithRequiredIdentity）。
+func TestGetAccountAnonymousSkipsOwnership(t *testing.T) {
+	repo := &fakeRepo{balResult: &model.PointAccount{UserID: 42, Balance: 250}}
+	s := newServer(repo, false)
+
+	resp, err := s.GetAccount(context.Background(), &pointspb.GetAccountReq{UserId: 42})
+	if err != nil {
+		t.Fatalf("匿名请求按 fail-open 放行，实际 err=%v", err)
+	}
+	if resp == nil || resp.Account == nil || resp.Account.Balance != 250 {
+		t.Fatalf("resp = %+v", resp)
 	}
 }
 
@@ -182,7 +219,7 @@ func TestGetAccountAdmitsMetainfoIdentity(t *testing.T) {
 	st := &recStore{}
 	repo := &fakeRepo{balResult: &model.PointAccount{UserID: 7, Balance: 1}}
 	g := route.New(middleware.New(st, nopLogger{}), nopLogger{})
-	svc := service.New(repo, false)
+	svc := service.New(repo, nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	ctx := metainfo.WithValue(context.Background(), identityMetaKey, "7")
@@ -263,7 +300,7 @@ func TestTraceOffEmitsNoLayerSpans(t *testing.T) {
 
 	g := route.New(middleware.New(nil, nopLogger{}), nopLogger{})
 	db := newRpcTestDB(t)
-	svc := service.New(repository.New(db, false), false)
+	svc := service.New(repository.New(db, false), nopLogger{}, false)
 	s := New(handler.New(svc, false), g, false)
 
 	if _, err := s.GetAccount(context.Background(), &pointspb.GetAccountReq{UserId: 9}); err != nil {
@@ -373,6 +410,6 @@ func newRpcTestDB(t *testing.T) *gorm.DB {
 func newServerWithRepo(t *testing.T, db *gorm.DB) *Server {
 	t.Helper()
 	g := route.New(middleware.New(nil, nopLogger{}), nopLogger{})
-	svc := service.New(repository.New(db, true), true)
+	svc := service.New(repository.New(db, true), nopLogger{}, true)
 	return New(handler.New(svc, true), g, true)
 }

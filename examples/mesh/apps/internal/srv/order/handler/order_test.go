@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/gospacex/logx"
@@ -25,14 +24,20 @@ type fakeRepo struct {
 	createdIts []model.OrderItem
 	items      []model.OrderItem
 	findErr    error
+
+	// 读路径调用计数：CreateOrder **不该**碰它们（见 TestCreateOrderDoesNotReadBack）。
+	findCalls  int
+	itemsCalls int
 }
 
-func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.OrderItem) error {
+func (f *fakeRepo) Create(_ context.Context, o *model.Order, items []model.OrderItem,
+	_ func(orderID uint64) (payload, traceparent string)) error {
 	o.ID = 777
 	f.created, f.createdIts = o, items
 	return nil
 }
 func (f *fakeRepo) FindByID(context.Context, uint64) (*model.Order, error) {
+	f.findCalls++
 	if f.findErr != nil {
 		return nil, f.findErr
 	}
@@ -42,12 +47,13 @@ func (f *fakeRepo) FindByID(context.Context, uint64) (*model.Order, error) {
 	return f.created, nil
 }
 func (f *fakeRepo) ItemsByOrderID(context.Context, uint64) ([]model.OrderItem, error) {
+	f.itemsCalls++
 	return f.items, nil
 }
 func (f *fakeRepo) UpdateStatus(context.Context, uint64, string, string) error { return nil }
 
 func newHandler(repo *fakeRepo, traceOn bool) *OrderHandler {
-	return New(service.New(repo, nil, nil, nil, nopLogger{}, traceOn), traceOn)
+	return New(service.New(repo, nil, nil, nopLogger{}, traceOn), traceOn)
 }
 
 // CreateOrder：RPC 结构 → service 入参的转换（多明细 + 总额由 service 计算）。
@@ -115,21 +121,26 @@ func TestCreateOrderNilReqIsInvalidArgument(t *testing.T) {
 	}
 }
 
-// CreateOrder 落库成功但回读失败 → 错误上抛（不返回半成品响应）。
-func TestCreateOrderPropagatesReadBackFailure(t *testing.T) {
-	repo := &fakeRepo{findErr: errors.New("read back failed")}
+// CreateOrder 不再回读订单：handler 直接用 service 交出的结果拼响应，
+// FindByID / ItemsByOrderID 一次都不该被调到（2026-10-10 code review §5.8）。
+//
+// 这条判据是可执行的**反向**断言：修复前的形态（创建成功后调 svc.GetOrder(id)
+// 填响应）会让 findCalls=1；更糟的是"回读失败"能把一次已经落库成功的下单
+// 变成 500 —— 那种失败是自找的，因为它读的正是自己刚写的那行。
+func TestCreateOrderDoesNotReadBack(t *testing.T) {
+	repo := &fakeRepo{}
 	h := newHandler(repo, false)
 	resp, err := h.CreateOrder(context.Background(), &orderpb.CreateOrderReq{
 		UserId: 1, Items: []*orderpb.OrderItem{{ProductId: 1, Name: "a", Quantity: 1, UnitPrice: 1}},
 	})
-	if err == nil {
-		t.Fatal("回读失败应报错")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
 	}
-	if resp != nil {
-		t.Fatalf("回读失败不应返回响应体，实际 %+v", resp)
+	if resp == nil || resp.OrderId != 777 || resp.TotalAmount != 1 {
+		t.Fatalf("resp = %+v", resp)
 	}
-	if c, _ := codes.From(err); c != codes.Internal {
-		t.Fatalf("回读失败应回 Internal，实际 %v (err=%v)", c, err)
+	if repo.findCalls != 0 || repo.itemsCalls != 0 {
+		t.Fatalf("CreateOrder 不得回读订单：FindByID=%d ItemsByOrderID=%d", repo.findCalls, repo.itemsCalls)
 	}
 }
 
