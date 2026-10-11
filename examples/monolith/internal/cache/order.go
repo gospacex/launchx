@@ -38,6 +38,12 @@ func NewOrder(inst cachex.Cache, ttl time.Duration, traceOn bool) *Order {
 // key 订单缓存键。集中一处，避免读写两侧拼法不一致导致「写了读不到」。
 func key(orderNo string) string { return "order:" + orderNo }
 
+// TTL 正缓存的存活时间（构造时给定）。
+//
+// 装配层把 TTL 交给本层之后，service 就不该再有第二个 TTL 来源 —— 否则
+// "改了配置却只有一半缓存跟着变"。读策略层（cacheutil）要正缓存 TTL 时从这里取。
+func (c *Order) TTL() time.Duration { return c.ttl }
+
 // begin 开本层 span（名字沿用既有的两段式 cache.<Op>，不走三段式，
 // 改名会打断既有 trace 判据），返回「收 error 再收尾」的闭包。
 func (c *Order) begin(ctx context.Context, op string) (context.Context, layer.End) {
@@ -70,6 +76,25 @@ func (c *Order) Set(ctx context.Context, orderNo, payload string) (err error) {
 	)
 
 	if err = c.inst.Set(ctx, key(orderNo), payload, c.ttl); err != nil {
+		err = fmt.Errorf("cache: set order %q: %w", orderNo, err)
+	}
+	return err
+}
+
+// SetTTL 按指定 TTL 写订单缓存（c.ttl 是正缓存的默认存活时间，这里允许覆盖）。
+//
+// 存在原因：空值哨兵（负缓存）必须与正缓存用**不同的** TTL —— 它的价值窗口是
+// "抗住一波穿透"，代价窗口是"记录创建后最长这么久仍查不到"，两者都要求它比正
+// 缓存短得多。共用 c.ttl 会让一次不存在的查询把"查不到"记上默认那么久。
+func (c *Order) SetTTL(ctx context.Context, orderNo, payload string, ttl time.Duration) (err error) {
+	ctx, end := c.begin(ctx, "SetOrder")
+	defer func() { end(err) }()
+	layer.Attrs(ctx,
+		attribute.String("cache.key", key(orderNo)),
+		attribute.Int("cache.ttl_ms", int(ttl.Milliseconds())),
+	)
+
+	if err = c.inst.Set(ctx, key(orderNo), payload, ttl); err != nil {
 		err = fmt.Errorf("cache: set order %q: %w", orderNo, err)
 	}
 	return err
