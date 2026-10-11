@@ -321,7 +321,8 @@
 | `gofmt -l .` | 空 |
 | `go build ./...` | OK |
 | `go vet ./...` | OK |
-| `go test . ./internal/... ./examples/pkg/...` | 全 ok |
+| `go test . ./internal/... ./examples/pkg/...` | 全 ok（含本轮新增 `examples/pkg/cacheutil`） |
+| `go test ./examples/mall/srv-points/...` | 全 ok（消费端 11 组） |
 | `examples/mesh/apps`（独立 module）build+vet+test | 全 ok |
 | `bash examples/scripts/ci.sh` | **门禁 PASS** |
 
@@ -356,9 +357,9 @@
 | 条目 | 状态 | 理由 / 需要作者决定的点 |
 |---|---|---|
 | **mesh apps 的同源下单幂等** | ✅ 已补齐（见 10.8） | 原判断「没有幂等键生成点、补它等于新增能力」**不成立** —— 复核发现更糟的事实：订单号是 service 层现编的 `M%s%06d`（时间戳 + `userID%1000000`），**同一用户同一秒下两单必然撞号**。现已按 micro/mall 同形补齐：入口生成键 → pb 透传 → 订单域事务内查重（含 outbox 事件不重插） |
-| mall 异步消费端 | ❌ | 需 kafka 真机才能验收；已把注释改成「当前只有生产端」而不是假装存在消费方 |
-| `pipeline.Shutdown` 零调用 | ❌ | 与 `App.Close` 是两份退出链。建议二选一（删掉 / 让 `Close` 把七步包成 `[]Step` 交给它），属结构性改动，本轮不动 |
-| 缓存穿透回填空值哨兵 | ❌ | 8 处（micro/mall 各四域），需先统一各域 cache 封装再改，否则会抄出八份不同的哨兵 |
+| mall 异步消费端 | ✅ 已补齐（见 10.9） | 原判断「需 kafka 真机才能验收，先只改注释」只对了一半：注释如实化是对的，但消费端本身可以落成**传输无关**的逻辑 + 注入替身的判据，真机验收只是最后一步。现已补 `order.completed.v1 → 送积分`，其余三个事件仍只有生产端（并在注释里逐个标明） |
+| `pipeline.Shutdown` 零调用 | ✅ 已收敛（见 10.10） | 采纳「让 `Close` 把七步包成 `[]Step` 交给它」：骨架（事件记录 / 幂等 / 错误聚合）只剩一份，各环差异（有界等待 / 15s 冲刷 / logger 吞错）留在 `Step.Fn` 里 |
+| 缓存穿透回填空值哨兵 | ✅ 已统一（见 10.11） | 先抽共享封装 `examples/pkg/cacheutil`（含空值哨兵），8 处全部改走它；顺带补上「Create 后失效」—— 没有它，负缓存会让新建记录在窗口内查不到 |
 | monolith 写接口鉴权 | ✅ 已落成（方式与第 9 章建议不同，见 10.7） | 复核时先发现一件更糟的事：`repository/order.go` 与 `service/order.go` 的注释都写着「该路径已被 RegisterRoutes 限制为只能绑回环地址（见 app/routes.go 的 loopbackOnly）」，而全仓 grep `loopbackOnly` **零命中** —— 注释虚构了一条安全约束。现已补成真判据 |
 | `micro/srv/` 冻结目录 | ✅ 裁定：维持冻结 + 上判据 | 删了就失去「拆分前 vs 拆分后」的对照证据；统一到 `srv-*` 也没有净收益。冻结语义落成 `frozen_test.go` 两条判据（声明被删会红 / 进部署清单会红），不再是口头约定 |
 | monolith 旧 DDL 与真源漂移 | ✅ 裁定：撤下（误列） | 复核后不成立：`bring-up.sh` 只建 3 表是因为 monolith 的业务面就只有 orders / order_items / users（无 outbox、无 stock/points/product），而 `order_db.sh` 的 10 表是给 micro/mall 四域用的 —— 两者不是同一张库的两个版本。且 monolith 的 `orders` 已带 `uk_orders_order_no`，与幂等口径一致 |
@@ -389,6 +390,13 @@
 | mesh pb 幂等键序列化 | `OrderNo` 的 tag 改 `protobuf:"-"` | FAIL（往返丢字段） |
 | mesh bff 是否真传了键 | 整行注释掉 `OrderNo: orderNo,` | FAIL（逐行判据红 —— 用 `strings.Contains` 会命中注释、假绿） |
 | mesh 单号是否带随机段 | 去掉随机段（只留时间戳） | FAIL（2000 次生成出现重复） |
+| 退出链走 `pipeline.Shutdown` | 换成等价但不加 `pipeline step` 前缀的内联实现 | FAIL（判据依赖的前缀消失） |
+| micro 不引用 mesh | 往 `micro/srv-order/.../repository` 加一个真 import mesh 的文件 | FAIL（真红后还原） |
+| 八处读缓存都走 `cacheutil` | 把 points 域改回 `cacheutil.FetchProbe(` | FAIL（静态判据点名该文件） |
+| 空值哨兵真的回填 | 删掉 `Fetch` 里的空值回填那一行 | FAIL（`TestFetchFillsNegativeOnNotFound` + `TestFetchNegativeHitKeepsNoCause`） |
+| 坏消息是丢弃而非重投 | 丢弃分支 `return nil` 改 `return errors.New(why)` | FAIL（7 个子用例全红） |
+| 消费循环停止有界 | `Stop` 超时分支后加 `select {}` | FAIL（用例挂住 2s 后报「又变回无界了」） |
+| 订阅侧消费组显式命名 | `group_id: srv-points` 改成 `mqx-group` | FAIL（判据认得缺省值） |
 
 ### 10.5 判据连锁反应（修判据不是终点）
 
@@ -453,3 +461,67 @@ OrderNo: fmt.Sprintf("M%s%06d", time.Now().Format("20060102150405"), in.UserID%1
 **出参类型放 `model` 而不是 `repository`**：service 用窄接口面向 repository 编程（不 import 它），而接口方法签名要求返回类型完全相同，故 `model.CreateOutput` 必须是两边都认的共享类型。
 
 **判据四组**（pb 往返 / `resolveOrderNo` 取舍 / 仓储 sqlite 重放 + 反向语义"不同号各落一单" / bff 静态判据逐行匹配），全部经反向探针验证真红后还原。
+
+### 10.9 mall 异步消费端：第一个真消费方
+
+`order.completed.v1 → 送积分` 现在有消费端了（`srv-points/internal/consumer`）。落点三层：
+
+1. **Handler（传输无关）**：`Handle(ctx, *mqx.Message) error` —— 解析事件 → 调 `PointsWriter.Earn` → 按结果分类计数（processed / skipped / failed）。注入替身即可单测，不需要 kafka。
+2. **Runner（启停）**：把 mqx 传输与 Handler 接起来，`Stop` **有界**（超时放弃 + Warn）—— kafka-go 的 `ConsumerGroup.Close` 会卡在 joinGroup 的网络读上且不设读 deadline，无界等待会让进程拖到优雅期耗尽被 SIGKILL。
+3. **配置**：订阅侧单起 mqx 实例 `srv-points-order-in`。
+
+**为什么订阅侧不能用 `a.MQConsumer()`**：框架按 `service.name` 装配的那个实例，producer 与 consumer **共用 `consumer.topic` 一个键**（mqx 现状：producer 的目标 topic 就读它）。该实例的 topic 是发送侧的 `points.changed.v1`，拿它去收 `order.completed.v1` 会两头都不对。故另起实例 + 业务侧自建句柄，代价是拿不到框架统一的降级文案 —— 已在装配处补了带后果的 Warn。
+
+**坏消息一律丢弃，不返回 error**：解析不出来的消息每次重投都失败，会让整个分区堵在一条坏消息上（head-of-line blocking），后面成千上万条好消息跟着不处理。没有 DLQ 时的取舍是"丢一条可对账补偿的积分，也不让队列停摆"，故丢弃时打 Error 级日志并计数。同理，schema_ver 高于当前支持版本也丢弃（消费者落后于生产者时，返回 error 等于让分区卡在自己读不懂的消息上）。
+
+**幂等交给下游，消费端不自己记第二份**：重投时照旧调 `Earn`，由 `uk_ledger_order_no_type` 唯一键裁决，命中 `CodePointsDuplicated` 视作**成功**（否则"正常重投"会在计数上冒充故障）。自己再存一份"处理过的 OrderNo"等于把同一事实存两处，两处迟早不一致。
+
+判据 11 组（正常入账 / 7 类坏消息丢弃 / 暂时失败可重试 / 业务拒绝丢弃 / 幂等命中算成功 / 重投不重复加钱 / Runner 接线 / 停止有界 / 正常退出 / nil 降级 / 配置里 `group_id` 非缺省值），三组反向探针见 10.4。
+
+**仍未补的**：`product.created.v1` / `stock.reserved.v1` / `points.changed.v1` 三个事件只有生产端 —— 事件包注释已逐个标明"已交付"与"设计意图"，不再一律写成「→ X 消费」。
+
+### 10.10 退出链收敛：骨架只剩一份
+
+`App.Close` 原本自己实现了「反序 + 事件记录 + 幂等 + 错误聚合」，而 `internal/pipeline.Shutdown` 做的是同一件事 —— 后者**零调用**，是死代码。死代码比重复代码更危险：它看起来像被维护着，改它的人会以为退出链跟着改了。
+
+改法是采纳报告的建议二：`Close` 只负责**编排步骤**，执行交给 `pipeline.Shutdown`：
+
+```go
+return pipeline.Shutdown(a.env(), []pipeline.Step{
+    stopHooks, stopServer, stopMetricsListener, stopComponents,
+    deregister, flushTracing, flushMetrics, closeLogger,
+})
+```
+
+各环**差异**留在 `Step.Fn` 里，它们不是骨架该管的：
+
+- 业务 / 服务端 / 采集口 / 组件四环额外套有界等待（`runStop`），超时只记 `stop.timeout.<name>` 不进聚合；
+- tracing 环有独立的 15s 冲刷上限（批量导出器缓冲未冲刷会静默丢掉"停机过程本身"那批 span —— 恰好是最该被看见的）；
+- logger 环刻意吞错：它是记录前面所有失败的唯一手段，不能被自己关掉。
+
+新增常量 `pipeline.StepMetricsListener`（采集口那一环此前只执行不记事件，顺序契约因此缺一环）。判据取**运行时**证据而非 grep：`Shutdown` 给每步错误加 `pipeline step %q` 前缀，断言它存在即证明真走了那份代码；同一条用例顺带钉住完整顺序契约（此前只验了 `server.stop` 与 `deregister` 的先后两条，中间漏掉 `metrics.listener` / `component.stop` 都能溜过去）。
+
+### 10.11 缓存穿透：先统一封装，再补空值哨兵
+
+原判断「8 处各写一份，改一处要改八遍，会抄出八份不同的哨兵」—— 所以**先抽共享封装**再做语义修正，顺序反了就是八份复制。
+
+新增 `examples/pkg/cacheutil`（与 outbox 同层，三示例共用），`Fetch[T]` 收口整条链路：
+
+| 情形 | 行为 |
+|---|---|
+| 命中正缓存 | 返回，记 `cache.hit` |
+| 命中空值哨兵 | 返回 `*NotFound`（**不回源**），记 `cache.hit` + `cache.negative` |
+| miss 且回源报 not found | 回填**空值哨兵**（MissTTL，默认 30s）后返回 `*NotFound` |
+| 回源报其他错 | 原样上抛，**不写任何缓存** |
+| 回填失败 / 解码失败 | 只告警（缓存是加速路径，不是数据源） |
+| 缓存组件为 nil | 退化为直接回源（合法部署形态） |
+
+`*NotFound` 包住回源原始错误并 `Unwrap`，因此各域的 `mapRepoErr` / `codes.Wrap` 靠 `errors.Is(err, repository.ErrNotFound)` 照样认得出 —— 命中负缓存与回源 miss 走同一条翻译路径，不会给出两种错误码。
+
+**必须配套的第二步：Create 路径失效**。负缓存的固有代价是"记录创建后最长 MissTTL 内仍查不到"。四域里 stock（首次预占）与 points（首次入账）的写路径已经失效，缺的是 **product 与 order 的 Create** —— 已补 `s.invalidate(...)`。不补的话，"查过一次不存在的 ID → 该 ID 随后被创建"会让新记录在窗口内查不到，等于用修穿透换来了另一个更难查的 bug。
+
+**回源故障绝不能写成空值哨兵**：那会让一次抖动变成"最长 MissTTL 内该键查不到"，且没有任何错误日志，数据看起来凭空消失。这条单独有用例钉住。
+
+判据三层：包内 9 组单测（含上面每一条语义）+ 静态判据 `TestEightReadPathsUseFetch`（逐域枚举，匹配 `:= cacheutil.Fetch(` —— 用 `cacheutil.Fetch` 会命中注释、假绿）+ `TestCreatePathsInvalidate`。
+
+**未纳入**：monolith 与 mesh apps 各有一处读缓存，但它们的 `Set` 签名与本封装修的接口不同（两侧缓存抽象不一致），合并要连带改这两个示例的缓存层，超出本轮范围 —— 已在 10.3 注明。
