@@ -32,6 +32,13 @@ import (
 // serverShutdownTimeout 优雅停机排空 in-flight 请求的上限。
 const serverShutdownTimeout = 5 * time.Second
 
+// tracingFlushTimeout 退出链里冲刷 tracer 的上限。
+//
+// 为什么不复用 defaultStopTimeout（5s）：批量导出器的缓冲未冲刷会**静默**丢掉
+// 最后一批 span —— 而那批 span 恰好是「停机过程本身」最该被看见的部分（谁卡住
+// 了、哪一环超时）。给它单独一个更宽的上限，是承认「这 15s 花得值」。
+const tracingFlushTimeout = 15 * time.Second
+
 // defaultStopTimeout 退出链**每一环**的等待上限。
 //
 // 为什么必须有：退出链上任何一环卡住，进程就永远收不到「SIGTERM 已优雅退出」，
@@ -837,18 +844,19 @@ func (a *App) setupSnapshot() []func(*App) error {
 //
 // 显式序列，不用 defer：defer 会在手动 flush 之后才执行，span 已经丢了。
 //
-//	业务 OnStop（逆序）→ server.stop → component.stop（逆序）
+//	业务 OnStop（逆序）→ server.stop → metrics.listener → component.stop（逆序）
 //	→ registry.deregister → tracing.shutdown（15s 冲刷）
 //	→ metrics.shutdown → logger.close
 //
-// 每一步都记录事件，供测试断言顺序（不靠日志文本匹配）。
-// 中间步骤失败不中断后续回收（否则会漏掉 flush），错误聚合返回。
+// 骨架交给 pipeline.Shutdown 执行：**事件记录、幂等、错误聚合**三件事只在那一
+// 份里实现（与启动链 Run 对偶 —— 改骨架语义只改一处，不会出现「改了退出链却
+// 忘了启动链」）。本方法只剩「编排步骤」这一件事。
 //
-// 注：`internal/pipeline` 里另有一个通用的 `pipeline.Shutdown`（同为「反序 +
-// 幂等 + 错误聚合」）。本框架的退出链**不走它**，原因：这里的每一环还要额外
-// 套一层有界等待（`runStop`）并在超时时记 `stop.timeout.<name>`，而 `pipeline`
-// 那版只对 NS 步骤做顺序执行。两者并存很容易让人以为改了其中之一就改了退出链，
-// 故在此写明：**退出链的唯一实现是 App.Close**。
+// 各环自己的差异仍留在 Step.Fn 里，它们不是骨架该管的：
+//   - 业务 / 服务端 / 采集口 / 组件四环额外套一层有界等待（runStop），
+//     超时只记 `stop.timeout.<name>` 留痕，不进错误聚合（见 runStop 注释）；
+//   - tracing 环有独立的 15s 冲刷上限（批量导出器的缓冲未冲刷会静默丢 span）；
+//   - logger 环刻意吞错：它是记录前面所有失败的唯一手段，不能被自己关掉。
 func (a *App) Close() error {
 	a.mu.Lock()
 	if a.closed {
@@ -860,99 +868,155 @@ func (a *App) Close() error {
 	copy(stops, a.stops)
 	a.mu.Unlock()
 
-	var errs []error
-	rec := func(name string) { a.events.Record(name) }
 	limit := a.stopTimeout()
 
 	// 1. 业务回调先退（此时基础设施仍可用）
-	rec(pipeline.StepSetupStop)
-	for i := len(stops) - 1; i >= 0; i-- {
-		if err := a.runStop(stops[i].name, stops[i].fn, limit); err != nil {
-			errs = append(errs, err)
-		}
+	stopHooks := pipeline.Step{
+		Name: pipeline.StepSetupStop,
+		Fn: func(*pipeline.Env) error {
+			var errs []error
+			for i := len(stops) - 1; i >= 0; i-- {
+				if err := a.runStop(stops[i].name, stops[i].fn, limit); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
+		},
 	}
 
 	// 2. 服务端停止：钩子由 Run 起服时按服务端类型接上（webx Shutdown /
 	//    kitex Stop）。从未起服则为 nil（no-op），不往错误聚合里塞噪声。
-	rec(pipeline.StepServerStop)
-	if a.serverStop != nil {
-		if err := a.runStop("server.stop", a.serverStop, limit); err != nil {
-			errs = append(errs, fmt.Errorf("server stop: %w", err))
-		}
-	}
-
-	// 2b. 采集口监听（仅 srv 档自建的那个）：必须**晚于**服务端停止，
-	//     否则停机过程自身的指标会被提前掐断。钩子在 startMetricsListener 里接。
-	a.mu.Lock()
-	metricsStop := a.metricsStop
-	a.metricsStop = nil
-	a.mu.Unlock()
-	if metricsStop != nil {
-		if err := a.runStop("metrics.listener", metricsStop, limit); err != nil {
-			errs = append(errs, fmt.Errorf("metrics listener stop: %w", err))
-		}
-	}
-
-	// 3. 组件停止（反序：先起的后停）
-	rec(pipeline.StepComponentStop)
-	if a.comp != nil {
-		cs := a.comp.NamedStops()
-		for i := len(cs) - 1; i >= 0; i-- {
-			if err := a.runStop(cs[i].Name, cs[i].Fn, limit); err != nil {
-				errs = append(errs, err)
+	stopServer := pipeline.Step{
+		Name: pipeline.StepServerStop,
+		Fn: func(*pipeline.Env) error {
+			a.mu.Lock()
+			stop := a.serverStop
+			a.mu.Unlock()
+			if stop == nil {
+				return nil
 			}
-		}
+			if err := a.runStop(pipeline.StepServerStop, stop, limit); err != nil {
+				return fmt.Errorf("server stop: %w", err)
+			}
+			return nil
+		},
 	}
 
-	// 4. 注册中心注销：只注销本进程**注册成功**的那个实例（未注册态彻底静默，
+	// 3. 采集口监听（仅 srv 档自建的那个）：必须**晚于**服务端停止，
+	//    否则停机过程自身的指标会被提前掐断。钩子在 startMetricsListener 里接。
+	stopMetricsListener := pipeline.Step{
+		Name: pipeline.StepMetricsListener,
+		Fn: func(*pipeline.Env) error {
+			a.mu.Lock()
+			metricsStop := a.metricsStop
+			a.metricsStop = nil
+			a.mu.Unlock()
+			if metricsStop == nil {
+				return nil
+			}
+			if err := a.runStop(pipeline.StepMetricsListener, metricsStop, limit); err != nil {
+				return fmt.Errorf("metrics listener stop: %w", err)
+			}
+			return nil
+		},
+	}
+
+	// 4. 组件停止（反序：先起的后停）
+	stopComponents := pipeline.Step{
+		Name: pipeline.StepComponentStop,
+		Fn: func(*pipeline.Env) error {
+			if a.comp == nil {
+				return nil
+			}
+			var errs []error
+			cs := a.comp.NamedStops()
+			for i := len(cs) - 1; i >= 0; i-- {
+				if err := a.runStop(cs[i].Name, cs[i].Fn, limit); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
+		},
+	}
+
+	// 5. 注册中心注销：只注销本进程**注册成功**的那个实例（未注册态彻底静默，
 	//    见 stepRegister）。必须早于 tracing.shutdown：注销本身会标 span，
 	//    冲刷之后再注销等于把最后一批 span 丢在缓冲里。
-	rec(pipeline.StepRegistryDeregister)
-	if inst := a.registered; inst != nil && a.registry != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), registryOpTimeout)
-		err := a.registry.Deregister(ctx, a.serviceName, inst)
-		cancel()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("registry deregister: %w", err))
-		}
-		a.registered = nil
-	}
-
-	// 5. 调用链冲刷：必须在所有组件停止之后、logger 关闭之前。
-	//    15s 上限：批量导出器缓冲未冲刷会静默丢最后一批 span。
-	rec(pipeline.StepTracingShutdown)
-	if a.tracer != nil {
-		done := make(chan error, 1)
-		go func() { done <- a.tracer.Close() }()
-		select {
-		case err := <-done:
-			if err != nil {
-				errs = append(errs, fmt.Errorf("tracing shutdown: %w", err))
+	deregister := pipeline.Step{
+		Name: pipeline.StepRegistryDeregister,
+		Fn: func(*pipeline.Env) error {
+			if a.registered == nil || a.registry == nil {
+				return nil
 			}
-		case <-time.After(15 * time.Second):
-			errs = append(errs, errors.New("tracing shutdown: 15s timeout"))
-		}
+			ctx, cancel := context.WithTimeout(context.Background(), registryOpTimeout)
+			err := a.registry.Deregister(ctx, a.serviceName, a.registered)
+			cancel()
+			a.registered = nil
+			if err != nil {
+				return fmt.Errorf("registry deregister: %w", err)
+			}
+			return nil
+		},
 	}
 
-	// 6. 指标收口：与 tracing 同理 —— 先把 MeterProvider 的聚合刷出去再关 logger。
-	//    srv 档的采集口监听在前面 OnStop("metrics") 里已关过一次，这里重复调用是
-	//    幂等的（http.Server.Shutdown 与 MeterProvider.Shutdown 都做了幂等保护）。
-	rec(pipeline.StepMetricsShutdown)
-	if a.metrics != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
-		if err := a.metrics.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("metrics shutdown: %w", err))
-		}
-		cancel()
+	// 6. 调用链冲刷：必须在所有组件停止之后、logger 关闭之前。
+	//    15s 上限：批量导出器缓冲未冲刷会静默丢最后一批 span。
+	flushTracing := pipeline.Step{
+		Name: pipeline.StepTracingShutdown,
+		Fn: func(*pipeline.Env) error {
+			if a.tracer == nil {
+				return nil
+			}
+			done := make(chan error, 1)
+			go func() { done <- a.tracer.Close() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					return fmt.Errorf("tracing shutdown: %w", err)
+				}
+			case <-time.After(tracingFlushTimeout):
+				return fmt.Errorf("tracing shutdown: %s timeout", tracingFlushTimeout)
+			}
+			return nil
+		},
 	}
 
-	// 7. 日志最后关（前面所有步骤都可能要打日志）
-	rec(pipeline.StepLoggerClose)
-	if a.logger != nil {
-		_ = a.logger.Close()
+	// 7. 指标收口：与 tracing 同理 —— 先把 MeterProvider 的聚合刷出去再关 logger。
+	//    srv 档的采集口监听在第 3 环已关过一次，这里重复调用是幂等的
+	//    （http.Server.Shutdown 与 MeterProvider.Shutdown 都做了幂等保护）。
+	flushMetrics := pipeline.Step{
+		Name: pipeline.StepMetricsShutdown,
+		Fn: func(*pipeline.Env) error {
+			if a.metrics == nil {
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+			defer cancel()
+			if err := a.metrics.Shutdown(ctx); err != nil {
+				return fmt.Errorf("metrics shutdown: %w", err)
+			}
+			return nil
+		},
 	}
 
-	return errors.Join(errs...)
+	// 8. 日志最后关（前面所有步骤都可能要打日志）
+	closeLogger := pipeline.Step{
+		Name: pipeline.StepLoggerClose,
+		Fn: func(*pipeline.Env) error {
+			if a.logger == nil {
+				return nil
+			}
+			// 刻意吞错：logger 是记录前面所有失败的唯一手段，
+			// 它的 Close 失败不该翻退出码（更不能因此丢掉已缓冲的日志）。
+			_ = a.logger.Close()
+			return nil
+		},
+	}
+
+	return pipeline.Shutdown(a.env(), []pipeline.Step{
+		stopHooks, stopServer, stopMetricsListener, stopComponents,
+		deregister, flushTracing, flushMetrics, closeLogger,
+	})
 }
 
 // stopTimeout 退出链每一环的等待上限：yaml 的 service.stop_timeout（>0 才生效）。

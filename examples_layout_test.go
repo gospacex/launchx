@@ -1,6 +1,8 @@
 package launchx
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,12 +97,18 @@ func TestMicroNotCoupledToMesh(t *testing.T) {
 		if info.IsDir() || filepath.Ext(path) != ".go" {
 			return nil
 		}
-		b, err := os.ReadFile(path)
+		// 只看 import 声明，不做全文匹配：注释里提到 mesh（例如「与 mesh 的仓储
+		// 测试同口径」）并不构成耦合，全文 Contains 会把这类注释判成违规。
+		// 判据必须匹配「只有真耦合才有的那一段」——这里是 import 路径本身。
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
-			return err
+			t.Errorf("%s 无法解析 import（语法错误会绕过这道闸门）：%v", path, err)
+			return nil
 		}
-		if strings.Contains(string(b), meshImport) {
-			t.Errorf("%s 引用了 %s —— micro 与 mesh 必须解耦", path, meshImport)
+		for _, imp := range f.Imports {
+			if strings.Contains(imp.Path.Value, meshImport) {
+				t.Errorf("%s import 了 %s —— micro 与 mesh 必须解耦", path, imp.Path.Value)
+			}
 		}
 		return nil
 	})

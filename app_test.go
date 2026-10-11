@@ -474,3 +474,57 @@ func TestStopHookErrorStillAggregated(t *testing.T) {
 		t.Fatal("返回 error 的回调不应被记为超时")
 	}
 }
+
+// TestCloseGoesThroughPipelineShutdown 断言退出链的骨架真的由 pipeline.Shutdown
+// 执行，而不是 App.Close 里另写一份循环。
+//
+// 为什么值得单列一条：两份退出链并存时，改了 pipeline.Shutdown（幂等 / 事件
+// 记录 / 错误聚合）的人会以为退出链跟着改了，实际没走那份代码 —— 死代码比
+// 重复代码更危险，它看起来像被维护着。判据取**运行时**证据而不是 grep：
+// Shutdown 给每一步的错误加 `pipeline step %q` 前缀，这个前缀只可能来自它。
+//
+// 顺带钉住退出链的**完整顺序契约**（此前只断言了 server.stop 与 deregister
+// 的先后两条，中间漏掉 metrics.listener / component.stop 等环都能溜过去）。
+func TestCloseGoesThroughPipelineShutdown(t *testing.T) {
+	app, err := Bootstrap("testdata/srv.yaml")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	boom := errors.New("stop failed on purpose")
+	app.OnStopNamed("failing-for-test", func() error { return boom })
+
+	closeErr := app.Close()
+	if closeErr == nil {
+		t.Fatal("回调返回的 error 必须进聚合，got nil")
+	}
+	if !errors.Is(closeErr, boom) {
+		t.Fatalf("聚合结果丢失原始 error：%v", closeErr)
+	}
+	if !strings.Contains(closeErr.Error(), "pipeline step") {
+		t.Fatalf("退出链没有走 pipeline.Shutdown（错误里缺少它独有的 `pipeline step` 前缀）：%v", closeErr)
+	}
+
+	// 顺序契约：每一步都必须留下事件，且严格按下面的次序。
+	want := []string{
+		pipeline.StepSetupStop,
+		pipeline.StepServerStop,
+		pipeline.StepMetricsListener,
+		pipeline.StepComponentStop,
+		pipeline.StepRegistryDeregister,
+		pipeline.StepTracingShutdown,
+		pipeline.StepMetricsShutdown,
+		pipeline.StepLoggerClose,
+	}
+	ev := app.Events()
+	prev := -1
+	for _, name := range want {
+		at := ev.IndexOf(name)
+		if at < 0 {
+			t.Fatalf("退出链缺一步 %q，实际只记录了：%v", name, ev.Order())
+		}
+		if at <= prev {
+			t.Fatalf("退出链顺序错乱：%q(%d) 不晚于前一步(%d)，实际 %v", name, at, prev, ev.Order())
+		}
+		prev = at
+	}
+}

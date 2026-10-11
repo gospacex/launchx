@@ -35,6 +35,7 @@ const (
 const (
 	StepSetupStop          = "setup.stop"
 	StepServerStop         = "server.stop"
+	StepMetricsListener    = "metrics.listener"
 	StepComponentStop      = "component.stop"
 	StepRegistryDeregister = "registry.deregister"
 	StepTracingShutdown    = "tracing.shutdown"
