@@ -25,7 +25,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -44,6 +43,7 @@ import (
 	"github.com/gospacex/launchx/examples/mall/pkg/events"
 	"github.com/gospacex/launchx/examples/mall/srv-order/internal/model"
 	"github.com/gospacex/launchx/examples/mall/srv-order/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -166,6 +166,9 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 		)
 	}
 	s.bumpUserOrders(ctx, cmd.UserID)
+	// 建完必须失效：读路径会给"不存在的订单 ID"写一条短期负缓存，
+	// 不失效的话新订单在负缓存窗口内查不到（该 ID 此前可能被人查过）。
+	s.invalidate(ctx, cmd.UserID, rec.OrderID)
 	return &model.CreateOrderResult{
 		OrderID:     rec.OrderID,
 		OrderNo:     rec.OrderNo,
@@ -179,6 +182,9 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 // 缓存的是"已被用户看到过的订单结果"，语义上是可失效的派生状态（状态流转后
 // 由 Delete 显式失效），故走 cachex；限流计数那种需要原子自增的状态走 kvx。
 // 缓存读失败（含 key 不存在）一律按 miss 处理：缓存是加速路径，不是数据源。
+//
+// 读缓存走 cacheutil.Fetch（含空值哨兵）：查不存在的订单会回填一条短期负缓存，
+// 否则"批量请求不存在的 ID"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out *model.OrderWithItems, err error) {
 	ctx, end := s.begin(ctx, "GetOrder")
 	defer func() { end(err) }()
@@ -191,35 +197,32 @@ func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out
 	}
 	key := orderCacheKey(q.UserID, q.OrderID)
 
-	if s.cache != nil {
-		if cached, err := s.cache.Get(ctx, key); err == nil && cached != "" {
-			var ow model.OrderWithItems
-			if json.Unmarshal([]byte(cached), &ow) == nil {
-				if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-					span.SetAttributes(attribute.Bool("cache.hit", true))
-				}
-				return &ow, nil
-			}
-			s.logger.WarnContext(ctx, "order cache decode failed, fallback to db", logx.String("key", key))
-		}
-	}
-
-	ow, err := s.repo.GetOrder(ctx, q)
+	ow, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.OrderWithItems, error) {
+		return s.repo.GetOrder(ctx, q)
+	})
 	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
+		var nf *cacheutil.NotFound
+		if errors.As(err, &nf) {
 			return nil, codes.Wrap(codes.CodeOrderNotFound, "order not found", err)
 		}
 		return nil, codes.Wrap(codes.CodeInternal, "load order failed", err)
 	}
-	if s.cache != nil {
-		if b, mErr := json.Marshal(ow); mErr == nil {
-			// 回填失败只告警：缓存是加速路径，不是数据源
-			if sErr := s.cache.Set(ctx, key, string(b), orderCacheTTL); sErr != nil {
-				s.logger.WarnContext(ctx, "order cache fill failed", logx.Err(sErr))
-			}
-		}
-	}
 	return ow, nil
+}
+
+// cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
+//
+// 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
+// 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
+func (s *OrderService) cacheOpt() cacheutil.Options {
+	return cacheutil.Options{
+		Label: "order",
+		TTL:   orderCacheTTL,
+		NotFound: func(err error) bool {
+			return errors.Is(err, repository.ErrNotFound)
+		},
+		Logger: s.logger,
+	}
 }
 
 // UpdateStatus 订单状态流转（2 表事务 + 缓存失效）

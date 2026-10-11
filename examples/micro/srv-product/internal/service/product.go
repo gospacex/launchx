@@ -16,7 +16,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -32,6 +31,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
 )
@@ -144,6 +144,9 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 	if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
 		span.SetAttributes(attribute.Int64("product.id", int64(rec.ProductID)))
 	}
+	// 建完必须失效：读路径会给"不存在的 ID"写一条短期负缓存，不失效的话
+	// 新商品在负缓存窗口内查不到（键此前可能被人查过）。
+	s.invalidate(ctx, rec.ProductID)
 	return &model.CreateProductResult{ProductID: rec.ProductID, SkuCount: rec.SkuCount}, nil
 }
 
@@ -152,6 +155,9 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 // 热度计数走 kvx 而非 cachex：它需要原子自增，且**不要求强一致** —— 丢了
 // 一次计数只是热度偏低，不影响正确性；反过来若为了它去动 cachex 的缓存值，
 // 读-改-写会在并发下互相覆盖。两者因此分工明确。
+//
+// 读缓存走 cacheutil.Fetch（含空值哨兵）：查不存在的商品 ID 会回填一条短期
+// 负缓存，否则"批量请求不存在的 ID"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery) (out *model.ProductDetail, err error) {
 	ctx, end := s.begin(ctx, "GetProduct")
 	defer func() { end(err) }()
@@ -162,34 +168,32 @@ func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery
 	key := productCacheKey(q.ProductID)
 	s.bumpHot(ctx, q.ProductID)
 
-	if s.cache != nil {
-		if cached, err := s.cache.Get(ctx, key); err == nil && cached != "" {
-			var d model.ProductDetail
-			if json.Unmarshal([]byte(cached), &d) == nil {
-				if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-					span.SetAttributes(attribute.Bool("cache.hit", true))
-				}
-				return &d, nil
-			}
-			s.logger.WarnContext(ctx, "product cache decode failed, fallback to db", logx.String("key", key))
-		}
-	}
-
-	d, err := s.repo.GetProduct(ctx, q.ProductID)
+	d, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.ProductDetail, error) {
+		return s.repo.GetProduct(ctx, q.ProductID)
+	})
 	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
+		var nf *cacheutil.NotFound
+		if errors.As(err, &nf) {
 			return nil, codes.Wrap(codes.CodeProductNotFound, "product not found", err)
 		}
 		return nil, codes.Wrap(codes.CodeInternal, "load product failed", err)
 	}
-	if s.cache != nil {
-		if b, mErr := json.Marshal(d); mErr == nil {
-			if sErr := s.cache.Set(ctx, key, string(b), productCacheTTL); sErr != nil {
-				s.logger.WarnContext(ctx, "product cache fill failed", logx.Err(sErr))
-			}
-		}
-	}
 	return d, nil
+}
+
+// cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
+//
+// 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
+// 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
+func (s *ProductService) cacheOpt() cacheutil.Options {
+	return cacheutil.Options{
+		Label: "product",
+		TTL:   productCacheTTL,
+		NotFound: func(err error) bool {
+			return errors.Is(err, repository.ErrNotFound)
+		},
+		Logger: s.logger,
+	}
 }
 
 // UpdateProduct 改商品（2 表事务 + 缓存失效）

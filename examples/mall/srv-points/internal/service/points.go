@@ -28,7 +28,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -46,6 +45,7 @@ import (
 	"github.com/gospacex/launchx/examples/mall/pkg/events"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/model"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -112,6 +112,10 @@ func (s *PointsService) begin(ctx context.Context, op string) (context.Context, 
 // 回源走的是 point_accounts ⋈ point_ledgers 的联表聚合投影，缓存里存的
 // 也就是这份投影 —— 缓存值与回源值必须是同一个结构，否则"命中缓存就没有
 // 流水笔数"这种半截响应会反复出现。
+//
+// 读缓存走 cacheutil.Fetch（含空值哨兵）：查没开过户的 user 会回填一条短期
+// 负缓存，否则"批量请求不存在的用户"能把整层缓存旁路掉，压力直接落到 DB。
+// 首次入账会经 apply → invalidate 把这条负缓存删掉（开户即该键转为存在）。
 func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery) (out *model.AccountDetail, err error) {
 	ctx, end := s.begin(ctx, "GetAccount")
 	defer func() { end(err) }()
@@ -120,30 +124,32 @@ func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery)
 		return nil, codes.New(codes.CodeUnauthorized, "user required")
 	}
 	key := accountCacheKey(q.UserID)
-	if s.cache != nil {
-		if cached, err := s.cache.Get(ctx, key); err == nil && cached != "" {
-			var a model.AccountDetail
-			if json.Unmarshal([]byte(cached), &a) == nil {
-				if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-					span.SetAttributes(attribute.Bool("cache.hit", true))
-				}
-				return &a, nil
-			}
-			s.logger.WarnContext(ctx, "points cache decode failed, fallback to db", logx.String("key", key))
-		}
-	}
-	a, err := s.repo.GetAccount(ctx, q.UserID)
+
+	a, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.AccountDetail, error) {
+		return s.repo.GetAccount(ctx, q.UserID)
+	})
 	if err != nil {
+		// *cacheutil.NotFound 会 Unwrap 到 repository.ErrNotFound，
+		// 因此 mapRepoErr 的 errors.Is 分支照样认得出 —— 命中负缓存与
+		// 回源 miss 走同一条翻译路径，不会给出两种不同的错误码。
 		return nil, s.mapRepoErr(ctx, err)
 	}
-	if s.cache != nil {
-		if b, mErr := json.Marshal(a); mErr == nil {
-			if sErr := s.cache.Set(ctx, key, string(b), accountCacheTTL); sErr != nil {
-				s.logger.WarnContext(ctx, "points cache fill failed", logx.Err(sErr))
-			}
-		}
-	}
 	return a, nil
+}
+
+// cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
+//
+// 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
+// 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
+func (s *PointsService) cacheOpt() cacheutil.Options {
+	return cacheutil.Options{
+		Label: "points",
+		TTL:   accountCacheTTL,
+		NotFound: func(err error) bool {
+			return errors.Is(err, repository.ErrNotFound)
+		},
+		Logger: s.logger,
+	}
 }
 
 // Earn 入账：幂等键 → 用户锁 → 2 表事务 + outbox → 缓存失效

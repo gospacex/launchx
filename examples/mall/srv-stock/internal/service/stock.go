@@ -24,7 +24,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -42,6 +41,7 @@ import (
 	"github.com/gospacex/launchx/examples/mall/pkg/events"
 	"github.com/gospacex/launchx/examples/mall/srv-stock/internal/model"
 	"github.com/gospacex/launchx/examples/mall/srv-stock/internal/repository"
+	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -110,6 +110,9 @@ func (s *StockService) begin(ctx context.Context, op string) (context.Context, l
 // 各自推进，不一致即意味着某次事务只落了一半。只对账而不自动修正 ——
 // 修正需要锁 + 事务，读路径上做会把"查询"变成"写入"，让读请求也承担
 // 写热点；这里只留告警，由人工/对账任务处置。
+//
+// 读缓存走 cacheutil.Fetch（含空值哨兵）：查没建过库存的商品会回填一条短期
+// 负缓存，否则"批量请求不存在的商品"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (out *model.StockDetail, err error) {
 	ctx, end := s.begin(ctx, "GetStock")
 	defer func() { end(err) }()
@@ -119,32 +122,39 @@ func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (out
 	}
 	key := stockCacheKey(q.ProductID)
 
-	if s.cache != nil {
-		if cached, err := s.cache.Get(ctx, key); err == nil && cached != "" {
-			var d model.StockDetail
-			if json.Unmarshal([]byte(cached), &d) == nil {
-				if span := trace.SpanFromContext(ctx); span != nil && span.IsRecording() {
-					span.SetAttributes(attribute.Bool("cache.hit", true))
-				}
-				return &d, nil
-			}
-			s.logger.WarnContext(ctx, "stock cache decode failed, fallback to db", logx.String("key", key))
-		}
-	}
-
-	d, err := s.repo.GetStock(ctx, q.ProductID)
+	d, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.StockDetail, error) {
+		return s.repo.GetStock(ctx, q.ProductID)
+	})
 	if err != nil {
+		// *cacheutil.NotFound 会 Unwrap 到 repository.ErrNotFound，
+		// 因此 mapRepoErr 的 errors.Is 分支照样认得出 —— 命中负缓存与
+		// 回源 miss 走同一条翻译路径，不会给出两种不同的错误码。
 		return nil, s.mapRepoErr(ctx, err)
 	}
 	s.auditDrift(ctx, d)
-	if s.cache != nil {
-		if b, mErr := json.Marshal(d); mErr == nil {
-			if sErr := s.cache.Set(ctx, key, string(b), stockCacheTTL); sErr != nil {
-				s.logger.WarnContext(ctx, "stock cache fill failed", logx.Err(sErr))
-			}
-		}
-	}
 	return d, nil
+}
+
+// cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
+//
+// 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
+// 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
+//
+// 空值 TTL 用包默认（30s）而不是 stockCacheTTL（30s 且强一致敏感）：
+// "该商品没有库存记录"是低频且会被首次预占立刻改写的事实，
+// 用与正缓存同样的窗口没有额外收益，只会拉长新建后不可见的窗口。
+func (s *StockService) cacheOpt() cacheutil.Options {
+	return cacheutil.Options{
+		Label: "stock",
+		TTL:   stockCacheTTL,
+		// 只认归一化后的 ErrNotFound：gorm 直接抛出的 ErrRecordNotFound
+		// 由 repository 层包成 ErrNotFound（见 repository.GetStock），
+		// 本层不 import gorm（句柄来源纪律），故不在这里重复认一遍。
+		NotFound: func(err error) bool {
+			return errors.Is(err, repository.ErrNotFound)
+		},
+		Logger: s.logger,
+	}
 }
 
 // ListStocks 联表分页（不走缓存：批量读命中率低，缓存反而增加失效面）
