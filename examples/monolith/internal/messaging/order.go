@@ -10,6 +10,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/gospacex/mqx"
@@ -33,18 +34,36 @@ func NewOrder(producer mqx.Producer, topic string, traceOn bool) *Order {
 	return &Order{producer: producer, topic: topic, traceOn: traceOn}
 }
 
-// Publish 投递一条订单事件。
-//
-// 降级语义由调用方保证 producer 非 nil —— 本方法不吞 nil：producer 为空时
-// 返回 error 并打进 span，让"事件没发出去"在链路上可见，而不是静默丢。
 // begin 开本层 span（三段式 messaging.order.<Op>），返回「收 error 再收尾」的闭包。
 func (o *Order) begin(ctx context.Context, op string) (context.Context, layer.End) {
 	return layer.Begin(ctx, "messaging", "order", op, o.traceOn, nil)
 }
 
+// ErrProducerUnavailable producer 缺席（MQ 组件降级 / 装配期没拿到句柄）。
+//
+// 它是**可判定**的降级错误，不是内部错误：调用方据此决定「记一笔继续走」还是
+// 「让请求失败」。早期注释承诺「producer 为空时返回 error」，实现却直接
+// `o.producer.Send(...)` —— nil 接口上调用方法是 panic，注释与实现相反，
+// 而且 panic 恰好发生在 MQ 降级这个最不该让进程崩的时刻。
+var ErrProducerUnavailable = errors.New("messaging: mq producer is unavailable")
+
+// Publish 投递一条订单事件。
+//
+// producer 缺席时**返回 ErrProducerUnavailable 而不是 panic**：降级路径上
+// 崩进程是错中最坏的一种（订单已经落库，事件却把进程带走了）。投递器已建、
+// producer 为空时仍会开本层 span 并把错误记进去 —— "事件没发出去"在链路上
+// 必须看得见，否则它会退化成"没人知道少了什么"。投递器本身为 nil（组件根本
+// 没装配，装配层连 Order 都没构造）时没有可挂的父节点，只能返回错误。
 func (o *Order) Publish(ctx context.Context, key string, payload []byte) (err error) {
+	if o == nil {
+		return ErrProducerUnavailable
+	}
 	ctx, end := o.begin(ctx, "PublishOrder")
 	defer func() { end(err) }()
+	if o.producer == nil {
+		err = fmt.Errorf("messaging: publish order event: %w", ErrProducerUnavailable)
+		return err
+	}
 	layer.Attrs(ctx,
 		attribute.String("messaging.system", "kafka"),
 		attribute.String("messaging.destination", o.topic),

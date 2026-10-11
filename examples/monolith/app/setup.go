@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/cloudwego/hertz/pkg/route"
 	"github.com/gospacex/logx"
 	"github.com/gospacex/traceflag"
 	"github.com/gospacex/webx"
@@ -31,6 +32,7 @@ import (
 	"github.com/gospacex/launchx/examples/monolith/internal/middleware"
 	"github.com/gospacex/launchx/examples/monolith/internal/ratelimit"
 	"github.com/gospacex/launchx/examples/monolith/internal/repository"
+	srroute "github.com/gospacex/launchx/examples/monolith/internal/route"
 	"github.com/gospacex/launchx/examples/monolith/internal/search"
 	"github.com/gospacex/launchx/examples/monolith/internal/service"
 )
@@ -144,7 +146,14 @@ func Setup(a *launchx.App) error {
 
 	// logger 一并交给业务层：降级（事件没投出去 / 索引没写 / 快照没存）必须落日志，
 	// 不能只落在 span 上 —— trace.enabled=false 时 span 不录，降级就彻底静默了。
-	svc := service.New(repo, orderCache, orderEvents, orderIndex, snapshots, logger, traceOn)
+	svc := service.New(repo, orderCache, orderEvents, orderIndex, snapshots, logger, traceOn, service.DemoDefaults{
+		// 缺省单价与分页上下界取自 demo.*：它们分别决定"订单金额"与"一次请求
+		// 最多扫多少行"，属于会随演示意图调整的参数，不留字面量在业务层。
+		// 键值缺失时 service.New 自行回落到包级 fallback 常量，这里不用兜。
+		DefaultUnitPrice: a.Config().GetFloat64("demo.default_unit_price"),
+		DefaultLimit:     a.Config().GetInt("demo.default_limit"),
+		MaxLimit:         a.Config().GetInt("demo.max_limit"),
+	})
 
 	// ---------- 业务中间件：鉴权 ----------
 	// 凭据走缓存，故只在缓存可用时装配；令牌为空则不注册 /secure 路由，
@@ -177,6 +186,17 @@ func Setup(a *launchx.App) error {
 		auth = tokMW.Handle
 	}
 
+	// ---------- 路由层：链路第一节 ----------
+	// 必须挂在限流 / 鉴权**之前**：只有先入后出，下游两节的 span 才会收在
+	// route span 之内；挂反了 route 会变成它们的兄弟节点，链路读起来像
+	// "这次请求没走路由"。
+	//
+	// 这一节此前只有类型定义、从未实例化 —— `route.order.<Op>` 整层缺失，
+	// 而 T2–T5 的判据里没有一条断言它存在，所以一直没人发现。补挂的同时在
+	// trace_e2e_test.go 里加了"每条 trace 必须有 route.order.* span"的断言，
+	// 免得它再次悄无声息地掉下来。
+	mountRouteLayer(engine.Engine, logger, traceOn)
+
 	// ---------- 业务中间件：限流（全局）----------
 	// 有外部依赖的中间件必须在每条链上都出现 —— 挂全局是为了让每个 span 树
 	// 都能看到它，而不是只在个别端点上"演示一次"。
@@ -189,6 +209,18 @@ func Setup(a *launchx.App) error {
 
 	RegisterRoutes(engine.Engine, handler.New(svc, traceOn), auth)
 	return nil
+}
+
+// mountRouteLayer 把路由层挂到 hertz 引擎上，返回实例。
+//
+// 单独一个函数而不是内联一句，是为了让「路由层到底挂没挂」这件事可被单测
+// 直接断言（见 route_layer_test.go）：本层此前只有类型定义、从未实例化，
+// `route.order.<Op>` 整层缺失，而 T2–T5 的判据里没有一条断言它存在，所以
+// 一直没人发现 —— 没有可执行判据的接线，掉下来是无声的。
+func mountRouteLayer(e *route.Engine, logger logx.Logger, traceOn bool) *srroute.Router {
+	r := srroute.New("order", logger, traceOn)
+	e.Use(r.Handle)
+	return r
 }
 
 // durationOrDefault 解析时长串，空串或非法都回落到 def。

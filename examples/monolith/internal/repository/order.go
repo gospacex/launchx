@@ -53,19 +53,19 @@ func quietNotFound(err error) bool {
 	return errors.Is(err, ErrNotFound) || errors.Is(err, gorm.ErrRecordNotFound)
 }
 
-// Create 单表写入（INSERT orders）。
-func (r *Repository) Create(ctx context.Context, o *model.Order) (err error) {
-	ctx, end := r.begin(ctx, "Create")
-	defer func() { end(err) }()
-	err = r.db.WithContext(ctx).Create(o).Error
-	return err
-}
-
 // List 单表批量查询（SELECT orders）。
-func (r *Repository) List(ctx context.Context, limit int) (out []model.Order, err error) {
+//
+// userID > 0 时按归属用户过滤（鉴权路径必须传，否则任何人都能翻别人的单）；
+// userID == 0 表示不按用户收敛，只允许 demo 的无鉴权列表路径使用，且那条路径
+// 已被 RegisterRoutes 限制为"只能绑回环地址"（见 app/routes.go）。
+func (r *Repository) List(ctx context.Context, userID int64, limit int) (out []model.Order, err error) {
 	ctx, end := r.begin(ctx, "List")
 	defer func() { end(err) }()
-	err = r.db.WithContext(ctx).Order("id DESC").Limit(limit).Find(&out).Error
+	q := r.db.WithContext(ctx).Order("id DESC").Limit(limit)
+	if userID > 0 {
+		q = q.Where("user_id = ?", userID)
+	}
+	err = q.Find(&out).Error
 	return out, err
 }
 
@@ -143,21 +143,35 @@ func (r *Repository) UpdateStatus(ctx context.Context, orderNo, status string) (
 	return err
 }
 
-// Delete 物理删除订单（DELETE orders）。
-func (r *Repository) Delete(ctx context.Context, orderNo string) (err error) {
-	ctx, end := r.begin(ctx, "Delete")
-	defer func() { end(err) }()
-	err = r.db.WithContext(ctx).Where("order_no = ?", orderNo).Delete(&model.Order{}).Error
-	return err
-}
-
-// DeleteItems 删除订单明细（DELETE order_items）。
+// DeleteWithItems 同事务删除订单与明细（DELETE order_items + DELETE orders）。
 //
-// 物理删除主子数据时一并清理，避免 demo 反复跑留下孤儿明细；单独开 span，
-// 便于一眼看清「删两张表 = 两条 SQL」。
-func (r *Repository) DeleteItems(ctx context.Context, orderNo string) (err error) {
-	ctx, end := r.begin(ctx, "DeleteItems")
+// 必须是**一个事务**而不是两条各自提交的 DELETE：先删明细再删主单，中间任何一步
+// 失败都会留下「主单还在、明细没了」的孤儿订单 —— 读接口 JOIN 出来的结果是半张
+// 单，而对账侧看到的是主子表条数对不上，两侧都说不清是哪次操作造成的。
+//
+// 为什么还要额外判 RowsAffected：gorm 的 Delete 在 RowsAffected=0 时 Error=nil
+// （"没有行被删除"按 SQL 语义不算错误），于是"删一个不存在的订单"
+// 在持久层是成功、在业务层是失败。这里把 RowsAffected==0 归一化成 ErrNotFound，
+// 让上层能把它翻成 404 —— 否则任何 order_no 都返回 200 {"deleted":true}。
+//
+// 事务里的两条 SQL 各自成 span（同一父 = 本方法 span，互为兄弟），README §3 里
+// "DELETE 删主子数据 → db.delete × 2" 指的就是这两条。
+func (r *Repository) DeleteWithItems(ctx context.Context, orderNo string) (err error) {
+	ctx, end := r.begin(ctx, "DeleteWithItems")
 	defer func() { end(err) }()
-	err = r.db.WithContext(ctx).Where("order_no = ?", orderNo).Delete(&model.OrderItem{}).Error
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		tx = tx.WithContext(ctx) // 保证事务内 SQL 仍挂在同一个 span 下
+		if err := tx.Where("order_no = ?", orderNo).Delete(&model.OrderItem{}).Error; err != nil {
+			return err
+		}
+		res := tx.Where("order_no = ?", orderNo).Delete(&model.Order{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("delete order %s: %w", orderNo, ErrNotFound)
+		}
+		return nil
+	})
 	return err
 }

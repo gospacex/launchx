@@ -17,8 +17,28 @@
 cd examples
 grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient|mongo\.Connect|elasticsearch\.NewClient|sql\.Open" \
      --include="*.go" --exclude="*_test.go" .      # 必须为空
-grep -rn "127\.0\.0\.1\|localhost" --include="*.go" . | grep -v kitex_gen | grep -v _test   # 必须为空
+grep -rnE "127\.0\.0\.1|localhost" --include="*.go" \
+     micro/bff micro/gateway micro/srv-order micro/srv-points micro/srv-product micro/srv-stock \
+     mall/srv-bff mall/srv-gateway mall/srv-order mall/srv-points mall/srv-product mall/srv-stock \
+     mesh/apps monolith/internal monolith/app monolith/cmd \
+  | grep -v kitex_gen | grep -v _test | grep -v "/scripts/"     # 必须为空
 ```
+
+> 作用域为什么是**逐个服务目录列举**而不是 `examples/` 整树：这条红线管的是
+> 「服务进程把监听/注册地址写死在源码里」（写死 ⇒ 网格复用不了同一份二进制，
+> 只能 fork 一份改常量）。`*/scripts/**`（如 `micro/srv-order/scripts/ordercli`）
+> 与 `*/e2e/**` 是**本机排障与验收工具**，它们的默认值天生就是回环地址，扫进去
+> 会让判据恒红、进而被人当成噪声忽略 —— 那才是真正危险的结果。
+> 逐个列举还有一个好处：新增服务目录必须**显式加进这张表**才会被守到，
+> 漏一个目录比"扫了但恒红"更容易被发现。当前实测 0 命中。
+>
+> 工具侧的默认值仍需可读 env（如 `envOr("MALL_PRODUCT_ADDR", ...)`）：既保留
+> 本机零配置体验，也让换环境时不必改代码。
+
+> ⚠️ 上面两条必须是 `-E`（ERE）。文档里曾经写成 BRE 的 `"127\.0\.0\.1\|localhost"`：
+> `\|` 这个交替语法在本机 grep（toybox 0.8.13）下**静默失效并返回 0 命中**，
+> 而 「必须为空」这条判据在零命中时恰好成立 ⇒ 有违规也被判成合规。
+> 同文件的第 18 行已经是 `-E` 形态，勿改回 BRE。
 
 `otel` 全局的取用分两类，**业务分层里两类都不出现**：
 

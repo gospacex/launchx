@@ -78,7 +78,7 @@ go run ./cmd
 | 方法 | 路径 | 说明 | 链路上可见的 span |
 |---|---|---|---|
 | POST | `/orders` | 建单：事务写 orders + order_items | `db.create` × 2 → `messaging.order.PublishOrder`+`messaging.kafka.send`、`search.order.IndexOrder`+`db.elasticsearch.index`、`docs.order.SaveSnapshot`+`db.mongodb.insert` |
-| GET | `/orders?limit=20` | 单表列表 | `db.query` |
+| GET | `/orders?limit=20` | 单表列表（`limit` 缺省 20、上界 200） | `db.query` |
 | GET | `/orders/search?q=` | **检索**（ES） | `search.order.SearchOrder` + `db.elasticsearch.search` |
 | GET | `/orders/:order_no` | 单表单条，**缓存 read-through** | `cache.order.GetOrder`+`db.redis.GET`、未命中则 `repository.order.Get`+`db.query`、回写 `cache.order.SetOrder`+`db.redis.SET` |
 | GET | `/orders/:order_no/join` | **连表**：orders JOIN users | JOIN 语句单独成 span（`db.query.text` 含 `join`） |

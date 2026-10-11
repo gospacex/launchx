@@ -371,13 +371,18 @@ minikube start --driver=docker --cpus=2 --memory=4096     # 宿主总内存仅 8
 # 必须用 operator 文件，不要用 --set：Istio 1.30 的 meshConfig.defaultConfig.tracing
 # 是**数组**，--set ...tracing.sampling=100 会让 istioctl 在 values.Map.SetPath 里 panic
 # （实测堆栈 operator/pkg/values/map.go:365）。采样率改由 Telemetry API 下发。
-istioctl install -y -f examples/mesh/istio-operator.yaml
-kubectl apply -f examples/mesh/namespace.yaml             # 带 istio-injection=enabled
+# 以下命令建议直接走 bring-up.sh（路径已随两链形态迁到 deploy/）：
+VARIANT=micro ./mesh/scripts/bring-up.sh check   # 前置 + 清单 dry-run + 地址自检
+VARIANT=micro ./mesh/scripts/bring-up.sh image   # 交叉编译 → build 进 minikube daemon
+                 ./mesh/scripts/bring-up.sh install # minikube start(2C4G) + istioctl install
+# 等价手工命令（对照）：
+istioctl install -y -f examples/mesh/deploy/istio/operator.yaml
+kubectl apply -R -f examples/mesh/deploy/shared            # 00-namespace（带 istio-injection=enabled）/ consul / host-middleware / telemetry / peer-authn
 # 镜像：先在 hubx/ 仓库根构建（构建上下文必须是仓库根，见 §13.3 C-0），再
-minikube image load launchx-examples/gateway:dev          # 三服务各一次
+minikube image load launchx-demo:dev                       # 对照组：gateway/bff/srv 三份（SVC 各构一次）
 ```
 
-集群内访问宿主中间件用 **`host.minikube.internal`**（minikube 提供的宿主 DNS 名；`host.docker.internal` 是 Docker Desktop 容器内的写法，在 minikube 的 k8s 里**不保证解析**）——这一点由 `configs/*.yaml` 的地址副本体现，也是网格与微服配置的**唯一**差异来源。
+集群内访问宿主中间件用 **`host.minikube.internal`**（minikube 提供的宿主 DNS 名；`host.docker.internal` 是 Docker Desktop 容器内的写法，在 minikube 的 k8s 里**不保证解析**）——这一点由各 `deploy/*/10-configmap.yaml` 里的地址副本体现，也是网格与微服配置的**唯一**差异来源。
 
 - **T10** ✅ **PASS（2026-10-05 真机实测，证据 `examples/mesh/docs/verify.md` §1）**：同一 trace 下同时有应用 span（`demo-gateway`/`demo-bff`/`demo-srv`）与 sidecar span（`demo-gateway.launchx-mesh`、`demo-bff.launchx-mesh`），应用 span 父子链仍为 gateway → bff → srv。代表性 trace `8a728dcfe9b47cb29b7b83e348a4bc9e`：16 span（应用 12 / sidecar 4），单根，树深 13。查询时**两侧都要查**：`service=demo-gateway` 与 `service=demo-gateway.launchx-mesh`。
   判据已可执行：`python3 scripts/trace-audit.py --service demo-gateway --lookback 2m --mesh`（追加 M1 共存 / M2 `component=proxy`+`upstream_cluster` 验真 / M3 覆盖 ≥2 跳）。
@@ -401,16 +406,19 @@ minikube image load launchx-examples/gateway:dev          # 三服务各一次
 grep -rn "cloudwego" --include=*.go .                    # 仅 micro/{srv,bff} 的 kitex 构造处允许命中
 grep -rn "redis/go-redis\|segmentio/kafka-go\|hashicorp/consul/api\|gorm.io/gorm" --include=*.go examples/  # 必须为空
 
-# 网格不复制业务代码：mesh 目录内不应有 .go 文件，只放清单与配置副本
-find examples/mesh -name '*.go'                 # 必须为空
-# 网格配置副本与微服配置的差异只在地址段（127.0.0.1 → host.minikube.internal）
-for s in gateway bff srv; do
-  diff <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/micro/$s/config.yaml) \
-       <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/mesh/configs/$s.yaml)
+# 网格的清单目录不复制业务代码（deploy/** 零实现）；原生组 Go 代码只在 apps/ 子树
+find examples/mesh/deploy -name '*.go'          # 必须为空
+find examples/mesh/apps -name '*.go' | head     # 非空（apps 原生组，独立 module；受 TestMeshGoCodeOnlyUnderApps 钉住）
+# 对照组的配置副本与微服源配置的差异只在地址段 —— **仅 gateway/srv 成立，bff 不成立**
+for s in gateway srv; do
+  echo "== $s =="   # deploy/micro/10-configmap.yaml 内的 $s 块 ≈ examples/micro/$s/config.yaml（地址段替换后逐键相等）
 done
+# bff 块**已知滞后**：缺 auth / demo / xmiddleware.cachex / service.upstream.demo-{order,points,product,stock}
+# 且有已废弃的 service.upstream.demo-srv（详见 §13.3 C-2 与 code-review-2026-10-10.md §5.12）
+grep -n "auth:\|seed_user_id\|demo-order" examples/mesh/deploy/micro/10-configmap.yaml   # 期望为空 = 证实滞后
 ```
 
-判定：`mode` 枚举无 `mesh` 取值；`examples/` 与库内无 sidecar 相关 trace 分支；`examples/mesh` **不含 Go 业务代码副本**（复用微服 demo 镜像，只换配置与地址段）——出现 `.go` 文件即 FAIL，因为它意味着网格走了独立代码路径，违反 T8「与微服同构」。
+判定：`mode` 枚举无 `mesh` 取值；`examples/` 与库内无 sidecar 相关 trace 分支；`examples/mesh/deploy` **不含 Go 业务代码副本**（micro 对照组复用 demo 镜像、只换配置与地址段）——`deploy/**` 出现 `.go` 文件即 FAIL，因为它意味着清单走了独立代码路径，违反 T8「与微服同构」。**注意**：这条自 2026-10-10 起**只对 `deploy/**` 成立**；`apps/**` 是刻意为网格写的原生应用（有 Go），由 `TestMeshGoCodeOnlyUnderApps` 单独约束。
 
 ---
 
@@ -422,15 +430,15 @@ done
 
 | 维度 | A 单体 `examples/monolith` | B 微服 `examples/micro` | C 网格 `examples/mesh` |
 |---|---|---|---|
-| `service.mode` | `monolith` | `gateway` / `bff` / `srv`（三个进程各一档） | 与 B **完全相同**（无 `mesh` 档） |
-| 进程数 | 1 | 3 | 3（复用 B 的镜像） |
-| 入口协议 | HTTP（webx/hertz） | HTTP → HTTP → Kitex RPC | 同 B，流量经 sidecar 接管 |
-| 服务间调用 | 进程内函数调用 | RPC + consul 发现 | 同 B（+ k8s Service 一层） |
-| 注册发现 | **不注册** | gateway 只发现不注册；bff/srv 注册 | 同 B |
-| Go 代码 | 有 | 有 | **禁止有**（镜像由 micro 侧 Dockerfile 构建；mesh 只有部署面，见 §13.3 C-0） |
-| 根 span 数 | 1 | 1 | 1（应用侧）；sidecar 侧另成并行链 |
-| Jaeger 服务名 | `demo-monolith` | `demo-gateway` / `demo-bff` / `demo-srv` | 应用名 + `<workload>.<ns>` 两套 |
-| 健康入口 | `GET /healthz/live`、`/healthz/ready`（webx 实际注册的两个子路径，**裸 `/healthz` 返回 404**） | gateway/bff 两个子路径；srv 靠 consul TTL | k8s `tcpSocket` 探针 + consul |
+| `service.mode` | `monolith` | `gateway` / `bff` / `srv`（三个进程各一档） | 同 B（无 `mesh` 档）；apps 原生组同为 `bff`/`srv` 档 |
+| 进程数 | 1 | 3 | micro 组 3（复用 B 的镜像）；apps 组 5（bff + 4×srv，**无 gateway 进程**） |
+| 入口协议 | HTTP（webx/hertz） | HTTP → HTTP → Kitex RPC | 同 B，流量经 sidecar 接管（apps 组入口 = Istio Gateway 资源） |
+| 服务间调用 | 进程内函数调用 | RPC + consul 发现 | 同 B（+ k8s Service 一层）；apps 组发现交 k8s Service/EDS |
+| 注册发现 | **不注册** | gateway 只发现不注册；bff/srv 注册 | micro 组同 B（consul）；apps 组零注册代码（交 EDS） |
+| Go 代码 | 有 | 有 | **清单目录无**（`deploy/**` 零实现）；apps 原生组**有** Go（`apps/`，独立 module，见 §13.3 修订注） |
+| 根 span 数 | 1 | 1 | 1（应用侧）；sidecar 侧另成并行链（apps 组根 span 由 Envoy 产生，按 `http.method`/`http.url` 匹配路由） |
+| Jaeger 服务名 | `demo-monolith` | `demo-gateway` / `demo-bff` / `demo-srv` | 应用名 + `<workload>.<ns>` 两套（apps 组应用名为 `bff` / `srv-<域>`） |
+| 健康入口 | `GET /healthz/live`、`/healthz/ready`（webx 实际注册的两个子路径，**裸 `/healthz` 返回 404**） | gateway/bff 两个子路径；srv 靠 consul TTL | micro 组同 B；apps 组 bff 用 `httpGet /healthz/live`、四域 srv 用 `tcpSocket` 探针 |
 
 ---
 
@@ -660,6 +668,20 @@ curl -sf http://127.0.0.1:8080/api/order/1001  | grep -q 'order_id'             
 
 ### 13.3 案例 C — 网格（`examples/mesh`）
 
+> **⚠️ 形态修订（2026-10-10，先读这一段）**：本节 C-0/C-0b/C-1/C-2 的正文成文于「网格只复用 micro 二进制、自身零 Go 代码」的单链形态。**现状是两条并存的证据链**（权威描述见 `examples/mesh/README.md` §1）：
+>
+> | 组 | 代码 | 清单 | 镜像 |
+> |---|---|---|---|
+> | **micro 对照组** | 无（复用 `examples/micro`） | `deploy/micro/` | `launchx-demo:dev` |
+> | **apps 原生组** | `apps/`（**独立 go.mod，五个进程：`cmd/bff` + 四个 `cmd/srv-<域>`**） | `deploy/apps/` | `launchx-mesh-apps:dev` |
+>
+> 由此**三条口径必须按现状读**（下文相应位置已就地加注）：
+> 1. 「网格无 Go 代码」**收窄为 `deploy/**` 子树**（清单目录零实现）；Go 代码只允许在 `apps/**`，由根包 `examples_layout_test.go` 的 `TestMeshGoCodeOnlyUnderApps` 钉住。`find examples/mesh -name '*.go'` **现状非空**（apps 下有 Go），故不能再作「必须为空」的判据。
+> 2. 清单与配置副本路径由旧的 `workloads/` + `configs/` + 顶层 `namespace.yaml` 改为 **`deploy/{shared,micro,apps}/`**（apps 组 8 个文件：`10-configmap` + `20..23-srv-*` + `30-bff` + `40-gateway` + `50-authz`）。
+> 3. apps 组**有独立 `Dockerfile`**（`apps/Dockerfile`），不再是「一律复用 micro 侧 Dockerfile」；入口是 **Istio Gateway 资源**（不是 gateway 进程）。
+>
+> 下文 C-3/C-4/C-5 中与 micro 对照组（3 进程、consul、`demo-*` 服务名）相关的判据，对 micro 组仍成立；apps 组的对应口径以 `mesh/README.md` 与 `apps/README.md` 为准。
+
 #### C-0 「业务代码与入口在哪」——代码面 vs 部署面的边界
 
 `examples/mesh/` 里**故意没有**业务分层代码和 `main.go`。这不是漏写，而是 launchx 的核心主张（C4 / T8）：**换形态不改业务代码**。网格与微服跑的是**同一份二进制**，差异只存在于部署面。
@@ -670,14 +692,16 @@ curl -sf http://127.0.0.1:8080/api/order/1001  | grep -q 'order_id'             
 |---|---|---|
 | **源码 / 进程入口** | `func main()`：`Bootstrap → OnSetup → Run` | `examples/micro/{gateway,bff,srv}/cmd/main.go`（唯一业务代码所在地） |
 | **镜像入口** | Dockerfile 的 `ENTRYPOINT`（即上表的二进制） | `examples/docker/Dockerfile`，`--build-arg SVC=gateway\|bff\|srv` |
-| **部署入口** | `scripts/bring-up.sh start/check/down` | `examples/mesh/scripts/bring-up.sh` |
-| **流量入口** | Istio IngressGateway（或 NodePort）→ `gateway` Service | `examples/mesh/workloads/gateway.yaml` + `mesh/gateway.yaml`（Gateway/VirtualService，若需要对外暴露） |
+| **部署入口** | `scripts/bring-up.sh start/check/down` | `examples/mesh/scripts/bring-up.sh`（`VARIANT={micro\|apps}`） |
+| **流量入口** | micro 组 = 应用侧 `gateway` 进程；apps 组 = **Istio IngressGateway**（Gateway/VirtualService） | `examples/mesh/deploy/micro/` + `deploy/apps/40-gateway.yaml` |
 
-所以 `examples/mesh` 是**部署面**，它引用而非复制业务代码。判定这条边界的命令：
+所以 `examples/mesh` 的**清单面**（`deploy/**`）引用而非复制业务代码。判定这条边界的命令（**已按两链形态修订**）：
 
 ```bash
-find examples/mesh -name '*.go'                     # 必须为空（出现即 FAIL：网格走了独立代码路径）
-grep -rn "image:" examples/mesh/workloads/*.yaml    # 必须指向 launchx-examples/*，且 tag 与 micro 构建产物一致
+find examples/mesh/deploy -name '*.go'              # 必须为空：清单目录零实现
+find examples/mesh/apps -name '*.go' | head         # apps 原生组**有** Go（独立 module）；受 TestMeshGoCodeOnlyUnderApps 约束
+grep -rn "image:" examples/mesh/deploy/micro/*.yaml # 对照组：仍指向 launchx-demo:dev
+grep -rn "image:" examples/mesh/deploy/apps/*.yaml  # 原生组：指向 launchx-mesh-apps:dev
 ```
 
 #### C-0b 复用边界：代码零差异，但有三个前提
@@ -728,32 +752,32 @@ grep -rln "POD_IP" examples/mesh/workloads/ examples/mesh/configs/  # 两侧都�
 
 **不得**以「bff→srv 缺 sidecar span」为由判 T10 FAIL —— 那是协议特性，不是断链。
 
-#### C-1 目录树（部署面，**禁 Go 代码**）
+#### C-1 目录树（部署面：`deploy/**` **禁 Go 代码**；`apps/**` 是原生组，**有** Go）
+
+> 旧树（`namespace.yaml` + `workloads/` + `configs/` + 顶层 `configmap.yaml`）已并入 `deploy/`；下为**现状**（与 `mesh/README.md` §1 一致）：
 
 ```
 examples/mesh/
-├── namespace.yaml                     # launchx-mesh（带 istio-injection=enabled 标签）
-├── workloads/
-│   ├── gateway.yaml                   # Deployment + Service（gateway）
-│   ├── bff.yaml                       # Deployment + Service（bff）
-│   └── srv.yaml                       # Deployment + Service（srv，tcpSocket 探 9013）
-├── configmap.yaml                     # ★ 三个 configs/*.yaml 的挂载载体（缺此则配置副本是死文件）
-├── telemetry.yaml                     # Istio Telemetry + extensionProvider(opentelemetry)
-├── configs/
-│   ├── gateway.yaml                   # 微服配置的地址副本（宿主地址 → host.minikube.internal）
-│   ├── bff.yaml
-│   └── srv.yaml
-├── scripts/bring-up.sh                # start / check / down（含镜像构建与 minikube image load）
-└── docs/verify.md                     # T12 证据落盘
+├── README.md                          # 两条证据链的权威说明
+├── deploy/                            # 全部清单
+│   ├── shared/                        #   两链共用：00-namespace / 10-consul / 20-host-middleware / 40-telemetry
+│   ├── istio/operator.yaml            #   istioctl install -f 入参（非 kubectl 对象）
+│   ├── micro/                         #   对照组清单（3 Deployment，含 gateway 进程）
+│   └── apps/                          #   原生组清单（8 个文件）
+│                                      #     10-configmap（五份配置的键值镜像）
+│                                      #     20..23-srv-{order,points,product,stock}
+│                                      #     30-bff（含 ServiceAccount bff）/ 40-gateway（Istio Gateway+VirtualService）/ 50-authz
+├── apps/                              # 网格原生应用（独立 go.mod，五进程：bff + 4×srv；**有 Go 代码**）
+│   ├── cmd/ conf/ internal/ pkg/
+│   ├── go.mod  Makefile  Dockerfile
+│   └── README.md
+├── scripts/bring-up.sh                # check / image / install / deploy / verify / status / down
+├── scripts/route-matrix-{apps,micro}.txt   # 入口链条矩阵定义（与 PROBE_ROUTES 同源）
+└── docs/verify.md                     # T10–T13 证据落盘（T13 在 §6）
 ```
 
-镜像构建面在**代码面一侧**（不进 mesh，以保住「网格无 Go 代码」）：
+镜像构建面：**对照组**在代码面一侧（`examples/docker/Dockerfile`，以保住「micro 组零改动」）；**原生组**自带 `examples/mesh/apps/Dockerfile`。两者**构建上下文都必须是 `hubx/` 仓库根**，不是 `launchx/`——因为 `go.mod` 的 26 条 replace 指向 `../{webx,configx,logx,dbx,cachex,mqx,otelx,rpcx,...}` 兄弟目录（沿用 `micro_apps/docker/Dockerfile` 已验证的约定）。对照组建镜像命令：
 
-```
-examples/docker/Dockerfile             # 单一 Dockerfile，--build-arg SVC=gateway|bff|srv
-```
-
-**构建上下文必须是 `hubx/` 仓库根**，不是 `launchx/`——因为 `go.mod` 的 26 条 replace 指向 `../{webx,configx,logx,dbx,cachex,mqx,otelx,rpcx,...}` 兄弟目录（沿用 `micro_apps/docker/Dockerfile` 已验证的约定）。构建命令：
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx            # 仓库根，不是 launchx/
@@ -780,16 +804,28 @@ kubectl create configmap gateway-config --from-file=config.yaml=examples/mesh/co
 #### C-2 与微服的同构断言（T8）
 
 ```bash
-# 配置副本差异只在地址段
-for s in gateway bff srv; do
-  diff <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/micro/$s/config.yaml) \
-       <(sed -E 's#[0-9]+(\.[0-9]+){3}:[0-9]+#ADDR#g' examples/mesh/configs/$s.yaml)
-done
-# 清单侧：镜像指向 launchx-examples/*，探针 tcpSocket 且端口与业务一致（3.13/O3）
-grep -n "tcpSocket" -A2 examples/mesh/workloads/*.yaml
+# 同构断言（已按两链形态修订）：配置副本不再散落 configs/，而是内联进各自的 ConfigMap，
+# 且 apps 组的 ConfigMap 与 apps/conf/*.yaml 是**逐字镜像**（改 conf 后必须同步）。
+# 判据：把 `  <svc>.yaml: |` 块脱去 4 空格缩进后与 apps/conf/<svc>.yaml 逐行相等（回环地址只在 micro 组出现）。
+# 本轮实测：apps 组 5/5 块逐行相等（此前 4 份 srv 各漂 2 行注释，已重新生成对齐）。
+#
+# ⚠️ micro 对照组的 ConfigMap **不满足**该断言，且是**已知滞后**（不是笔误）：
+#   - deploy/micro/10-configmap.yaml 的 `bff.yaml` 块比 examples/micro/bff/config.yaml 少 18 个叶子键：
+#     缺整段 auth / demo、缺 xmiddleware.cachex(.instances.demo-bff)、缺 service.upstream.demo-{order,points,product,stock}，
+#     且残留已废弃的 service.upstream.demo-srv；拓扑仍是旧的「单 srv」3 进程形态（仅 20-srv.yaml）。
+#   - 而 bring-up.sh 的 micro 变体会用**当前** examples/micro/{gateway,bff,srv}/cmd 构建镜像，
+#     当前 bff 在 demo.auth_token 为空时**启动即失败**（examples/micro/bff/app/setup.go:179）
+#     ⇒ `VARIANT=micro` 现状**起不来**（gateway/srv 两块与源 0 漂移，只有 bff 断）。
+#   - 故「对照组的配置副本与微服源配置只差地址段」**只对 gateway/srv 成立**。
+#     清单侧：micro 组镜像指向 launchx-demo:*、apps 组指向 launchx-mesh-apps:*，探针 tcpSocket 且端口与业务一致（3.13/O3）
+grep -n "tcpSocket" -A2 examples/mesh/deploy/micro/*.yaml
+grep -n "auth:\|seed_user_id\|demo-order" examples/mesh/deploy/micro/10-configmap.yaml   # 空 = 证实 micro bff 块滞后
 ```
 
 #### C-3 调用链拓扑（双链并存）
+
+> 下列拓扑为 **micro 对照组**（`demo-*` 服务名）。apps 原生组的服务名是 `srv-<域>` / `bff`，
+> 入口是 Istio Gateway、`inbound` 根 span 由 Envoy 产生（无 `/api` 前缀，因 VirtualService 带 `rewrite`）。
 
 ```
 同一 trace 内：
@@ -829,13 +865,15 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 
 | 判据 | 通过条件 |
 |---|---|
-| `find examples/mesh -name '*.go'` | 空 |
+| `find examples/mesh/deploy -name '*.go'` | 空（清单目录零实现） |
+| `find examples/mesh/apps -name '*.go'` | **非空**（原生组有 Go）；受 `TestMeshGoCodeOnlyUnderApps` 约束 |
 | `kubectl apply --dry-run=client -R` | 全过 |
 | `bring-up.sh check` | 底座齐全时 0；缺失时**非零**并显式报缺失 |
-| Pod READY | 全部 `2/2` |
+| Pod READY | 全部 `2/2`（apps 组五进程 + sidecar 各 `2/2`） |
 | T10 双链并存 | 同一 trace 有 app + sidecar span，app 父子链方向不变 |
 | T11 反例 | 关掉应用传播器后 trace 数 ≥ 4（证明该断言非空壳） |
 | E5 OFF/ON | 可复现，两侧各一次 |
+| T13 路由矩阵 | `trace-audit.py --route-matrix` 逐路由 PASS，**退出码即结论**（不得 `\|\| true`，见 §5.3 / bring-up.sh） |
 | T12 证据 | `docs/verify.md` 含 trace-id / span 总数 / app span 数 vs sidecar 数 / 原始响应 / 版本清单 |
 
 ---
@@ -851,7 +889,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 | 注册与健康检查 | 不注册 | consul TTL + 心跳 | consul + k8s 双层 | coordx |
 | metrics / Prometheus | ✅ | ✅ | ✅（**2026-10-10 真机复验**，4/4） | 落点：`internal/telemetry.NewMetrics` 建 MeterProvider（拉取式，`otel/exporters/prometheus`）→ HTTP 档挂 `webx.MetricsPrefix`、srv 档单起 `metrics.addr`；RPC 侧 `rpcx.{requests,request.duration,errors}`。**2026-10-08 实测**：单体 `:8080/metrics`、微服 `bff:8081/metrics`（含 `rpcx_requests_total{rpc_role="client"}`）与 `srv-order:9031/metrics`（`rpc_role="server"`）均返回 Prometheus 文本；网关/域服启动日志打出 `rpc governance: ... metrics=on`。**2026-10-10 网格列实测**（证据 `mesh/docs/verify.md` §7.3）：srv-order `9031/metrics` Pod 内 79 行、宿主 port-forward 抓取不被 sidecar 拦（对照 9022 被 ALLOW 策略拒）、bff `8081/metrics` 含 `rpcx_requests_total{rpc_role="client"}` 且计数与流量吻合、`rpcx_request_duration_seconds` 分桶 `le="0.001"` 起 |
 | pprof | ❌ | ❌ | ❌ | 本轮不做 |
-| 告警 / 看板 | ❌ | ❌ | ❌ | 本轮不做 |
+| 告警 / 看板 | ❌ | ❌ | ❌（**底稿已备**：`deploy/prod/prometheusrule.yaml` + `podmonitor.yaml`，未 apply） | 本轮不做；底稿见 §13.4 修订注 |
 
 > 上表是「有没有」的事实登记，不是验收项。仍为缺口的项统一记 **SKIP**，任何把 SKIP 写成
 > PASS 的行为按 §15 第 7 条处理。
@@ -1014,8 +1052,31 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 10. **网格里混进 Go 代码**：`examples/mesh` 出现 `.go` 文件 = 网格走了独立代码路径，直接违反 T8。哪怕编译通过、链路也通，仍判 FAIL（因为"通"的是另一份代码，不能证明同构）。
 11. **单体出现 deregister 日志**：单体不注册，退出序列里若打出 deregister，说明 `mode` 装配串档了（monolith 走了 bff/srv 分支），链路看似正常但装配矩阵已错。
 12. **镜像构建上下文错**：在 `launchx/` 下 `docker build` 会因 `go.mod` replace 指向 `../webx` 等兄弟目录而失败（`../` 越出仓库根）。构建必须在 `hubx/` 根执行并 `-f launchx/examples/docker/Dockerfile`。看到 `../webx: no such file` 就是这个错。
-13. **配置副本没挂进容器**：`configs/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl exec ... -- cat /app/config.yaml` 必须与 `examples/mesh/configs/<svc>.yaml` 一致，且含 `host.minikube.internal`。
-14. **地址硬编码导致网格被迫 fork 代码**：`examples/micro` 的 Go 源码里出现 `127.0.0.1` / `localhost` / 写死的端口常量 → 网格无法复用同一份二进制，只能复制一份改常量，T8 当场失效。判据：`grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/` 必须为空。**这是本轮最容易复发的一条**：现役 `micro_apps` 三个服务全是这个写法（`const listenAddr = "127.0.0.1:8080"`），照抄即中招。
+13. **配置副本没挂进容器**：`conf/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl -n launchx-mesh exec <pod> -c app -- cat /app/conf/<svc>.yaml` 必须与 `examples/mesh/apps/conf/<svc>.yaml` 逐行一致，且含 `host-middleware.launchx-mesh.svc.cluster.local`。
+   > 挂载点是 `/app/conf/` 下的 `subPath` 单文件（见 `deploy/apps/20-srv-order.yaml` 的 volumes 段），**不是** `/app/config.yaml`；配置源目录是 `examples/mesh/apps/conf/` 而非 `examples/mesh/configs/`。按旧路径写判据只会得到「文件不存在」，于是这条防线既不通过也不失败，直接失效。
+14. **地址硬编码导致网格被迫 fork 代码**：`examples/micro` 的 Go 源码里出现 `127.0.0.1` / `localhost` / 写死的端口常量 → 网格无法复用同一份二进制，只能复制一份改常量，T8 当场失效。判据必须为空。**这是本轮最容易复发的一条**：现役 `micro_apps` 三个服务全是这个写法（`const listenAddr = "127.0.0.1:8080"`），照抄即中招。
+    > ⚠️ **判据必须写成 `grep -rnE`**：`grep -rn "127\.0\.0\.1\|localhost"` 用的是 BRE，
+    > `\|` 交替在本机 grep（toybox）与其他部分实现里会**静默失效并返回 0 命中**，
+    > 于是「必须为空」永远满足 —— 把有违规的代码判成无违规。同理，
+    > `grep -cE '[^[:print:]]'` 不能用于找非 ASCII（POSIX 把汉字也判为可打印，
+    > 见 `ci.sh` 的注释），要用 `[^ -~]`。这两条已固化进 `examples/scripts/ci.sh`，
+    > 不要只在文档里手写。
+    >
+    > 判据作用域是**服务进程目录逐个列举**，不是 `examples/` 整树：
+    >
+    > ```bash
+    > grep -rnE "127\.0\.0\.1|localhost" --include="*.go" \
+    >      micro/bff micro/gateway micro/srv-order micro/srv-points micro/srv-product micro/srv-stock \
+    >      mall/srv-bff mall/srv-gateway mall/srv-order mall/srv-points mall/srv-product mall/srv-stock \
+    >      mesh/apps monolith/internal monolith/app monolith/cmd \
+    >   | grep -v kitex_gen | grep -v _test | grep -v "/scripts/"     # 必须为空
+    > ```
+    >
+    > 排除 `*/scripts/**` 与 `*/e2e/**` 的理由：它们是本机排障/验收工具，默认值
+    > 天生是回环地址，扫进去判据恒红，然后就会被当噪声忽略 —— 比漏扫更危险。
+    > 2026-10-11 把判据从 BRE 修成 `-E` 后，正是这两类目录的 8 处命中暴露出来，
+    > 才反逼出这次作用域收窄（`mall/e2e` 的 6 处已改为 `envOr` 可读环境变量）。
+    > 当前实测 0 命中。
 15. **把「网格装上了」当成「治理已下沉」**：Kitex 是 TTHeader over TCP 私有协议，Istio 按 TCP 处理，`tcp_proxy` 层**没有 L7 治理**（§13.5）。重试、熔断、限流、灰度、鉴权一项都交不出去。若验收报告写「治理已由网格接管」而应用侧配置并未撤除，等于双重治理 + 虚假陈述 → FAIL。正确表述是「本轮网格提供 mTLS 与连接级可观测，L7 治理仍在应用侧」。
 16. **把 Kitex 段没有 sidecar span 当成断链**：Istio tracing 由 Envoy HTTP connection manager 产生，纯 TCP（Kitex TTHeader）经 `tcp_proxy` 预期**不生成** sidecar span（§C-0c ③）。判 T10 只看 HTTP 段的 sidecar span 与应用链的完整性；反过来，若 bff→srv 竟然出现 sidecar span，要回来修正该条预期说明。
 17. **用 `.attributes[]` 取 Jaeger span 属性**（2026-10-05 实测踩到）：Jaeger REST API（`/api/traces`）返回的 span 属性在 **`.tags[]`**，结构是 `{"key","type","value"}`；`.attributes[]` **不存在**，取之恒为空数组。后果极隐蔽——`db.query.text | length == 0`、"空值数为 0"、`JOIN 数为 0` 全都"通过"，整套 T13 判据变成空壳。判据一律写 `.spans[].tags[]?`（见 §9b.3 顶部警示）。**自检方式**：先跑 `jq '[.data[].spans[].tags[]? | select(.key=="db.query.text")] | length'`，若得到 0 而 Jaeger UI 上明明有 SQL，就是命中本条。

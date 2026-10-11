@@ -62,6 +62,9 @@ demo:
   cache_ttl: 60s                    # 订单缓存有效期
   order_index: "orders"             # ES 索引名
   snapshot_collection: "order_snapshots"  # Mongo 集合名
+  default_unit_price: 9.9           # unit_price 未提供时的缺省单价（<0 一律报 400，不再静默改写）
+  default_limit: 20                 # limit 未提供时的缺省条数
+  max_limit: 200                    # limit 上界：超过即截断，不接受无界扫描
 
 xmiddleware:
 
