@@ -12,7 +12,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -28,8 +27,15 @@ import (
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/events"
+	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 	"github.com/gospacex/launchx/examples/pkg/traceparent"
 )
+
+// orderCacheTTL 订单主表缓存存活时间。
+//
+// 原先这个值写在 fill 里（`5*time.Minute`），读策略收口后必须提到常量：
+// cacheutil 要它作为 Options.TTL，而 fill 已不存在。
+const orderCacheTTL = 5 * time.Minute
 
 // orderRepo 是 service 真正依赖的窄接口：只含它调用的四个方法。
 //
@@ -209,32 +215,54 @@ func newOrderNo() string {
 }
 
 // GetOrder 查单：先缓存，未命中回源并回填。
+//
+// 读缓存走 cacheutil.FetchResult（含空值哨兵）：查不存在的 id 会回填一条短期
+// 负缓存，否则"批量请求不存在的 id"能把整层缓存旁路掉，压力直接落到 DB。
+// 用 FetchResult 而不是 Fetch 是因为 OrderView.Cached 是验收判据的一部分。
+//
+// 明细**不进缓存**（与主表分开查）：明细条数随下单变化、主表不随，
+// 塞进同一个键会让"改明细"和"改状态"共用一个失效点，反而更容易读到半截数据。
 func (s *OrderService) GetOrder(ctx context.Context, id uint64) (v *OrderView, err error) {
 	ctx, end := layer.Begin(ctx, "service", "order", "GetOrder", s.traceOn, nil)
 	defer func() { end(err) }()
 
-	if s.cache != nil {
-		if raw, err := s.cache.Get(ctx, s.key(id)); err == nil && raw != "" {
-			if o, ok := decodeOrder(raw); ok {
-				items, _ := s.repo.ItemsByOrderID(ctx, id)
-				return &OrderView{Order: o, Items: items, Cached: true}, nil
-			}
-		}
-	}
-
-	o, err := s.repo.FindByID(ctx, id)
+	res, err := cacheutil.FetchResult(ctx, s.cache, s.cacheOpt(), s.key(id),
+		func(ctx context.Context) (*model.Order, error) {
+			return s.repo.FindByID(ctx, id)
+		})
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		var nf *cacheutil.NotFound
+		if errors.As(err, &nf) {
 			return nil, codes.New(codes.OrderNotFound, fmt.Sprintf("order %d not found", id))
 		}
 		return nil, codes.Wrap(codes.Internal, "get order", err)
 	}
-	items, err := s.repo.ItemsByOrderID(ctx, id)
-	if err != nil {
-		return nil, codes.Wrap(codes.Internal, "get order items", err)
+
+	items, ierr := s.repo.ItemsByOrderID(ctx, id)
+	if ierr != nil {
+		// 命中缓存时明细缺席只降级不失败：主表已经拿到了，返回"没有明细的订单"
+		// 好过整个请求失败；回源路径上则不豁免 —— 那说明库本身有问题。
+		// 两条路径的差别刻意保留，改一致会让"缓存命中"掩盖真实的库故障。
+		if res.Hit {
+			s.logger.Warn("mesh-order: load items failed, serve order without items",
+				logx.String("order_id", strconv.FormatUint(id, 10)), logx.Err(ierr))
+		} else {
+			return nil, codes.Wrap(codes.Internal, "get order items", ierr)
+		}
 	}
-	s.fill(ctx, *o)
-	return &OrderView{Order: *o, Items: items}, nil
+	return &OrderView{Order: *res.Value, Items: items, Cached: res.Hit}, nil
+}
+
+// cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
+func (s *OrderService) cacheOpt() cacheutil.Options {
+	return cacheutil.Options{
+		Label: "order",
+		TTL:   orderCacheTTL,
+		NotFound: func(err error) bool {
+			return errors.Is(err, gorm.ErrRecordNotFound)
+		},
+		Logger: s.logger,
+	}
 }
 
 // MarkPaid 改状态：库层条件更新 → 缓存失效。
@@ -287,27 +315,10 @@ func (s *OrderService) key(id uint64) string {
 	return "mesh:order:detail:" + strconv.FormatUint(id, 10)
 }
 
-// decodeOrder 只从缓存解出订单主表；明细仍回源（明细变更频率高于主表）。
+// 解码与回填不再在本域手写：都归 cacheutil（见 GetOrder）。
 //
-// cachex 的取值是 string，故这里收 string 而不是 []byte。
-func decodeOrder(raw string) (model.Order, bool) {
-	var o model.Order
-	if err := json.Unmarshal([]byte(raw), &o); err != nil || o.ID == 0 {
-		return model.Order{}, false
-	}
-	return o, true
-}
-
-// fill 回填缓存，失败只告警（缓存是加速器，不该影响请求成败）。
-func (s *OrderService) fill(ctx context.Context, o model.Order) {
-	if s.cache == nil {
-		return
-	}
-	b, err := json.Marshal(o)
-	if err != nil {
-		return
-	}
-	if err := s.cache.Set(ctx, s.key(o.ID), string(b), 5*time.Minute); err != nil {
-		s.logger.Warn("mesh-order: cache fill failed", logx.Err(err))
-	}
-}
+// 原先 decodeOrder 里那条 `o.ID == 0 → 视为 miss` 的判据没有丢，它搬进了
+// model.Order.Valid（cacheutil.Validatable）—— 规则跟着值走，而不是留在
+// 某一个域的解码函数里、让其它域各写一份。
+// 「明细不进缓存」这条仍在本域表达（GetOrder 里显式分开查），因为它不是
+// 通用规则，是本域对明细变更频率的判断。

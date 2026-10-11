@@ -18,6 +18,13 @@ type Order struct {
 // TableName 固定表名，避免依赖 gorm 的复数化规则（规则变动会让表名漂移）。
 func (Order) TableName() string { return "orders" }
 
+// Valid 判定这份值是不是一个完整订单（供 cacheutil.Validatable 使用）。
+//
+// 反序列化成功不等于值完整：缓存里混进一个缺主键的半截对象时，不校验就会
+// 把它当命中直接返回，用户看到一个"没有 ID 的订单"。此前这条判据写在
+// service 的 decodeOrder 里，收口到 cacheutil 后由值自己声明。
+func (o Order) Valid() bool { return o.ID != 0 }
+
 // CreateOutput 下单事务的落库结果。
 //
 // 放在 model 而不是 repository：service 用窄接口面向 repository 编程（不 import

@@ -20,3 +20,10 @@ type Product struct {
 
 // TableName 固定表名，避免依赖 gorm 的复数化规则（规则变动会让表名漂移）。
 func (Product) TableName() string { return "products" }
+
+// Valid 判定这份值是不是一个完整商品（供 cacheutil.Validatable 使用）。
+//
+// 反序列化成功不等于值完整：缓存里混进一个缺主键的半截对象时，不校验就会
+// 把它当命中直接返回。此前这条判据写在 service 的 decodeProduct 里，
+// 收口到 cacheutil 后由值自己声明 —— 规则跟着值走，八个域不会各写一份。
+func (p Product) Valid() bool { return p.ID != 0 }

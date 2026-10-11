@@ -11,7 +11,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -23,6 +22,7 @@ import (
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/product/model"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
+	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 )
 
 // detailTTL 商品详情缓存存活时间。
@@ -66,28 +66,42 @@ type ProductView struct {
 //
 // 未命中（库里没有该 id）回 ProductNotFound，与「库报错」区分开：前者是用户
 // 拿错了 id，后者是下游故障，bff 对两者的映射不同（404 vs 502）。
+//
+// 读缓存走 cacheutil.FetchResult（含空值哨兵）：查不存在的 id 会回填一条短期
+// 负缓存，否则"批量请求不存在的 id"能把整层缓存旁路掉，压力直接落到 DB。
+// 用 FetchResult 而不是 Fetch 是因为 ProductView.Cached 是验收判据的一部分，
+// 进程内要能断言"这次到底命中了没有"（span 上的 cache.hit 属性读不到）。
 func (s *ProductService) GetProduct(ctx context.Context, id uint64) (v *ProductView, err error) {
 	ctx, end := layer.Begin(ctx, "service", "product", "GetProduct", s.traceOn, nil)
 	defer func() { end(err) }()
 
-	key := s.key(id)
-	if s.cache != nil {
-		if raw, cerr := s.cache.Get(ctx, key); cerr == nil && raw != "" {
-			if p, ok := decodeProduct(raw); ok {
-				return &ProductView{Product: p, Cached: true}, nil
-			}
-		}
-	}
-
-	p, err := s.repo.FindByID(ctx, id)
+	res, err := cacheutil.FetchResult(ctx, s.cache, s.cacheOpt(), s.key(id),
+		func(ctx context.Context) (*model.Product, error) {
+			return s.repo.FindByID(ctx, id)
+		})
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		var nf *cacheutil.NotFound
+		if errors.As(err, &nf) {
 			return nil, codes.New(codes.ProductNotFound, "product "+strconv.FormatUint(id, 10)+" not found")
 		}
 		return nil, codes.Wrap(codes.Internal, "get product", err)
 	}
-	s.fill(ctx, *p)
-	return &ProductView{Product: *p}, nil
+	return &ProductView{Product: *res.Value, Cached: res.Hit}, nil
+}
+
+// cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
+//
+// 为什么要抽：各域各写一份 Options 的话，改负缓存策略就要改 N 遍，
+// 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
+func (s *ProductService) cacheOpt() cacheutil.Options {
+	return cacheutil.Options{
+		Label: "product",
+		TTL:   detailTTL,
+		NotFound: func(err error) bool {
+			return errors.Is(err, gorm.ErrRecordNotFound)
+		},
+		Logger: s.logger,
+	}
 }
 
 // UpdatePrice 改价格：落库 → 删缓存。
@@ -119,27 +133,7 @@ func (s *ProductService) key(id uint64) string {
 	return "mesh:product:detail:" + strconv.FormatUint(id, 10)
 }
 
-// decodeProduct 从缓存解出商品；解不出（非法 JSON / id 为 0）视为 miss。
+// 解码与回填不再在本域手写：都归 cacheutil（见 GetProduct）。
 //
-// cachex 的取值是 string，故这里收 string 而不是 []byte。
-func decodeProduct(raw string) (model.Product, bool) {
-	var p model.Product
-	if err := json.Unmarshal([]byte(raw), &p); err != nil || p.ID == 0 {
-		return model.Product{}, false
-	}
-	return p, true
-}
-
-// fill 回填缓存，失败只告警（缓存是加速器，不该影响请求成败）。
-func (s *ProductService) fill(ctx context.Context, p model.Product) {
-	if s.cache == nil {
-		return
-	}
-	b, err := json.Marshal(p)
-	if err != nil {
-		return
-	}
-	if err := s.cache.Set(ctx, s.key(p.ID), string(b), detailTTL); err != nil {
-		s.logger.Warn("mesh-product: cache fill failed", logx.Err(err))
-	}
-}
+// 留在域内的代价不是多几行，而是**语义各写一份**：此前"解码失败 → 当 miss"和
+// "回填失败 → 只告警"这两条规则只有 product 域遵守，改规则永远改不全。
