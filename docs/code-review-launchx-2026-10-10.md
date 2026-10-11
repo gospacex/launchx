@@ -359,7 +359,7 @@
 | **mesh apps 的同源下单幂等** | ✅ 已补齐（见 10.8） | 原判断「没有幂等键生成点、补它等于新增能力」**不成立** —— 复核发现更糟的事实：订单号是 service 层现编的 `M%s%06d`（时间戳 + `userID%1000000`），**同一用户同一秒下两单必然撞号**。现已按 micro/mall 同形补齐：入口生成键 → pb 透传 → 订单域事务内查重（含 outbox 事件不重插） |
 | mall 异步消费端 | ✅ 已补齐（见 10.9） | 原判断「需 kafka 真机才能验收，先只改注释」只对了一半：注释如实化是对的，但消费端本身可以落成**传输无关**的逻辑 + 注入替身的判据，真机验收只是最后一步。现已补 `order.completed.v1 → 送积分`，其余三个事件仍只有生产端（并在注释里逐个标明） |
 | `pipeline.Shutdown` 零调用 | ✅ 已收敛（见 10.10） | 采纳「让 `Close` 把七步包成 `[]Step` 交给它」：骨架（事件记录 / 幂等 / 错误聚合）只剩一份，各环差异（有界等待 / 15s 冲刷 / logger 吞错）留在 `Step.Fn` 里 |
-| 缓存穿透回填空值哨兵 | ✅ 已统一（见 10.11） | 先抽共享封装 `examples/pkg/cacheutil`（含空值哨兵），8 处全部改走它；顺带补上「Create 后失效」—— 没有它，负缓存会让新建记录在窗口内查不到 |
+| 缓存穿透回填空值哨兵 | ✅ 已统一（见 10.11 / 10.12） | 先抽共享封装 `examples/pkg/cacheutil`（含空值哨兵），**全仓 11 处**读缓存全部改走它 —— 上一轮停在 micro/mall 八处的理由（两侧缓存抽象不齐）不成立：收口的是读策略不是连接，把参数换成窄接口 `Store` 即可；顺带补上「Create 后失效」（仅单号可由调用方带来的那两域） |
 | monolith 写接口鉴权 | ✅ 已落成（方式与第 9 章建议不同，见 10.7） | 复核时先发现一件更糟的事：`repository/order.go` 与 `service/order.go` 的注释都写着「该路径已被 RegisterRoutes 限制为只能绑回环地址（见 app/routes.go 的 loopbackOnly）」，而全仓 grep `loopbackOnly` **零命中** —— 注释虚构了一条安全约束。现已补成真判据 |
 | `micro/srv/` 冻结目录 | ✅ 裁定：维持冻结 + 上判据 | 删了就失去「拆分前 vs 拆分后」的对照证据；统一到 `srv-*` 也没有净收益。冻结语义落成 `frozen_test.go` 两条判据（声明被删会红 / 进部署清单会红），不再是口头约定 |
 | monolith 旧 DDL 与真源漂移 | ✅ 裁定：撤下（误列） | 复核后不成立：`bring-up.sh` 只建 3 表是因为 monolith 的业务面就只有 orders / order_items / users（无 outbox、无 stock/points/product），而 `order_db.sh` 的 10 表是给 micro/mall 四域用的 —— 两者不是同一张库的两个版本。且 monolith 的 `orders` 已带 `uk_orders_order_no`，与幂等口径一致 |
@@ -397,6 +397,12 @@
 | 坏消息是丢弃而非重投 | 丢弃分支 `return nil` 改 `return errors.New(why)` | FAIL（7 个子用例全红） |
 | 消费循环停止有界 | `Stop` 超时分支后加 `select {}` | FAIL（用例挂住 2s 后报「又变回无界了」） |
 | 订阅侧消费组显式命名 | `group_id: srv-points` 改成 `mqx-group` | FAIL（判据认得缺省值） |
+| 残缺缓存值不得当命中 | `Validatable` 分支前加 `false &&` | FAIL（半截对象被当成命中返回） |
+| mesh 两域声明 `Valid()` | 删掉 `Product.Valid()` | FAIL（静态判据点名该文件）—— **注意 mesh apps 照样编译通过**，删了不报错，只有判据能抓 |
+| monolith typed nil 判空 | `store()` 里去掉 `if s.cache == nil` | FAIL（运行时判据 + 静态判据同时红） |
+| 判据能分辨调用形态 | mesh order 的 `FetchResult` 改成 `Fetch` | FAIL（静态判据点名该形态） |
+
+**判据自己也会假红**：第一版按 `:= cacheutil.Fetch(` 全文匹配，把 monolith（`out, err = ...`，具名返回值用 `=`）判成"没接线"。已改成逐行扫 + 跳过注释行。判据太窄会逼人为了过判据改代码 —— 这是判据的错，不是代码的错。
 
 ### 10.5 判据连锁反应（修判据不是终点）
 
@@ -522,6 +528,26 @@ return pipeline.Shutdown(a.env(), []pipeline.Step{
 
 **回源故障绝不能写成空值哨兵**：那会让一次抖动变成"最长 MissTTL 内该键查不到"，且没有任何错误日志，数据看起来凭空消失。这条单独有用例钉住。
 
-判据三层：包内 9 组单测（含上面每一条语义）+ 静态判据 `TestEightReadPathsUseFetch`（逐域枚举，匹配 `:= cacheutil.Fetch(` —— 用 `cacheutil.Fetch` 会命中注释、假绿）+ `TestCreatePathsInvalidate`。
+判据三层：包内单测（含上面每一条语义）+ 静态判据逐处枚举 + `TestCreatePathsInvalidate`。
 
-**未纳入**：monolith 与 mesh apps 各有一处读缓存，但它们的 `Set` 签名与本封装修的接口不同（两侧缓存抽象不一致），合并要连带改这两个示例的缓存层，超出本轮范围 —— 已在 10.3 注明。
+### 10.12 收口的最后一公里：monolith 与 mesh apps
+
+上一轮把 10.11 的范围停在 micro/mall 八处，理由是 monolith 与 mesh apps 的缓存抽象与 `cachex.Cache` 不齐（monolith 的 `cache.Order.Set` 不带 TTL 参数）。**这个理由不成立**：收口的是**读策略**，不是连接 —— 把参数从 `cachex.Cache` 换成只含 `Get/Set(带 ttl)/Delete` 的窄接口 `Store`，两侧都能进来。
+
+于是上一轮的"未纳入"三条全部收口，全仓读缓存只剩一份实现（11 处）：
+
+| 落点 | 适配方式 |
+|---|---|
+| micro / mall 各四域（8） | `cachex.Cache` 天然满足 `Store` |
+| monolith `service.Get` | `orderCacheStore` 适配 `*cache.Order`，保留它外面那层业务 span（**不能**改成直接交裸 cachex：Jaeger 上就只剩一条 redis 命令，回答不了"谁在访问缓存"） |
+| mesh apps order / product（2） | 直接用 `cachex.Cache`；改用 `FetchResult` 取命中状态 |
+
+过程中撞到并解决的三件事：
+
+1. **typed nil 陷阱**：`s.cache` 是 `*cache.Order`，**nil 指针转成接口后 != nil**，直接交给 cacheutil 会让"没配缓存"这条默认路径在 nil 接收者上调方法。判空必须写在适配处（`(*Service).store()`），并有运行时用例 + 静态判据双份钉住。
+2. **"解码成功 ≠ 值完整"不能丢**：mesh 两域此前用 `ID == 0` 挡半截对象。收口时把它做成 `cacheutil.Validatable` 接口（值自己声明完不完整），而不是塞进 `Options`——`Options` 不是泛型的，装不下 `func(*T) bool`；再者"什么算完整"本来就只有值自己知道。
+3. **TTL 的真源只有一处**：monolith 的正缓存 TTL 从 `cache.Order.TTL()` 取，不在 service 里再写一份（抄一份会让"改了配置只有一半缓存跟着变"）。
+
+**Create 路径失效不是"写路径都该失效"**：monolith 与 mesh order 的新记录主键/单号由服务端生成，不存在"这个键刚被记成不存在"的前提，故未补失效；micro/mall 那两处补了，是因为它们的单号可由调用方带来（幂等键 / bff 生成）。差别写在代码注释里，免得后来人对着两边以为漏了一边。
+
+**判据为什么不写死 `:=`**：monolith 的调用点是 `out, err = cacheutil.Fetch(ctx, ...)`（具名返回值用 `=`）。第一版判据按 `:= cacheutil.Fetch(` 全文匹配，把**已接线的 monolith 判成没接线**（假红）；改成逐行扫 + 跳过注释行 + 用 `cacheutil.Fetch(ctx,` 区分 `FetchResult`。反向探针：把 mesh order 改成 `Fetch` → 红；把 `Valid()` 删掉 → 红（**而 mesh apps 照样编译通过**，这正是"删了也不报错"的那类契约，只能靠静态判据抓）。
