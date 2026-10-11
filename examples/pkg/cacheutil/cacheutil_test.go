@@ -294,3 +294,80 @@ func TestFetchDecodedGarbageFallsBack(t *testing.T) {
 		t.Fatalf("脏值应回源并覆盖，got %+v, err %v", got, err)
 	}
 }
+
+// ======================= Validatable（值自己声明完不完整） =======================
+
+// guarded 实现 Validatable：缺主键即不完整。
+type guarded struct {
+	ID   uint64 `json:"id"`
+	Name string `json:"name"`
+}
+
+func (g guarded) Valid() bool { return g.ID != 0 }
+
+// TestFetchRejectsIncompleteCachedValue 「反序列化成功 ≠ 值完整」。
+//
+// mesh 两个域此前用 `ID == 0` 挡半截对象，收口时这条判据不能丢 —— 丢了就是
+// "修了穿透，换来返回半个订单"。
+//
+// 反向探针（已实测）：把 FetchResult 里的 Validatable 分支去掉 → 本用例红
+// （残缺值会被当成命中直接返回）。
+func TestFetchRejectsIncompleteCachedValue(t *testing.T) {
+	c := newFakeCache()
+	_ = c.Set(context.Background(), "k", `{"name":"half"}`, time.Minute)
+
+	loads := 0
+	res, err := FetchResult(context.Background(), c, opt(), "k", func(context.Context) (*guarded, error) {
+		loads++
+		return &guarded{ID: 7, Name: "full"}, nil
+	})
+	if err != nil {
+		t.Fatalf("残缺值应按 miss 回源，err=%v", err)
+	}
+	if res.Hit {
+		t.Fatal("残缺值不得算命中 —— 否则用户看到半个对象")
+	}
+	if loads != 1 {
+		t.Fatalf("残缺值必须回源，loads=%d", loads)
+	}
+	if res.Value == nil || res.Value.ID != 7 {
+		t.Fatalf("应返回回源值，got %+v", res.Value)
+	}
+}
+
+// TestFetchResultReportsHit FetchResult 的命中状态必须准：
+// mesh 的 ProductView.Cached / OrderView.Cached 是验收判据的一部分。
+func TestFetchResultReportsHit(t *testing.T) {
+	c := newFakeCache()
+
+	// 1. 首次回源：Hit=false
+	r1, err := FetchResult(context.Background(), c, opt(), "k", func(context.Context) (*detail, error) {
+		return &detail{ID: 1}, nil
+	})
+	if err != nil || r1.Hit {
+		t.Fatalf("首次应未命中：hit=%v err=%v", r1.Hit, err)
+	}
+	// 2. 第二次命中：Hit=true
+	r2, err := FetchResult(context.Background(), c, opt(), "k", func(context.Context) (*detail, error) {
+		t.Fatal("命中后不得回源")
+		return nil, nil
+	})
+	if err != nil || !r2.Hit {
+		t.Fatalf("第二次应命中：hit=%v err=%v", r2.Hit, err)
+	}
+	// 3. 命中空值哨兵：Negative=true，且不回源
+	_, _ = FetchResult(context.Background(), c, opt(), "gone", func(context.Context) (*detail, error) {
+		return nil, errMissing
+	})
+	r3, err := FetchResult(context.Background(), c, opt(), "gone", func(context.Context) (*detail, error) {
+		t.Fatal("命中空值哨兵不得回源")
+		return nil, nil
+	})
+	if !r3.Negative {
+		t.Fatal("命中空值哨兵应标 Negative=true")
+	}
+	var nf *NotFound
+	if !errors.As(err, &nf) {
+		t.Fatalf("命中空值哨兵应回 *NotFound，实际 %v", err)
+	}
+}
