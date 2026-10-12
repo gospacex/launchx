@@ -150,14 +150,15 @@ cd /Users/hyx/work/gowork/src/hubx/launchx
 wc -l examples/micro/bff/cmd/main.go                       # 49
 
 # ② 地址全部配置化（换部署形态只改配置，不重新编译）
-grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/bff/   # 必须为空
+go test . -run 'TestServiceSourceHasNoHardcodedLoopbackAddr' -count=1   # PASS = 无硬编码回环地址
+#    （原手写 grep 用 BRE 的 `\|`，在本机 grep 下静默零命中，而「必须为空」恰恰由零命中成立）
 
 # ③ 不自建客户端：下游 RPC 客户端只能用 launchx 给的选项构造
-grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" \
-     --include=*.go examples/micro/bff/                    # 必须为空
+go test . -run 'TestServiceSourceHasNoDirectMiddlewareSetup' -count=1   # PASS = 不自建客户端
+#    （原手写 grep 会把注释里写的「不自建 gorm.Open」也算成命中）
 
 # ④ 业务层不含形态分支（/ping 回显的 "bff" 取自 App.Mode()，写在装配层）
-grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)' --include=*.go examples/micro/bff/internal/   # 必须为空
+grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)' --include='*.go' examples/micro/bff/internal/   # 必须为空
 
 # ⑤ 下游发现生效 + 三段链路（完整链路在 Task 19 跑，本 Task 只要求编译通过 + 可启动）
 for s in demo-product demo-stock demo-order demo-points; do

@@ -57,9 +57,9 @@ grep -c "=>" go.mod              # ≥ 26（禁止 go mod tidy）
 
 ```bash
 # ① 库侧（根包 *.go + internal/**）：零 cloudwego / 零驱动直引
-grep -rn "cloudwego" --include=*.go . | grep -v "^./examples/"    # 必须为空
-grep -rn "go-redis\|segmentio/kafka-go\|hashicorp/consul/api\|gorm.io/gorm" \
-     --include=*.go . | grep -v "^./examples/"                    # 必须为空
+#    手写 grep 已换成自动守卫：**注释与报错文案里提到这些包时 grep 同样会命中**，
+#    而本条判据恰恰是「必须为空」——恒红的判据很快会被整片忽略掉。
+go test . -run 'TestLibrarySourceHasNoDirectMiddlewareImports' -count=1   # PASS = 依赖面干净
 grep -n "cloudwego/kitex" go.mod                                  # Task 11 起已转 direct（见 ③）
 ```
 
@@ -90,7 +90,7 @@ grep -n "cloudwego/kitex" go.mod                                  # Task 11 起�
 任一自建客户端调用——那才是"绕过 launchx 直引驱动"。判定：
 
 ```bash
-grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" --include=*.go .   # 必须为空
+go test . -run 'TestServiceSourceHasNoDirectMiddlewareSetup' -count=1   # PASS = 服务源码不自建连接
 ```
 
 **Task 11 追加的豁免（不算越界，限定范围）**：随 srv-order 迁进来的单测
@@ -100,8 +100,8 @@ launchx、也不连任何中间件，是纯测试夹具，不属于"业务绕过
 故上式对该目录需排除 `_test.go`：
 
 ```bash
-grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" \
-     --include=*.go --exclude='*_test.go' .                                          # 必须为空
+#    同上：这里要看的是**调用**，而 grep 会把「本包不 gorm.Open」这类注释也算成命中。
+go test . -run 'TestServiceSourceHasNoDirectMiddlewareSetup' -count=1   # PASS = 服务源码不自建连接
 ```
 
 ---
@@ -403,8 +403,8 @@ minikube image load launchx-demo:dev                       # 对照组：gateway
 ## 12. 依赖面与同构（tasks 3.14 / 4.8）
 
 ```bash
-grep -rn "cloudwego" --include=*.go .                    # 仅 micro/{srv,bff} 的 kitex 构造处允许命中
-grep -rn "redis/go-redis\|segmentio/kafka-go\|hashicorp/consul/api\|gorm.io/gorm" --include=*.go examples/  # 必须为空
+go test . -run 'TestServiceSourceHasNoDirectMiddlewareSetup' -count=1   # PASS = 服务源码不自建连接
+grep -rnE "cloudwego" --include='*.go' .            # 仅 micro/{srv,bff} 的 kitex 构造处允许命中
 
 # 网格的清单目录不复制业务代码（deploy/** 零实现）；原生组 Go 代码只在 apps/ 子树
 find examples/mesh/deploy -name '*.go'          # 必须为空
@@ -415,7 +415,7 @@ for s in gateway srv; do
 done
 # bff 块**已知滞后**：缺 auth / demo / xmiddleware.cachex / service.upstream.demo-{order,points,product,stock}
 # 且有已废弃的 service.upstream.demo-srv（详见 §13.3 C-2 与 code-review-2026-10-10.md §5.12）
-grep -n "auth:\|seed_user_id\|demo-order" examples/mesh/deploy/micro/10-configmap.yaml   # 期望为空 = 证实滞后
+grep -nE "auth:|seed_user_id|demo-order" examples/mesh/deploy/micro/10-configmap.yaml   # 期望为空 = 证实滞后
 ```
 
 判定：`mode` 枚举无 `mesh` 取值；`examples/` 与库内无 sidecar 相关 trace 分支；`examples/mesh/deploy` **不含 Go 业务代码副本**（micro 对照组复用 demo 镜像、只换配置与地址段）——`deploy/**` 出现 `.go` 文件即 FAIL，因为它意味着清单走了独立代码路径，违反 T8「与微服同构」。**注意**：这条自 2026-10-10 起**只对 `deploy/**` 成立**；`apps/**` 是刻意为网格写的原生应用（有 Go），由 `TestMeshGoCodeOnlyUnderApps` 单独约束。
@@ -468,7 +468,7 @@ cd examples/monolith
 test -f config.yaml && test -f cmd/main.go && test -f app/setup.go && test -f app/routes.go
 for d in handler logic service repository model; do test -d internal/$d || echo "MISSING internal/$d"; done
 # 反向断言：业务分层不得出现 mode 分支（C4）
-grep -rn "monolith\|bff\|gateway\|srv" internal/ | grep -v "_test.go"    # 必须为空
+grep -rnE "monolith|bff|gateway|srv" --include='*.go' internal/ | grep -v "_test.go"    # 必须为空
 ```
 
 #### A-2 `main.go` 契约
@@ -731,7 +731,7 @@ service:
 
 ```bash
 # 网格复用前必须先过这两条（在代码面执行）
-grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/   # 必须为空：地址一律来自配置
+go test . -run 'TestServiceSourceHasNoHardcodedLoopbackAddr' -count=1   # PASS = 服务源码无硬编码回环地址
 grep -rln "POD_IP" examples/mesh/workloads/ examples/mesh/configs/  # 两侧都必须命中
 ```
 
@@ -819,7 +819,7 @@ kubectl create configmap gateway-config --from-file=config.yaml=examples/mesh/co
 #   - 故「对照组的配置副本与微服源配置只差地址段」**只对 gateway/srv 成立**。
 #     清单侧：micro 组镜像指向 launchx-demo:*、apps 组指向 launchx-mesh-apps:*，探针 tcpSocket 且端口与业务一致（3.13/O3）
 grep -n "tcpSocket" -A2 examples/mesh/deploy/micro/*.yaml
-grep -n "auth:\|seed_user_id\|demo-order" examples/mesh/deploy/micro/10-configmap.yaml   # 空 = 证实 micro bff 块滞后
+grep -nE "auth:|seed_user_id|demo-order" examples/mesh/deploy/micro/10-configmap.yaml   # 空 = 证实 micro bff 块滞后
 ```
 
 #### C-3 调用链拓扑（双链并存）
@@ -943,7 +943,7 @@ curl -s "http://127.0.0.1:16686/api/traces?service=demo-gateway.launchx-mesh&lim
 
 ```bash
 # Kitex 段不得把端口误声明为 http（会让 Istio 误判协议并静默失败）
-grep -rn "appProtocol\|name: http\|name: grpc" examples/mesh/deploy/*/*.yaml
+grep -rnE "appProtocol|name: http|name: grpc" examples/mesh/deploy/*/*.yaml
 # 双重重试检查：网格侧 retries 与应用侧 rpcx.retry 只能居其一。
 # 注意必须锚在 xmiddleware.rpcx 段上：`retry` 在本仓还出现在 lockx（锁重试，无关）
 # 与 outbox/mqx（消费端重试）—— 宽匹配会把它们一起捞进来，判据就失去意义。
@@ -1055,7 +1055,7 @@ k8s 的 `Service` + `endpoints` + DNS 本身就是注册中心，Istio 的服务
 13. **配置副本没挂进容器**：`conf/*.yaml` 若只写进 ConfigMap 却没有 `volumeMounts`，Pod 起来会用镜像内默认配置（指向 `127.0.0.1`），在 k8s 里必然连不上宿主中间件。判据：`kubectl -n launchx-mesh exec <pod> -c app -- cat /app/conf/<svc>.yaml` 必须与 `examples/mesh/apps/conf/<svc>.yaml` 逐行一致，且含 `host-middleware.launchx-mesh.svc.cluster.local`。
    > 挂载点是 `/app/conf/` 下的 `subPath` 单文件（见 `deploy/apps/20-srv-order.yaml` 的 volumes 段），**不是** `/app/config.yaml`；配置源目录是 `examples/mesh/apps/conf/` 而非 `examples/mesh/configs/`。按旧路径写判据只会得到「文件不存在」，于是这条防线既不通过也不失败，直接失效。
 14. **地址硬编码导致网格被迫 fork 代码**：`examples/micro` 的 Go 源码里出现 `127.0.0.1` / `localhost` / 写死的端口常量 → 网格无法复用同一份二进制，只能复制一份改常量，T8 当场失效。判据必须为空。**这是本轮最容易复发的一条**：现役 `micro_apps` 三个服务全是这个写法（`const listenAddr = "127.0.0.1:8080"`），照抄即中招。
-    > ⚠️ **判据必须写成 `grep -rnE`**：`grep -rn "127\.0\.0\.1\|localhost"` 用的是 BRE，
+    > ⚠️ **判据必须写成 `-rnE`（ERE）而不是 BRE 的 `\|` 交替**：
     > `\|` 交替在本机 grep（toybox）与其他部分实现里会**静默失效并返回 0 命中**，
     > 于是「必须为空」永远满足 —— 把有违规的代码判成无违规。同理，
     > `grep -cE '[^[:print:]]'` 不能用于找非 ASCII（POSIX 把汉字也判为可打印，

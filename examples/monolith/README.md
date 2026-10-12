@@ -214,7 +214,7 @@ provider 侧），照原话当期望值会把"总闸关"这种正当配置判成
 
 ```bash
 # 业务三层不得出现 mode 判定或形态取值字面量（import 路径含 monolith 不算）
-grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)|service\.mode' --include=*.go internal/   # 必须为空
+grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)|service\.mode' --include='*.go' internal/   # 必须为空
 ```
 
 换形态只改 `config.yaml` 的 `service.mode`；网格形态复用**同一份二进制**，

@@ -178,7 +178,8 @@ cd /Users/hyx/work/gowork/src/hubx/launchx
 wc -l examples/micro/gateway/cmd/main.go                       # 49
 
 # ② 地址全部配置化（换部署形态只改配置，不重新编译）
-grep -rn "127\.0\.0\.1\|localhost" --include='*.go' examples/micro/gateway/   # 必须为空
+go test . -run 'TestServiceSourceHasNoHardcodedLoopbackAddr' -count=1   # PASS = 无硬编码回环地址
+#    （原手写 grep 用 BRE 的 `\|`，在本机 grep 下静默零命中，而「必须为空」恰恰由零命中成立）
 
 # ③ 不自建客户端：注册中心句柄只能经 a.Registry() 取
 grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient|coordx\.New" \
@@ -188,7 +189,7 @@ grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewC
 grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)' --include='*.go' examples/micro/gateway/internal/  # 必须为空
 
 # ⑤ 本档不注册：代码里不应有任何 Register/Deregister 调用
-grep -rn "Register(\|Deregister(" --include='*.go' examples/micro/gateway/   # 必须为空
+grep -rnE "Register\(|Deregister\(" --include='*.go' examples/micro/gateway/   # 必须为空
 
 # ⑥ 上游发现生效（完整链路在 Task 19 跑，本 Task 只要求编译通过 + 可启动）
 curl -s 'http://127.0.0.1:8500/v1/health/service/demo-bff?passing=1' | jq 'length'   # ≥ 1

@@ -11,34 +11,49 @@
 | 业务分层 | 不出现 `gorm.Open` / `redis.NewClient` / `kafka.NewWriter` / `consul.NewClient` 等自建客户端；不出现 `otel.GetTracerProvider()` / `otel.GetTextMapPropagator()` 等直取全局单例（走 `launchx.Inject` / `launchx.Extract`，tracer 由装配层交接） |
 | 地址 | 代码内不出现 `127.0.0.1` / `localhost`，一律来自配置 |
 
-红线自检命令（排除 `_test.go`，测试里的 sqlite 内存库是已登记的豁免）：
+红线自检（在**仓根**执行，两条都已固化成自动守卫）：
 
 ```bash
-cd examples
-grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient|mongo\.Connect|elasticsearch\.NewClient|sql\.Open" \
-     --include="*.go" --exclude="*_test.go" .      # 必须为空
-grep -rnE "127\.0\.0\.1|localhost" --include="*.go" \
-     micro/bff micro/gateway micro/srv-order micro/srv-points micro/srv-product micro/srv-stock \
-     mall/srv-bff mall/srv-gateway mall/srv-order mall/srv-points mall/srv-product mall/srv-stock \
-     mesh/apps monolith/internal monolith/app monolith/cmd \
-  | grep -v kitex_gen | grep -v _test | grep -v "/scripts/"     # 必须为空
+go test . -run 'TestServiceSourceHasNoDirectMiddlewareSetup' -count=1   # PASS = 服务源码不自建连接
+go test . -run 'TestServiceSourceHasNoHardcodedLoopbackAddr' -count=1   # PASS = 服务源码无硬编码回环地址
+go test . -run 'TestEveryServiceDirIsGuarded' -count=1                  # PASS = 没有漏登记的服务目录
 ```
 
-> 作用域为什么是**逐个服务目录列举**而不是 `examples/` 整树：这条红线管的是
+> **为什么不再手写 grep**：这两条原先都是 grep 命令，各自以一种方式失效，
+> 且失效后的表现都是"看起来没毛病"。
+>
+> - 中间件那条是**文本**判据：源码里提到这些名字的地方有 30 处，而它们**全部**
+>   是注释与报错文案（"本包不 gorm.Open"、"instead of gorm.Open"），真调用一处
+>   都没有 —— 恒输出噪声的判据比失效更糟，它会把真正的新违规一起淹没。
+>   守卫改用 `go/parser` 走 AST：注释不进 AST，且只认 `*ast.CallExpr`，
+>   顺带连 import 别名（`g "gorm.io/gorm"`）也躲不掉。
+> - 地址那条逐个列举服务目录，指优点是作用域精确（这套清单沿用到了守卫里），
+>   但它原先是 BRE 的 `\|` —— 在本机 grep（toybox 0.8.13）下**静默零命中**，
+>   而「必须为空」恰恰由零命中成立。改成 `-E` 之后才第一次真正生效。
+>
+> 作用域仍是**逐个服务目录列举**而不是 `examples/` 整树：这条红线管的是
 > 「服务进程把监听/注册地址写死在源码里」（写死 ⇒ 网格复用不了同一份二进制，
 > 只能 fork 一份改常量）。`*/scripts/**`（如 `micro/srv-order/scripts/ordercli`）
 > 与 `*/e2e/**` 是**本机排障与验收工具**，它们的默认值天生就是回环地址，扫进去
 > 会让判据恒红、进而被人当成噪声忽略 —— 那才是真正危险的结果。
-> 逐个列举还有一个好处：新增服务目录必须**显式加进这张表**才会被守到，
-> 漏一个目录比"扫了但恒红"更容易被发现。当前实测 0 命中。
+>
+> 显式清单的缺点是"新增服务目录默认没人守"，且这种漏是**静默**的。这条已由
+> `TestEveryServiceDirIsGuarded` 补上：它按命名规则自动发现服务目录，凡发现而
+> 未登记即 FAIL（正是它检出了此前漏登记的 `micro/srv`）。
+>
+> 当前状态：地址红线有 3 处**带理由的豁免**（monolith 的 `loopbackOnly` 判定本体
+> 与两条修复建议文案，见 `examples_addr_hygiene_test.go` 的 `addrExemptions`）。
+> 豁免必须自证仍在起作用，指向的行一旦改动就要求清理 —— 否则清单只会单向膨胀。
 >
 > 工具侧的默认值仍需可读 env（如 `envOr("MALL_PRODUCT_ADDR", ...)`）：既保留
 > 本机零配置体验，也让换环境时不必改代码。
 
-> ⚠️ 上面两条必须是 `-E`（ERE）。文档里曾经写成 BRE 的 `"127\.0\.0\.1\|localhost"`：
-> `\|` 这个交替语法在本机 grep（toybox 0.8.13）下**静默失效并返回 0 命中**，
-> 而 「必须为空」这条判据在零命中时恰好成立 ⇒ 有违规也被判成合规。
-> 同文件的第 18 行已经是 `-E` 形态，勿改回 BRE。
+> ⚠️ 若哪天需要临时手写 grep：必须是 `-rnE`（ERE）。文档里曾经写成 BRE 的
+> `"127\.0\.0\.1\|localhost"`：`\|` 这个交替语法在本机 grep（toybox 0.8.13）下
+> **静默失效并返回 0 命中**，而「必须为空」这条判据在零命中时恰好成立 ⇒ 有违规
+> 也被判成合规。同理 `--include` 的通配符必须加引号（`--include='*.go'`）：
+> 不加时 zsh 报 no matches found，bash 下会被当前目录里的 `.go` 文件 glob 展开。
+> 这两类形态现在由 `TestAcceptanceDocsDoNotUseBrokenGrepForm` 在门禁里拦住。
 
 `otel` 全局的取用分两类，**业务分层里两类都不出现**：
 

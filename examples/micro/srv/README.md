@@ -101,15 +101,16 @@ cd /Users/hyx/work/gowork/src/hubx/launchx
 wc -l examples/micro/srv/cmd/main.go                       # 49
 
 # ② 无 micro_apps / infra 残留（业务代码只换 import，不再依赖原仓内部包）
-grep -rn "micro_apps" --include=*.go examples/micro/srv/   # 必须为空
+grep -rn "micro_apps" --include='*.go' examples/micro/srv/   # 必须为空
 
 # ③ 地址全部配置化（陷阱 14：网格要复用同一份二进制）
-grep -rn "127\.0\.0\.1\|localhost" --include=*.go examples/micro/srv/   # 必须为空
+go test . -run 'TestServiceSourceHasNoHardcodedLoopbackAddr' -count=1   # PASS = 无硬编码回环地址
+#    （原手写 grep 用 BRE 的 `\|`，在本机 grep 下静默零命中，而「必须为空」恰恰由零命中成立）
 #    地址只允许出现在 config.yaml 里
 
 # ④ 不自建客户端（句柄一律经 a.DB() / a.MQ() / launchx 注册）
-grep -rnE "gorm\.Open|redis\.NewClient|kafka\.(NewWriter|NewReader)|consul\.NewClient" \
-     --include=*.go examples/micro/srv/                    # 必须为空
+go test . -run 'TestServiceSourceHasNoDirectMiddlewareSetup' -count=1   # PASS = 不自建客户端
+#    （原手写 grep 会把注释里写的「不自建 gorm.Open」也算成命中）
 
 # ⑤ 迁移进来的单测全绿
 GOFLAGS=-mod=mod go test ./examples/micro/srv/...
@@ -136,7 +137,7 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-srv&limit=1' > /tmp/srv-
 `internal/{rpc,service,repository}` 内**不含任何形态分支**：
 
 ```bash
-grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)|service\.mode' --include=*.go \
+grep -rnE '"monolith"|"bff"|"gateway"|Mode\(\)|service\.mode' --include='*.go' \
      examples/micro/srv/internal/     # 必须为空（import 路径不算）
 ```
 
