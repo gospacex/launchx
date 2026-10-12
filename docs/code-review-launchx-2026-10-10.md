@@ -226,7 +226,7 @@
 **遗留（上一轮已知、本轮不改变结论）**：
 
 - `micro` 对照组已失效（`deploy/micro/10-configmap.yaml` 仍是 3 进程拓扑、bff 块缺 `auth`/`demo`/`upstream`），已加 `guard_micro_variant` 硬拒绝（exit 3）+ 文档收窄口径，但**未就地改建** —— 建议单列一个变更处理，不要在本轮混着改。
-- 入口闸门的**装配级**单测仍缺（`internal/bff/app` 无 `_test.go`），目前只在 handler 级 + 集群 verify 覆盖。
+- ✅ ~~入口闸门的**装配级**单测仍缺~~ —— 2026-10-11 补上（`examples/mesh/apps/internal/bff/app/setup_test.go`，见 10.13）。原只剩 handler 级 + 集群 verify，而 handler 级证明不了「中间件有没有挂上」，因为它测的是链条本身的裁决逻辑。
 - 网格只接住 `gateway→bff` 这一跳，`bff→srv` 走 Kitex TTHeader/TCP 永无 sidecar span —— 这是协议事实，不是缺陷，但建议在各案例 README 的统一章节写明，免得被当成漏埋。
 
 ---
@@ -551,3 +551,71 @@ return pipeline.Shutdown(a.env(), []pipeline.Step{
 **Create 路径失效不是"写路径都该失效"**：monolith 与 mesh order 的新记录主键/单号由服务端生成，不存在"这个键刚被记成不存在"的前提，故未补失效；micro/mall 那两处补了，是因为它们的单号可由调用方带来（幂等键 / bff 生成）。差别写在代码注释里，免得后来人对着两边以为漏了一边。
 
 **判据为什么不写死 `:=`**：monolith 的调用点是 `out, err = cacheutil.Fetch(ctx, ...)`（具名返回值用 `=`）。第一版判据按 `:= cacheutil.Fetch(` 全文匹配，把**已接线的 monolith 判成没接线**（假红）；改成逐行扫 + 跳过注释行 + 用 `cacheutil.Fetch(ctx,` 区分 `FetchResult`。反向探针：把 mesh order 改成 `Fetch` → 红；把 `Valid()` 删掉 → 红（**而 mesh apps 照样编译通过**，这正是"删了也不报错"的那类契约，只能靠静态判据抓）。
+
+### 10.13 手写红线的死而复生 + 最后一个缺口补上（2026-10-11）
+
+本轮起点是一次核验：**这两条红线都失效，而且失效方向相反。**
+
+| 红线 | 判据形态 | 实际表现 | 后果 |
+|---|---|---|---|
+| 地址不硬编码 | BRE 的 `\|` 交替 | 本机 grep（toybox 0.8.13）**静默 0 命中** | 「必须为空」恰由零命中成立 ⇒ 有违规也判成合规 |
+| 不自建中间件连接 | 文本 grep，扫整树含注释 | **恒定输出 30 行** | 全是注释与报错文案（"本包不 gorm.Open"），真调用 0 处 ⇒ 任何人跑一次就认定它坏了，从此连真正的违规一起不看 |
+
+把地址那条改成 `-E` 之后它才第一次真正生效，立刻吐出 `monolith/app/routes.go` 4 处 ——
+都是 10.12 那一轮新增 `loopbackOnly` 时带进来的（回环的定义与报错建议文案，
+最终判定为**带理由的豁免**），从那时起没有任何信号。
+
+**共同的根因**：判据是文本 search，而注释与字符串同样是文本。故改用 `go/parser`
+走 AST —— 注释不进 AST，字符串常量（BasicLit）与调用（CallExpr）在 AST 里天然分开。
+
+四个守卫（根包 `examples_addr_hygiene_test.go`）：
+
+- `TestServiceSourceHasNoHardcodedLoopbackAddr`：扫字符串字面量；服务目录**逐个列举**
+  （`*/scripts/**` 与 `*/e2e/**` 是本机工具，默认值天生是回环，算进去会恒红）；排除 `_test.go` 与 `kitex_gen`。
+- `TestServiceSourceHasNoDirectMiddlewareSetup`：只认 CallExpr，并按 import 别名
+  反解包名 —— `g "gorm.io/gorm"` 的 `g.Open` 也躲不掉。
+- `TestAcceptanceDocsDoNotUseBrokenGrepForm`：拦两种失效形态（BRE `\|`、无引号 `--include=*.go`）。
+  这一条管的是**判据的形态**而不是内容 —— 修完之后最可能发生的是有人照旧段落把坏写法抄回去。
+- `TestEveryServiceDirIsGuarded`：服务目录按命名规则自动发现，未登记即 FAIL。
+  正是它检出了此前漏登记的 `micro/srv`（冻结对照样例，有真实 Go 代码）。
+
+**豁免必须自证**：`addrExemptions` 每条都得对得上当前的一次 AST 命中，否则报「陈旧豁免」——
+包含豁免行被改成注释这种最难察觉的情形（东西还在，作用已经没了）。
+
+连带清理验收文档里 **27 处**失效写法（BRE `\|` 12 处 + 无引号 `--include` 15 处；
+后者在 zsh 报 no matches found、在 bash 会被当前目录的 `.go` 文件 glob 展开），
+把 5 处「必须为空」的手写命令换成引用上述守卫。
+⇒ **又一次：判据第一次真正生效时，会把长期被掩盖的违规一次性吐出来。**
+
+#### 最后一个缺口：`internal/bff/app` 的装配级判据（10.3 里唯一剩下的）
+
+handler 级的四向测试证明「链条的裁决逻辑」是对的，证明不了两件只有装配层看得见的事：
+
+1. **中间件到底挂上了没有**。hertz 的 `Engine.Use` 是 `group.Handlers = append(...)`，
+   而路由在被注册那一刻就把它快照进自己的链 —— 注册之后再 Use，中间件对已注册路由
+   **完全不起作用且不报错**。于是「闸门写好了、测试也绿了、入口却在裸奔」可达。
+2. **`auth.require=false` 是否真的不装闸门**。装了再放行会让配置变成谎话。
+
+补上的四个用例（新文件 `examples/mesh/apps/internal/bff/app/setup_test.go`）：
+
+- `TestRequiredIdentityGateBlocksAnonymous`：真 `webx.TestApp()` + 真 HTTP 四条断言
+  （无凭据 401 / 错误凭据 401 / 正确凭据 200 / 探针 200）。**放行类一律用 `/ping`**：
+  `/order/:id` 会去调零值 `Clients`，500 会把「有没有被拦住」这个信息盖掉。
+- `TestRequiredIdentityIsInertWhenRegisteredAfterRoutes`：反向顺序下闸门失效 ——
+  把 hertz 这条语义写成判据，防的是有人调换顺序。
+- `TestAuthDisabledReallyDisablesGate`：关掉配置就真的放行。
+- 前三个用的是**本文件的装配复刻件**，管不到 `Setup` 自己，故再回到源码钉两条静态：
+  行号上 `Use` 必须早于 `Register`；`WithRequiredIdentity` 必须在条件分支里。
+
+⚠️ **判据自身的坑（又一次靠反向探针救回来）**：
+`TestRequiredIdentityIsConditional` 第一版只判「在不在 if 里」，而 `if true {` 在结构上
+同样是 if —— 探针把它改成恒真后**依旧全绿**。收紧成「条件必须是非常量」才真红。
+⇒ **宽松的判据与失效的判据同样危险，区别只在于它看起来是绿的。**
+
+反向探针合计 7 条：真地址违规 / 真调用（含别名）/ 注释里的禁用名不得命中 /
+豁免行被改注释 / 新增服务目录 / 调换装配顺序 / 闸门条件改恒真 —— 全部真红后还原。
+
+**仍然刻意不引入的**：跨函数的静态装配顺序分析（micro/mall 的 `installAuth` 形态）。
+它的 Use 写在被调函数的函数体里（行号在路由注册之后），要判准需要调用图 —— 成本高风险大，
+而脆弱的判据本身就是新的假红源（正是本轮刚治理完的东西）。
+四个示例已逐一人工核对，Use / installAuth 的调用点都早于路由注册，现状无违约。
