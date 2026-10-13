@@ -15,6 +15,17 @@ service:
   self:
     addr: "${SRV_PRODUCT_SELF_ADDR}"  # 容器内外地址不一致时显式声明注册地址
 
+# ----- dtm 分支面（Saga 销量 +n/-n，dtm server 按 URL 回调本进程）-----
+# 编排侧据此拼分支 URL：grpc://<listen_addr>/dtmbranch.product.ProductBusi/<Method>
+#   AddSales    ← action     （销量 +n）
+#   ReduceSales ← compensate（销量 -n）
+# 商品域只占 904x 段的第一号；四域端口约定 9041-9044，写错会占住别的域的端口，
+# 症状是「另一个域的分支全连不上」，排查方向会被带偏很远。
+# **不注册 consul**：分支面不接受业务调用，注册进去只会多暴露一个裸 gRPC 端点。
+dtm:
+  branch:
+    listen_addr: "127.0.0.1:9041"
+
 # 调用链：全局闸 + 组件级开关。trace.on.<name> 只裁决入链，不裁决构造。
 # 商品域用到了 db / cache / mq / kv / lock / registry 六类，缺一项的 span
 # 会在 Jaeger 上静默消失（不是报错），故这里逐项显式列出。

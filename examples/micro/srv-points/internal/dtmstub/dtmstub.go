@@ -76,6 +76,31 @@ func (t *table) find(col, val string) int {
 	return -1
 }
 
+// hasRow 判「同一行上」的这几列是否与给定值全等 —— 与 has 的区别是
+// has 只看两列，hasRow 看的多列必须落在**同一行**。
+//
+// dtm 的 barrier 唯一键是 (gid, branch_id, op, barrier_id) 四列同一行，
+// 拆成两个二元组分别判会误判：表里已有
+// (gid=A,branch=1,op=action,barrier=x) 与 (gid=B,branch=1,op=compensate,barrier=y) 时，
+// 插入 (gid=A,branch=1,op=compensate,barrier=y) 官方判「不重复」，拆判却两两都命中
+// （前者命中行1、后者命中行2）→ 被当成重复而跳过业务写。这类假绿/假红会让人
+// 误以为 barrier 守卫在起作用。
+func (t *table) hasRow(key map[string]string) bool {
+	for _, r := range t.rows {
+		match := true
+		for col, want := range key {
+			if asString(r[col]) != want {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *table) has(cols [2]string, key [2]string) bool {
 	for _, r := range t.rows {
 		if asString(r[cols[0]]) == key[0] && asString(r[cols[1]]) == key[1] {
@@ -131,7 +156,7 @@ func newDataset() dataset {
 		},
 		"barrier": {
 			cols:   []string{"id", "trans_type", "gid", "branch_id", "op", "barrier_id", "reason"},
-			unique: [][2]string{{"gid", "branch_id"}, {"op", "barrier_id"}},
+			unique: [][2]string{{"gid", "branch_id"}, {"op", "barrier_id"}}, // 仅用于自检提示；真实判重见 hasRow
 		},
 	}
 }
@@ -420,8 +445,11 @@ func (c *stubConn) execBarrierInsert(a []any) (driver.Result, error) {
 	d := c.view()
 	tb := d["barrier"]
 	gid, branch, op, barrierID := asString(a[1]), asString(a[2]), asString(a[3]), asString(a[4])
-	if tb.has([2]string{"gid", "branch_id"}, [2]string{gid, branch}) &&
-		tb.has([2]string{"op", "barrier_id"}, [2]string{op, barrierID}) {
+	// 与 schema-micro.sql 的 uniq_barrier(gid, branch_id, op, barrier_id) 逐列对齐，
+	// 四列必须在同一行上（见 hasRow 的注释）。
+	if tb.hasRow(map[string]string{
+		"gid": gid, "branch_id": branch, "op": op, "barrier_id": barrierID,
+	}) {
 		return driver.RowsAffected(0), nil
 	}
 	tb.rows = append(tb.rows, map[string]any{

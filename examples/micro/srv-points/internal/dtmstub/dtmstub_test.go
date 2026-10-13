@@ -3,6 +3,7 @@ package dtmstub
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"testing"
 )
 
@@ -156,3 +157,50 @@ func TestUnknownStatementIsAnError(t *testing.T) {
 		t.Fatal("未登记的读语句必须报错（取错列会让被测代码拿到别的语义的值还测得过）")
 	}
 }
+
+// TestBarrierUniquenessIsFourColumnsOnOneRow 钉住夹具对 dtm barrier 唯一键的建模：
+// schema-micro.sql 的 uniq_barrier 是 (gid, branch_id, op, barrier_id) **同一行上的
+// 四元组**。若夹具把它拆成 (gid,branch_id) 与 (op,barrier_id) 两个二元组分别判，
+// 下面这组数据就会误判：两对分别命中不同行，于是把一次合法的插入当成重复而返回
+// RowsAffected(0) —— barrier 守卫由此变成假货，而测试仍然绿。
+func TestBarrierUniquenessIsFourColumnsOnOneRow(t *testing.T) {
+	db := New()
+	conn := &stubConn{db: db}
+
+	insert := func(transType, gid, branch, op, barrierID string) driver.Result {
+		t.Helper()
+		res, err := conn.execBarrierInsert([]any{transType, gid, branch, op, barrierID, "reason"})
+		if err != nil {
+			t.Fatalf("barrier 插入不该报错：%v", err)
+		}
+		return res
+	}
+
+	insert("saga", "A", "1", "action", "x")     // 行1
+	insert("saga", "B", "1", "compensate", "y") // 行2
+	if got := db.Barriers(); got != 2 {
+		t.Fatalf("前两行应都插入成功，实际 barrier 行数 %d", got)
+	}
+
+	// 合法插入（官方判不重复）：gid=A branch=1 op=compensate barrier=y
+	// —— 前两列命中行1、后两列命中行2，拆判会误判为重复。
+	res := insert("saga", "A", "1", "compensate", "y")
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("四元组各不相同的一行必须被接受（RowsAffected=1），实际 %d —— 夹具把唯一键拆成两个二元组分别判了", n)
+	}
+	if got := db.Barriers(); got != 3 {
+		t.Fatalf("barrier 行数应为 3，实际 %d", got)
+	}
+
+	// 真重复（同四元组）必须被拒：dtm 靠 RowsAffected==0 判空补偿/重复回调/悬挂。
+	res = insert("saga", "A", "1", "compensate", "y")
+	if n, _ := res.RowsAffected(); n != 0 {
+		t.Fatalf("同四元组重复插入必须返回 RowsAffected=0，实际 %d", n)
+	}
+	if got := db.Barriers(); got != 3 {
+		t.Fatalf("重复插入后行数不得增加，实际 %d", got)
+	}
+}
+
+// 反向探针：把 execBarrierInsert 里的 hasRow(...) 换回拆成两个 has([2]string{...}) 的
+// 旧写法，上面这条用例必须立刻红。

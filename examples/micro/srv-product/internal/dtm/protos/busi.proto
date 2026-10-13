@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package dtmbranch.product;
+
+option go_package = "github.com/gospacex/launchx/examples/micro/srv-product/internal/dtm/protos;protos";
+
+// ProductBusi 商品域的 dtm 分支服务。
+//
+// 方法命名沿 dtm 官方 Saga 惯例：正向 action / 逆向 compensate。本域在整条
+// Saga 里只有**一个**步骤、两个方向：
+//
+//	AddSales   ← action     （销量 +n）
+//	ReduceSales ← compensate（销量 -n）
+//
+// **没有 TCC**。冻结语义只涉及库存与积分，商品域没有「可售/冻结」两态可分 —
+// 硬给它加三段只会让编排侧多两个回调 URL，而其中两段必然是空实现。
+service ProductBusi {
+  // AddSales Saga 正向分支：累计销量 +n（行不存在则 upsert）。
+  rpc AddSales (ProductBusiReq) returns (ProductBusiResp) {}
+
+  // ReduceSales Saga 补偿分支：把 AddSales 加的量原样减回，且必须回到基线。
+  rpc ReduceSales (ProductBusiReq) returns (ProductBusiResp) {}
+}
+
+// ProductBusiReq 分支请求。
+//
+// 三个字段对应 dtm 载荷的三件事，多一个都没有：
+message ProductBusiReq {
+  // biz 业务体的原始 JSON。反序列化在 service 层（领域 DTO），本层不碰 ——
+  // 分支 handler 只做协议转换，业务规则一律不在这一层。
+  string biz = 1;
+
+  // traceparent W3C 链路上下文。正向分支由编排侧（bff）编进载荷，分支面
+  // Extract 回来挂回同一条 trace；补偿由 dtm 定时器异步发起，载荷里没有它，
+  // 此时按「新根 trace + biz.dtm.gid 关联」口径处理。
+  string traceparent = 2;
+
+  // fail_inject 失败注入目标分支名（演示用）：等于本分支名即直接返业务失败，
+  // 用于点火 Saga 逆序补偿链。真机恒为空。
+  string fail_inject = 3;
+}
+
+// ProductBusiResp 分支响应。
+//
+// code / message 是给人和排障看的（与 kitex 面响应体同构，便于对照）。
+// **dtm server 不读这两个字段**：它只看 gRPC status ——
+//
+//	Aborted        业务失败（Saga 立即逆序补偿，不再重试）
+//	FailedPrecondition + ONGOING  稍后重试
+//	其余 status     基础失败（按退避重试）
+//
+// 判定逻辑在 dtmgrpc.GrpcError2DtmError（dtm 客户端库）：dtm 调用分支时用
+// raw codec，响应字节被塞进一个 *[]byte 之后**从不解析**。也就是说把 code
+// 置成 2003 而 status 仍是 OK，dtm 会当成成功往下走 —— 这是分支面最容易写错
+// 的一处，故实现里以 status 为唯一失败出口。
+message ProductBusiResp {
+  int64 code = 1;
+  string message = 2;
+}

@@ -1,0 +1,92 @@
+// dtm 分支面协议（srv-order）。
+//
+// 为什么单独一份 busi.proto 而不扩 order.thrift：
+//   - 传输面不同。order.thrift 走 kitex（+ thriftgo 生成物落在 pkg/kitex_gen，
+//     四域共用一份），dtm server 只按 URL 回调 gRPC 端点。共用一份 IDL 会让
+//     dtm 的生成物混进 kitex_gen，而 spec 明确要求这两面互不渗透
+//     （dtm-branch-facade:「dtm 分支 pb 生成产物只落在 internal/dtm/protos/，
+//     kitex_gen 保持原样」）。
+//   - 载荷形状不同。dtm 分支收的是「原始业务体 JSON + traceparent + 失败注入」
+//     三件套，各域的 biz JSON 互不相同；硬塞进 thrift 结构体就得给四域各写一份
+//     结构体字段，而分支面根本不解析它（解析发生在 service 层的领域 DTO 上）。
+//
+// 生成命令（在 srv-order 仓根执行，产物落在 internal/dtm/protos/ 内，
+// 不进 pkg/kitex_gen）：
+//
+//	protoc --go_out=. --go_opt=paths=source_relative \
+//	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+//	       -I . internal/dtm/protos/busi.proto
+//
+// 注意 `-I .` 而不是 `-I internal/dtm/protos`：source_relative 按「输入文件
+// 相对 proto_path 的路径」落盘，写成后者时 protos/ 成了根，产物会落在
+// internal/dtm/ 下、与 busi.proto 分家两处（而 pkg/kitex_gen 里绝不能有它 ——
+// kitex_gen 是 kitex 的生成物，混进 grpc-go 生成码会让 kitex 工具按错误假设
+// 处理该目录）。
+//
+// 编排侧据此拼 URL：grpc://<listen_addr>/dtmbranch.order.OrderBusi/<Method>
+// 全方法名由 proto package + service + 方法名唯一决定，改 package 即改 URL，
+// 两边必须同步 —— TestFullMethodNamesMatchDtmCallbackURL 钉住这一条。
+
+syntax = "proto3";
+
+package dtmbranch.order;
+
+option go_package = "github.com/gospacex/launchx/examples/micro/srv-order/internal/dtm/protos;protos";
+
+// OrderBusiReq 分支请求。
+//
+// 三个字段对应 dtm 载荷的三件事，多一个都没有：
+message OrderBusiReq {
+  // biz 业务体的原始 JSON（model.DtmOrderCmd 的形状）。反序列化在 service 层
+  // （领域 DTO），本层不碰 —— 分支 handler 只做协议转换，业务规则一律不在这一层。
+  string biz = 1;
+  // traceparent W3C 链路上下文。正向分支由编排侧（bff）编进载荷，分支面
+  // Extract 回来挂回同一条 trace；补偿 / Cancel 由 dtm 异步发起，载荷里没有它，
+  // 此时按「新根 trace + biz.dtm.gid 关联」口径处理。
+  string traceparent = 2;
+  // fail_inject 失败注入目标分支名（演示用）：等于本分支名即直接返业务失败，
+  // 用于点火 Saga 补偿 / TCC Cancel 链。真机恒为空。
+  string fail_inject = 3;
+}
+
+// OrderBusiResp 分支响应。
+//
+// code / message 是给人和排障看的（与 kitex 面响应体同构，便于对照）。
+// **dtm server 不读这两个字段**：dtmsvr/trans_status.go 的 getGrpcResult 把响应
+// 字节整个塞进 *[]byte，从不解析；客户端 dtmgrpc/type.go 的 GrpcError2DtmError
+// 只看 gRPC status —— codes.Aborted 表示业务失败（不重试、转而补偿），其余
+// status 视作基础失败（按退避重试）。也就是说：把 code 置成 3003 而 status
+// 仍是 OK，dtm 会当成成功往下走 —— 这是分支面最容易写错的一处，故在实现里
+// 以 status 为唯一出口（见 internal/dtm/busi_server.go 的 branchError）。
+message OrderBusiResp {
+  int64 code = 1;
+  string message = 2;
+}
+
+// OrderBusi 订单域的 dtm 分支服务。
+//
+// 方法命名沿 dtm 官方 Saga/TCC 惯例：Saga 正向 action / 逆向 compensate，
+// TCC try / confirm / cancel。订单域在这两条链里的位置：
+//   - Saga：stock.Deduct → **order.CreateOrder** → product.销+1 → points.Debit，
+//     任一失败逆序回调时调 **order.CancelOrder**；
+//   - TCC：**order.TryPlace** 建占位单 → 各域冻结 → **order.ConfirmFreeze**
+//     把占位单转正式单，任一冻结失败则 **order.CancelFreeze** 废占位单。
+//
+// outbox 落点（口径②，钉在 service 的 repository 调用形状上）：
+// CreateOrder 与 ConfirmFreeze 写；TryPlace / CancelOrder / CancelFreeze 不写。
+service OrderBusi {
+  // CreateOrder Saga 正向：正式单落库（orders + order_items + outbox 同事务）。
+  rpc CreateOrder(OrderBusiReq) returns (OrderBusiResp) {}
+  // CancelOrder Saga 补偿：把 CreateOrder 建的单作废（status → canceled）。
+  // 逆序执行到本分支时，dtm 的 barrier 会先判它是否为「空补偿」（正向从未到达）
+  // —— 是则只记 barrier 行、不写业务库；落到本方法时正向确实到过。
+  rpc CancelOrder(OrderBusiReq) returns (OrderBusiResp) {}
+
+  // TryPlace TCC 一阶段：建 presale_locked 占位单（**不写 outbox**：单还没成，
+  // 此刻发「下单完成」事件等于通知下游去送积分 / 扣库存，而那两笔随时会被回退）。
+  rpc TryPlace(OrderBusiReq) returns (OrderBusiResp) {}
+  // ConfirmFreeze TCC 二阶段：占位单 → 正式 paid 单，**此刻才写 outbox**。
+  rpc ConfirmFreeze(OrderBusiReq) returns (OrderBusiResp) {}
+  // CancelFreeze TCC 二阶段：废掉占位单（**不写 outbox**）。
+  rpc CancelFreeze(OrderBusiReq) returns (OrderBusiResp) {}
+}

@@ -10,6 +10,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/pkg/handlecheck"
 	productrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/product/product"
 	"github.com/gospacex/launchx/examples/micro/pkg/routing"
+	dtmsetup "github.com/gospacex/launchx/examples/micro/srv-product/internal/dtm"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/handler"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/middleware"
 	"github.com/gospacex/launchx/examples/micro/srv-product/internal/repository"
@@ -38,6 +40,13 @@ const (
 	rateLimitPerMinute = 300 // 读多写少的域，上限比订单域宽
 	rateLimitWindow    = time.Minute
 )
+
+// branchStopTimeout 分支面优雅停机的上限。
+//
+// 上限而非无限等待的理由：停不下来的分支调用会占着 9041 端口，而 dtm 会一直
+// 重试它 —— 端口被占住的话整笔全局事务的补偿链全挂在上面，一笔失败拖成整域
+// 停机。给 5s 是「正常请求跑完」与「不能无限期挂住」之间的折中。
+const branchStopTimeout = 5 * time.Second
 
 // Setup 是注册给 App.OnSetup 的装配回调：
 // 取 DB / Cache / MQ / KV / Lock 句柄 → 断言句柄来源 → 装配
@@ -141,6 +150,21 @@ func Setup(a *launchx.App) error {
 	}
 
 	rt := route.NewRouter(limiter, gate, traceOn, logger)
+
+	// ---- dtm 分支面 listener（Saga AddSales / ReduceSales）----
+	// 地址只来自 config（dtm.branch.listen_addr，见 config.yaml）：Go 代码里零
+	// 硬编码。**不注册 consul**（分支只被 dtm 回调，注册了反而让调用方调到它）。
+	// 装配期起不来即失败：分支面缺席时四域里唯独销量不动，而症状要跑到真机
+	// 跑一笔 Saga 才看得见。
+	branch, err := dtmsetup.Start(cfg.GetString(dtmsetup.ListenAddrKey), svc, traceOn, logger)
+	if err != nil {
+		return errors.New("srv-product: dtm branch face: " + err.Error())
+	}
+	a.OnStopNamed("dtm-branch-graceful", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), branchStopTimeout)
+		defer cancel()
+		return branch.Stop(ctx)
+	})
 
 	a.SetRPCServer(productrpc.NewServer(&srvrpc.Server{Handler: h, Router: rt, TraceOn: traceOn}, opts...))
 	return nil

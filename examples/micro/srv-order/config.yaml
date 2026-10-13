@@ -131,3 +131,12 @@ xmiddleware:
     driver: consul
     addr: "127.0.0.1:8500"
     enable_trace: true
+
+# ----- dtm 分支面（第二条并列入口，grpc-go）-----
+# dtm server 按下面这个地址 + /dtmbranch.order.OrderBusi/<Method> 直连本域分支面，
+# 故它不进 coordx（不是对外服务入口，没有健康检查也没有 auth）。地址只在这里出现
+# 一次，Go 代码里零硬编码。
+# 四域端口约定 9041-9044：商品 9041 / **订单 9042** / 库存 9043 / 积分 9044。
+dtm:
+  branch:
+    listen_addr: "127.0.0.1:9042"
