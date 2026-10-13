@@ -74,3 +74,184 @@ DEALLOCATE PREPARE drop_stmt;
 -- 届请先人工核对（例如按 order_no 分组找出重复项、与 orders 对账后再决定去留），
 -- 去重后重跑本脚本即可。
 -- -----------------------------------------------------------------------------
+
+-- =============================================================================
+-- DTM 增量（add-micro-dtm-saga-tcc）：四域各一份 barrier 表 + 冻结/销量/占位单列
+-- -----------------------------------------------------------------------------
+-- 列定义**逐字取自 dtm 官方 sqls/dtmcli.barrier.mysql.sql**，一处未改：
+--
+--   create table if not exists dtm_barrier.barrier(
+--     id bigint(22) PRIMARY KEY AUTO_INCREMENT,
+--     trans_type varchar(45) default '', gid varchar(128) default '',
+--     branch_id varchar(128) default '', op varchar(45) default '',
+--     barrier_id varchar(45) default '', reason varchar(45) default '',
+--     create_time datetime DEFAULT now(), update_time datetime DEFAULT now(),
+--     key(create_time), key(update_time),
+--     UNIQUE key(gid, branch_id, op, barrier_id)) ...
+--
+-- 唯一键**必须**是 (gid, branch_id, op, barrier_id)。早先的草案漏了 trans_type /
+-- gid 两列、且把唯一键写成 (branch_id, barrier_id) —— 后者会让不同全局事务里
+-- 同名分支互相判重，直接造成跨事务丢账。本文件以官方定义为准。
+--
+-- 与官方的唯一差异：**表落在各域业务库内（表名 barrier），不建独立 dtm_barrier 库**。
+-- 原因是 dtm 的 barrier 行由 BranchBarrier.CallWithDB 在**业务连接的事务内**插入
+-- （见 client/dtmcli/barrier.go：tx := db.Begin() 后 InsertBarrier(tx, ...)），
+-- 落到同一库里才能与业务写同事务原子提交/回滚。四个域各是独立进程，各自在自己的
+-- 连接上执行 `insert ignore into barrier`，天然互不干扰。
+-- 装配期由 dtmx.BarrierFromCtx 设 dtmcli.SetBarrierTableName("barrier")；
+-- 该变量是进程级全局量，跨进程无共享，四域各自设成同名即可。
+--
+-- dtm 的 InsertBarrier 对 MySQL 走 `insert ignore into <表名>(...)`，不引用
+-- 约束名（GetInsertIgnoreTemplate 的 pgConstraint 参数只在 postgres 分支用），
+-- 故唯一键叫什么名字都不影响 MySQL 运行；这里仍命名为 uniq_barrier，与官方
+-- 意图对齐，便于将来换 postgres 时不必改表。
+-- =============================================================================
+
+-- ---- 1) 四域 barrier 表 ------------------------------------------------------
+-- 逐份重复而非一条 `CREATE TABLE ... ` 跨库：MySQL 的 CREATE TABLE 不跨库，
+-- 每份前置自己的 USE，与本文件既有写法同构。
+
+USE stock_db;
+CREATE TABLE IF NOT EXISTS barrier (
+  id          BIGINT      NOT NULL AUTO_INCREMENT,
+  trans_type  VARCHAR(45)  NOT NULL DEFAULT '',
+  gid         VARCHAR(128) NOT NULL DEFAULT '',
+  branch_id   VARCHAR(128) NOT NULL DEFAULT '',
+  op          VARCHAR(45)  NOT NULL DEFAULT '',
+  barrier_id  VARCHAR(45)  NOT NULL DEFAULT '',
+  reason      VARCHAR(45)  NOT NULL DEFAULT '' COMMENT 'the branch type who insert this record',
+  create_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_barrier_create_time (create_time),
+  KEY idx_barrier_update_time (update_time),
+  UNIQUE KEY uniq_barrier (gid, branch_id, op, barrier_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='dtm 子事务屏障（官方定义，按域隔离）';
+
+USE points_db;
+CREATE TABLE IF NOT EXISTS barrier (
+  id          BIGINT      NOT NULL AUTO_INCREMENT,
+  trans_type  VARCHAR(45)  NOT NULL DEFAULT '',
+  gid         VARCHAR(128) NOT NULL DEFAULT '',
+  branch_id   VARCHAR(128) NOT NULL DEFAULT '',
+  op          VARCHAR(45)  NOT NULL DEFAULT '',
+  barrier_id  VARCHAR(45)  NOT NULL DEFAULT '',
+  reason      VARCHAR(45)  NOT NULL DEFAULT '' COMMENT 'the branch type who insert this record',
+  create_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_barrier_create_time (create_time),
+  KEY idx_barrier_update_time (update_time),
+  UNIQUE KEY uniq_barrier (gid, branch_id, op, barrier_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='dtm 子事务屏障（官方定义，按域隔离）';
+
+USE order_db;
+CREATE TABLE IF NOT EXISTS barrier (
+  id          BIGINT      NOT NULL AUTO_INCREMENT,
+  trans_type  VARCHAR(45)  NOT NULL DEFAULT '',
+  gid         VARCHAR(128) NOT NULL DEFAULT '',
+  branch_id   VARCHAR(128) NOT NULL DEFAULT '',
+  op          VARCHAR(45)  NOT NULL DEFAULT '',
+  barrier_id  VARCHAR(45)  NOT NULL DEFAULT '',
+  reason      VARCHAR(45)  NOT NULL DEFAULT '' COMMENT 'the branch type who insert this record',
+  create_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_barrier_create_time (create_time),
+  KEY idx_barrier_update_time (update_time),
+  UNIQUE KEY uniq_barrier (gid, branch_id, op, barrier_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='dtm 子事务屏障（官方定义，按域隔离）';
+
+USE product_db;
+CREATE TABLE IF NOT EXISTS barrier (
+  id          BIGINT      NOT NULL AUTO_INCREMENT,
+  trans_type  VARCHAR(45)  NOT NULL DEFAULT '',
+  gid         VARCHAR(128) NOT NULL DEFAULT '',
+  branch_id   VARCHAR(128) NOT NULL DEFAULT '',
+  op          VARCHAR(45)  NOT NULL DEFAULT '',
+  barrier_id  VARCHAR(45)  NOT NULL DEFAULT '',
+  reason      VARCHAR(45)  NOT NULL DEFAULT '' COMMENT 'the branch type who insert this record',
+  create_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_barrier_create_time (create_time),
+  KEY idx_barrier_update_time (update_time),
+  UNIQUE KEY uniq_barrier (gid, branch_id, op, barrier_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='dtm 子事务屏障（官方定义，按域隔离）';
+
+-- ---- 2) product_db：Saga 销量分支的账变落点 ---------------------------------
+-- 为什么新起一张表而不给 products 加一列：销量是**高频写**（每单 +1），
+-- 与 products 的低频读（详情/列表）挤同一行会把行锁争用拉到整张商品表上；
+-- 且销量需要「可独立回退到基线」的语义，单独成表便于 Saga 补偿断言。
+USE product_db;
+CREATE TABLE IF NOT EXISTS product_sales (
+  product_id BIGINT UNSIGNED NOT NULL,
+  sold       BIGINT       NOT NULL DEFAULT 0 COMMENT '累计销量；Saga 销量分支的账变落点',
+  updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (product_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品销量（Saga 分支账变）';
+
+-- ---- 3) 冻结语义列（TCC Try/Confirm/Cancel） --------------------------------
+-- 三态不变式：available + frozen + reserved <= total
+--   TryFreeze：available↓ frozen↑（尚未实扣，可 Cancel 回退）
+--   Confirm  ：frozen↓（真正实扣，可用永久减少）
+--   Cancel   ：frozen↓ available↑（完全回原状）
+-- 故列必须是「可售之外另立一档 frozen」，不能复用 reserved —— reserved 绑 order_no
+-- 走的是预占流水语义（stock_reservations），与 TCC 的冻结/实扣是两套账。
+
+USE stock_db;
+SET @c_exists := (
+  SELECT COUNT(1) FROM information_schema.COLUMNS
+   WHERE table_schema = 'stock_db' AND table_name = 'stocks' AND column_name = 'frozen'
+);
+SET @c_ddl := IF(@c_exists = 0,
+  'ALTER TABLE stocks ADD COLUMN frozen INT NOT NULL DEFAULT 0 COMMENT ''TCC 冻结量：Try 可售→冻结，Confirm 冻结→实扣，Cancel 冻结→可售''',
+  'DO 0');
+PREPARE frozen_stmt FROM @c_ddl;
+EXECUTE frozen_stmt;
+DEALLOCATE PREPARE frozen_stmt;
+
+USE points_db;
+SET @pc_exists := (
+  SELECT COUNT(1) FROM information_schema.COLUMNS
+   WHERE table_schema = 'points_db' AND table_name = 'point_accounts' AND column_name = 'frozen'
+);
+SET @pc_ddl := IF(@pc_exists = 0,
+  'ALTER TABLE point_accounts ADD COLUMN frozen BIGINT NOT NULL DEFAULT 0 COMMENT ''TCC 冻结积分：Try 可用→冻结，Confirm 冻结→实扣，Cancel 冻结→可用''',
+  'DO 0');
+PREPARE pfrozen_stmt FROM @pc_ddl;
+EXECUTE pfrozen_stmt;
+DEALLOCATE PREPARE pfrozen_stmt;
+
+-- ---- 4) orders：TCC 占位单与 dtm gid 的关联 ---------------------------------
+-- status 已是 VARCHAR(32)，`presale_locked` 是取值而非 schema 变更，无需 DDL。
+-- 真正缺的是「这张占位单属于哪个全局事务」：Confirm/Cancel 回调只带 gid 与
+-- branch_id，不带 order_no，没有这列就只能全表扫 status 猜是哪一张单。
+USE order_db;
+SET @og_exists := (
+  SELECT COUNT(1) FROM information_schema.COLUMNS
+   WHERE table_schema = 'order_db' AND table_name = 'orders' AND column_name = 'dtm_gid'
+);
+SET @og_ddl := IF(@og_exists = 0,
+  'ALTER TABLE orders ADD COLUMN dtm_gid VARCHAR(128) NOT NULL DEFAULT '''' COMMENT ''所属 dtm 全局事务号；Saga/TCC 占位与补偿按它定位''',
+  'DO 0');
+PREPARE og_stmt FROM @og_ddl;
+EXECUTE og_stmt;
+DEALLOCATE PREPARE og_stmt;
+
+SET @ogi_exists := (
+  SELECT COUNT(1) FROM information_schema.statistics
+   WHERE table_schema = 'order_db' AND table_name = 'orders' AND index_name = 'idx_orders_dtm_gid'
+);
+SET @ogi_ddl := IF(@ogi_exists = 0,
+  'ALTER TABLE orders ADD KEY idx_orders_dtm_gid (dtm_gid)',
+  'DO 0');
+PREPARE ogi_stmt FROM @ogi_ddl;
+EXECUTE ogi_stmt;
+DEALLOCATE PREPARE ogi_stmt;
+
+-- -----------------------------------------------------------------------------
+-- dtm server 自己的事务表（trans_global / trans_branch_op / kv）**不在本文件**：
+-- 归属 dtm_db，由 dtm server 的官方 DDL sqls/dtmsvr.storage.mysql.sql 建，见
+-- Task 2 的执行记录。业务四库里不得出现 trans_* 表。
+-- -----------------------------------------------------------------------------
