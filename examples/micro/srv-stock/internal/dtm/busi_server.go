@@ -23,7 +23,9 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
+	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/dtm-labs/client/dtmgrpc"
 
@@ -116,7 +118,7 @@ func (s *BusiServer) branch(ctx context.Context, branch string, req *protos.Stoc
 	if req.GetFailInject() == branch {
 		err = dtmx.BusinessFailure(codes.New(codes.CodeInternal,
 			fmt.Sprintf("fail_inject: 分支 %s 被编排侧指定为失败", branch)))
-		return failResp(err), dtmgrpc.DtmError2GrpcError(err)
+		return failResp(err), branchError(err)
 	}
 
 	// ③ 载荷 → 领域 DTO。坏载荷按业务失败处理：重试一万次也还是坏，而放过去
@@ -124,15 +126,34 @@ func (s *BusiServer) branch(ctx context.Context, branch string, req *protos.Stoc
 	var cmd model.DtmStockCmd
 	if jerr := json.Unmarshal([]byte(req.GetBiz()), &cmd); jerr != nil {
 		err = dtmx.BusinessFailure(codes.Wrap(codes.CodeInvalidParam, "dtm 分支载荷 biz 不是合法 JSON", jerr))
-		return failResp(err), dtmgrpc.DtmError2GrpcError(err)
+		return failResp(err), branchError(err)
 	}
 
 	// ④ 交棒给 service（barrier、事务、库存语义都在那一层之下）。
 	if werr := write(ctx, cmd); werr != nil {
 		err = werr
-		return failResp(err), dtmgrpc.DtmError2GrpcError(err)
+		return failResp(err), branchError(err)
 	}
 	return &protos.StockBusiResp{Code: codes.CodeOK, Message: "ok"}, nil
+}
+
+// branchError 翻成本域（以及四域统一）的失败出口：
+//   - 带 dtm 官方哨兵 → codes.Aborted，dtm 判业务失败、不重试，转而逆序补偿；
+//   - 带 ErrOngoing   → codes.FailedPrecondition，dtm 判仍在进行中；
+//   - 其余            → codes.Internal，dtm 按退避重试。
+//
+// 为什么基础失败要显式翻 Internal 而不能直接 return err：直接返回会被 grpc-go
+// 编成 Unknown。Unknown 在 dtm 侧与 Internal 行为相同（都不是 Aborted，都会重试），
+// 但排查时 Unknown 几乎总被误读成「回调根本没到」，而 Internal 至少说明得出
+// 「是本域自己判的失败」。四域口径必须一致，故与 order/product/points 同形。
+func branchError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if dtmx.IsBusinessFailure(err) {
+		return dtmgrpc.DtmError2GrpcError(err) // ErrFailure → Aborted，ErrOngoing → FailedPrecondition
+	}
+	return status.Error(grpccodes.Internal, err.Error())
 }
 
 // begin 开 rpc.dtm.stock.<Method> span。
