@@ -67,6 +67,9 @@ require (
 	github.com/cloudwego/runtimex v0.1.1 // indirect
 	github.com/cloudwego/thriftgo v0.4.5 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/dtm-labs/client v1.18.7 // indirect
+	github.com/dtm-labs/dtmdriver v0.0.6 // indirect
+	github.com/dtm-labs/logger v0.0.1 // indirect
 	github.com/elastic/elastic-transport-go/v8 v8.6.0 // indirect
 	github.com/elastic/go-elasticsearch/v8 v8.15.0 // indirect
 	github.com/fatih/color v1.16.0 // indirect
@@ -77,6 +80,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-redis/redis/v8 v8.11.5 // indirect
 	github.com/go-redsync/redsync/v4 v4.11.0 // indirect
+	github.com/go-resty/resty/v2 v2.7.0 // indirect
 	github.com/go-sql-driver/mysql v1.7.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
@@ -120,6 +124,7 @@ require (
 	github.com/montanaflynn/stats v0.7.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nacos-group/nacos-sdk-go/v2 v2.2.5 // indirect
+	github.com/natefinch/lumberjack v2.0.0+incompatible // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
