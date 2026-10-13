@@ -98,7 +98,48 @@ dtm server 以官方形态（双端口 :36789/:36790，`STORE_DRIVER=mysql` +
 如积分不足、库存不足）与**基础失败**（普通 gRPC error，dtm 重试）。
 失败注入走载荷 `fail_inject` 字段（`chain.sh --compensate` 演示口径的替代）。
 
+### D7a. gRPC 分支的失败必须走 status code，不是响应体（2026-10-13 amend 新增）
+
+D7 的「业务失败」在 gRPC 分支上**不能**靠响应体表达。dtm 回调用 **raw codec**：
+dtm server v1.19.0 的 `dtmsvr/trans_status.go::getGrpcResult` 把响应字节塞进
+`*[]byte`，**从不解析响应体**；客户端 `dtmgrpc/type.go::GrpcError2DtmError`
+只看 gRPC status —— `Aborted` = 业务失败（不重试）、`FailedPrecondition` + ONGOING、
+其余 = 基础失败（重试）。
+
+故四域分支 handler 的失败返回口径固定为：
+- 业务失败 → `status.Error(codes.Aborted, ...)`
+- 基础失败 → `status.Error(codes.Internal, ...)`
+- 响应体 `Code`/`Message` 只作人读与将来 HTTP 分支桥接，**不参与失败裁决**
+
+这条搞反的后果与 D7 自造哨兵同级：业务失败被当基础失败**无限重试**。
+
+### D7b. 冻结/实扣的三态不变式（2026-10-13 amend 新增）
+
+`total` 是**累计入库量**，`AdjustTx` 的入库是 `total`/`available` 同量增减。
+故 ConfirmFreeze 若只 `frozen -= n` 而不减 `total`，一次入库会被算两遍，
+其后可卖总量虚高。
+
+不变式：`available + frozen + reserved + sold <= total`，且
+- `TryFreeze`：`available -= n, frozen += n`（total 不动，Cancel 才能原样退回）
+- `ConfirmFreeze`：`frozen -= n, total -= n`（真正实扣，累计入库同步减少）
+- `CancelFreeze`：`frozen -= n, available += n`（total 不动）
+- Saga 的 `Deduct`/`Release` 同样做成 `total ∓ n, available ∓ n` 的严格逆运算
+
 ### D8. dtmx 独立为 hubx 平级组件仓（2026-10-13 amend 新增）
+
+公共件三件套（失败语义 / traceparent 续链 / 官方 barrier 包装）落
+`github.com/gospacex/dtmx`（物理路径 `../dtmx`，与 dbx/mqx/kvx/lockx/otelx 平级），
+launchx 以 `replace github.com/gospacex/dtmx => ../dtmx` 消费。
+
+理由：这三样与业务无关，而 dtm 是跨形态能力（saga/tcc 的分支语义在
+examples/{micro,mall,monolith,mesh} 都成立）。留在 `examples/micro/pkg/` 下会让
+下一个接 dtm 的形态复制一份，而复制件之间的一致性只能靠人工 —— 这正是 D7 那个
+风险（自造失败哨兵）的成因。独立成组件仓后，复制变成 import。
+
+边界：dtmx 是**纯库**，不 import launchx / configx / dbx，不起 listener、不读配置；
+branch URL 的 `<host:port>` 段由调用方从自己的 config 拼入（dtm server 负责拆解与拨号）。
+依赖方向上 `ExtractParent` 走 `otelx/propagation`（launchx 的 Inject/Extract 背后
+即它），**不可**反向 import launchx —— 会被 replace 闭成环。
 
 ## Risks / Trade-offs
 
