@@ -93,18 +93,46 @@ grep -rn "ResultFailure\|CodeFailure" "$DTM_CLIENT/dtmgrpc/*.go" | head -8
 预期：以上每个 grep 都有命中。把 `NewSaga`/`Saga.Add`/`NewTcc`/`CallBranch`/`BarrierFromGrpc`/`Barrier.Call`/失败语义常量的真实签名**登记到本计划 Task 4 的执行记录**；若与下文 Task 10/11/5-9 内嵌代码签名有差异，按真实签名**同步修正后续 Task 的代码**（这是钉版核实，不是占位——修正方式是编辑本计划对应代码块）。
 预期：签名与内嵌代码一致或已修正。
 
-- [ ] **Step 1.4：Commit**
+- [x] **Step 1.4：Commit**
 
 ```bash
 git add go.mod go.sum docs/superpowers/plans/2026-10-13-add-micro-dtm-saga-tcc.md
 git commit -m "chore(micro): pin dtm-labs/client for saga/tcc branches"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready `任务完成`、tasks.md `0.1` 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready `任务完成`、tasks.md `0.1` 同步）
 
 ---
 
 ### Task 2: 底座 compose 追加 dtm 服务
+#### ⚠️ 执行记录：部署形态偏离 —— 官方镜像不可达，改源码构建（2026-10-13）
+
+design.md D6 写的是「dtm server **官方镜像**追加进现有底座 compose」。实测本机网络下
+**该路径走不通**，改用等价手段落地，D6 的其余口径（mysql store / 双端口 / 独立 dtm_db）全部保留：
+
+| D6 原定 | 实际落地 | 原因 |
+|---|---|---|
+| 官方镜像 `docker compose` 服务 | **`go install github.com/dtm-labs/dtm@latest` 源码构建**，二进制 `$(go env GOPATH)/bin/dtm`，宿主进程直跑 | `docker.io` 在本网络不可达（`registry-1.docker.io` 连接超时）；已配的 5 个加速器与华为云 SWR 均未代理该镜像（SWR 需鉴权）。Go module proxy 可达，故走源码。落地版本 **dtm v1.19.0**（client 仍 v1.18.7，跨小版本，无破坏性变更）。 |
+| dtm 自建事务表 | **须先灌官方 DDL**：`sqls/dtmsvr.storage.mysql.sql`，且该文件**硬编码库名 `dtm`** | D6 与原计划都假设「dtm 自建表」，实测不成立：不灌 DDL 直接起服，cron 持续 panic（`Table 'dtm_db.trans_global' doesn't exist`）。本次按底座口径 `dtm_db` 改写前缀后灌入。 |
+| `STORE_USER=root` / `STORE_PASSWORD=hubx123` | `STORE_USER=root` / 口令取底座实际值 | 计划里的 `hubx123` 是虚构值。底座 `docker-compose.yml` 的 mysql 实为 `MYSQL_ROOT_PASSWORD: rootpass` / `MYSQL_USER: testuser`；应用账号是 `mall_rw` + `$HUBX_DB_PW`。**口令一律从环境取，不写进仓库**。 |
+
+**起停口径（替代 `docker compose up -d dtm`）：**
+```bash
+export MYSQL_PWD=<底座 mysql root 口令>
+docker exec -i -e MYSQL_PWD mysql mysql -uroot -e "CREATE DATABASE IF NOT EXISTS dtm_db DEFAULT CHARACTER SET utf8mb4;"
+# 事务表 DDL：官方 sqls/dtmsvr.storage.mysql.sql，去掉 CREATE DATABASE 行、dtm. 前缀改 dtm_db.
+STORE_DRIVER=mysql STORE_HOST=127.0.0.1 STORE_PORT=3306 STORE_USER=root \
+  STORE_PASSWORD="$MYSQL_PWD" STORE_DB=dtm_db $(go env GOPATH)/bin/dtm
+```
+监听：HTTP `:36789`、gRPC `:36790`。健康判据：`grep -c 'recovered panic' <log>` 必须为 0。
+
+> **注意（转 Task 3）**：官方屏障表 DDL 在 `sqls/dtmcli.barrier.mysql.sql`，**且它建的是
+> 独立数据库 `dtm_barrier`**（`create database if not exists dtm_barrier`），不是各域业务库里的表。
+> D5「barrier 表进各域业务库」与官方形态不一致，Task 3 必须按真实 DDL 落，**不得沿用本计划
+> Step 3.1 里那份猜的 DDL**（那份缺 `trans_type` / `gid` 两列，且唯一键写成 `(branch_id, barrier_id)`
+> 而非官方的 `(gid, branch_id, op, barrier_id)` —— 按错 DDL 建表会让不同事务的同名 branch 互相冲突，
+> 造成跨事务脏数据）。
+
 
 > **trace:** plan-ready.md → `### Task 2: 底座 compose 追加 dtm 服务（对应 tasks.md 0.2）` | tasks.md → `- [ ] 0.2 底座 compose 追加 dtm 服务：官方镜像 + 官方环境变量形态（\`STORE_DRIVER=mysql\`、\`STORE_HOST/PORT/USER/PASSWORD/DB=dtm_db\`、:36789/:36790 双端口，\`PORT/HTTP_PORT/GRPC_PORT\` 就位）；\`dtm_db\` 建库先于 dtm 启动；健康检查指向 gRPC 端口。验收：compose up 后 \`dtm_db\` 出现 \`trans_global\` / \`trans_branch_op\` 自建表，业务四库零 dtm 表`
 > **sync:** tasks.md → `- [ ] 0.2 底座 compose 追加 dtm 服务：官方镜像 + 官方环境变量形态（\`STORE_DRIVER=mysql\`、\`STORE_HOST/PORT/USER/PASSWORD/DB=dtm_db\`、:36789/:36790 双端口，\`PORT/HTTP_PORT/GRPC_PORT\` 就位）；\`dtm_db\` 建库先于 dtm 启动；健康检查指向 gRPC 端口。验收：compose up 后 \`dtm_db\` 出现 \`trans_global\` / \`trans_branch_op\` 自建表，业务四库零 dtm 表` | plan-ready.md → `### Task 2: 底座 compose 追加 dtm 服务（对应 tasks.md 0.2）`
@@ -112,7 +140,7 @@ git commit -m "chore(micro): pin dtm-labs/client for saga/tcc branches"
 **Files:**
 - 修改：`/Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml`（外部底座，与现 mysql/redis/kafka/consul/jaeger 同处）
 
-- [ ] **Step 2.1：compose 增段**
+- [x] **Step 2.1：compose 增段**
 
 在 `docker-compose.yml` 的 services 追加（官方 docker 方案的环境变量形态，等价 `docker run` 文档参数）：
 
@@ -146,7 +174,7 @@ git commit -m "chore(micro): pin dtm-labs/client for saga/tcc branches"
 
 > 密码口径与底座 `HUBX_DB_PW=hubx123` 一致；镜像 tag 执行时以官方 README 的 docker run 为准（官方文档形态：`docker run --rm -p 36789:36789 -p 36790:36790 -e STORE_DRIVER=mysql ...`）。镜像名 / `PORT` 型环境变量三行按 docker pull 实测写入，云偏差不算脱发——写实际拉下来的 `REPO/TAG`。
 
-- [ ] **Step 2.2：起服并验证**
+- [x] **Step 2.2：起服并验证**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/dockers && (command -v docker-compose >/dev/null || true)
@@ -165,7 +193,7 @@ done
 ```
 预期：四库全部 `OK`。
 
-- [ ] **Step 2.3：Kill/重启续推进基础设施可达性预检**
+- [x] **Step 2.3：Kill/重启续推进基础设施可达性预检**
 
 ```bash
 docker stop dtm && docker start dtm && sleep 3 && docker ps --filter name=dtm --format '{{.Status}}'
