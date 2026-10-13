@@ -24,17 +24,17 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/events"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
-	"github.com/gospacex/launchx/examples/pkg/traceparent"
+	"github.com/gospacex/otelx/propagation"
 )
 
 // orderCacheTTL 订单主表缓存存活时间。
 //
 // 原先这个值写在 fill 里（`5*time.Minute`），读策略收口后必须提到常量：
-// cacheutil 要它作为 Options.TTL，而 fill 已不存在。
+// loadthrough 要它作为 Options.TTL，而 fill 已不存在。
 const orderCacheTTL = 5 * time.Minute
 
 // orderRepo 是 service 真正依赖的窄接口：只含它调用的四个方法。
@@ -158,7 +158,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (re
 	}
 	// traceparent 在事务外取好：它只依赖 ctx 里的 span context，与库无关；
 	// fill 在事务内被回调时直接闭包引用。
-	tp := traceparent.Of(ctx, s.traceOn)
+	tp := propagation.TraceparentIf(ctx, s.traceOn)
 	out, err := s.repo.Create(ctx, o, items, func(orderID uint64) (string, string) {
 		payload, mErr := events.OrderCompleted{
 			OrderID: orderID, UserID: in.UserID, TotalAmount: total, OccurredAt: time.Now(),
@@ -216,7 +216,7 @@ func newOrderNo() string {
 
 // GetOrder 查单：先缓存，未命中回源并回填。
 //
-// 读缓存走 cacheutil.FetchResult（含空值哨兵）：查不存在的 id 会回填一条短期
+// 读缓存走 loadthrough.FetchResult（含空值哨兵）：查不存在的 id 会回填一条短期
 // 负缓存，否则"批量请求不存在的 id"能把整层缓存旁路掉，压力直接落到 DB。
 // 用 FetchResult 而不是 Fetch 是因为 OrderView.Cached 是验收判据的一部分。
 //
@@ -226,12 +226,12 @@ func (s *OrderService) GetOrder(ctx context.Context, id uint64) (v *OrderView, e
 	ctx, end := layer.Begin(ctx, "service", "order", "GetOrder", s.traceOn, nil)
 	defer func() { end(err) }()
 
-	res, err := cacheutil.FetchResult(ctx, s.cache, s.cacheOpt(), s.key(id),
+	res, err := loadthrough.FetchResult(ctx, s.cache, s.cacheOpt(), s.key(id),
 		func(ctx context.Context) (*model.Order, error) {
 			return s.repo.FindByID(ctx, id)
 		})
 	if err != nil {
-		var nf *cacheutil.NotFound
+		var nf *loadthrough.NotFound
 		if errors.As(err, &nf) {
 			return nil, codes.New(codes.OrderNotFound, fmt.Sprintf("order %d not found", id))
 		}
@@ -254,8 +254,8 @@ func (s *OrderService) GetOrder(ctx context.Context, id uint64) (v *OrderView, e
 }
 
 // cacheOpt 本域读缓存的统一参数（正缓存 TTL 与空值哨兵只在这一处定义）。
-func (s *OrderService) cacheOpt() cacheutil.Options {
-	return cacheutil.Options{
+func (s *OrderService) cacheOpt() loadthrough.Options {
+	return loadthrough.Options{
 		Label: "order",
 		TTL:   orderCacheTTL,
 		NotFound: func(err error) bool {
@@ -315,10 +315,10 @@ func (s *OrderService) key(id uint64) string {
 	return "mesh:order:detail:" + strconv.FormatUint(id, 10)
 }
 
-// 解码与回填不再在本域手写：都归 cacheutil（见 GetOrder）。
+// 解码与回填不再在本域手写：都归 loadthrough（见 GetOrder）。
 //
 // 原先 decodeOrder 里那条 `o.ID == 0 → 视为 miss` 的判据没有丢，它搬进了
-// model.Order.Valid（cacheutil.Validatable）—— 规则跟着值走，而不是留在
+// model.Order.Valid（loadthrough.Validatable）—— 规则跟着值走，而不是留在
 // 某一个域的解码函数里、让其它域各写一份。
 // 「明细不进缓存」这条仍在本域表达（GetOrder 里显式分开查），因为它不是
 // 通用规则，是本域对明细变更频率的判断。

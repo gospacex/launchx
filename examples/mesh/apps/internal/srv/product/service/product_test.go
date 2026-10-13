@@ -141,7 +141,7 @@ type recLogger struct {
 func (l *recLogger) Warn(msg string, _ ...logx.Field) { l.warns = append(l.warns, msg) }
 
 // WarnContext 必须一并覆写：logx.Logger 是**嵌入的 nil 接口**，只补 Warn 的话
-// 走 WarnContext 的调用（cacheutil 的告警就走它）会被转发到 nil 接口上 panic。
+// 走 WarnContext 的调用（loadthrough 的告警就走它）会被转发到 nil 接口上 panic。
 func (l *recLogger) WarnContext(_ context.Context, msg string, _ ...logx.Field) {
 	l.warns = append(l.warns, msg)
 }

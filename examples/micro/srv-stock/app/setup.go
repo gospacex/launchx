@@ -23,6 +23,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/pkg/handlecheck"
 	stockrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/stock/stock"
 	"github.com/gospacex/launchx/examples/micro/pkg/routing"
+	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/dtm"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/handler"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/middleware"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/repository"
@@ -41,7 +42,7 @@ const (
 
 // Setup 是注册给 App.OnSetup 的装配回调：
 // 取 DB / Cache / MQ / KV / Lock 句柄 → 断言句柄来源 → 装配
-// repository → outbox → service → handler → route → rpc 桩 →
+// repository → outbox → service → dtm 分支面 → handler → route → rpc 桩 →
 // 用 launchx 产出的 kitex 选项建服务端 → SetRPCServer 回存。
 //
 // 失败即返回 error：装配期报错好过带着半装配的状态把服务起出去 ——
@@ -120,6 +121,16 @@ func Setup(a *launchx.App) error {
 		traceOn,
 		logger,
 	)
+
+	// dtm 分支面（grpc-go，第二条并列入口）：地址取 dtm.branch.listen_addr，
+	// 不注册 consul。它与 kitex 面汇到同一个 service —— 业务规则一份，幂等各由
+	// 各自的机制裁决（barrier vs stock_reservations 唯一键），互不冒充。
+	//
+	// 装配失败即启动失败：分支面起不来时 dtm server 回调会 404，而全局事务会在
+	// 那边一直挂着直到超时 —— 那时候本服务日志里什么都没有。
+	if err := dtm.Setup(a, svc); err != nil {
+		return errors.New("srv-stock: " + err.Error())
+	}
 
 	// 限流器只在 KV 组件可用时启用（kv 为 nil 时 Allow 恒 true：fail-open）
 	var limiter *middleware.RateLimiter

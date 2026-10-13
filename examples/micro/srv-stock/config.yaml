@@ -44,6 +44,16 @@ logx:
 metrics:
   enabled: true
   addr: "127.0.0.1:9034"
+# ----- dtm 分支面：承接 dtm server 的 Saga/TCC gRPC 回调 -----
+# 独立于 rpcx(kitex) 的第二个监听口：dtm server 只按 URL 直连它，
+# **不注册进 consul**（分支面没有健康检查与鉴权，注册进去只会让运维多看到一个
+# 裸 gRPC 端点）。四域端口约定 9041-9044，库存域 9043。
+# barrier 表名（barrier，落在 stock_db 内）不是环境变量而是 schema 契约，见
+# examples/micro/scripts/schema-micro.sql 与 internal/dtm/setup.go 的注释。
+dtm:
+  branch:
+    listen_addr: "127.0.0.1:9043"
+
 # ----- 鉴权：只校验边界层（bff）透传下来的身份，不重复验签 -----
 # require=false 表示"内网可信、任何入站 RPC 都放行"：只在受控网络里用。
 # 这一段整体缺失时装配层按 **true** 处理（安全默认值），不会静默裸奔。

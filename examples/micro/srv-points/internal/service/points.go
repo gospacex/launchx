@@ -39,13 +39,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/repository"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
-	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/otelx/propagation"
 )
 
 // pointsLockTTL 入账/消费互斥的持锁上限。
@@ -73,24 +73,35 @@ type PointsService struct {
 	// kv 限流计数 + 幂等键（nil 表示 KV 组件未装配 → 幂等降级为只靠数据库）
 	kv kvx.KVStore
 	// lock 入账/消费按用户互斥（nil 表示锁组件未装配 → fail-open）
-	lock    lockx.Locker
-	traceOn bool
-	logger  logx.Logger
+	lock lockx.Locker
+	// dtmStore dtm 分支写通道（nil 表示装配漏了它 → 分支方法报 1003 并拒绝记账；
+	// 宁可不记，也不在无 barrier 的情况下落库，见 dtm_points.go）
+	dtmStore *repository.DtmBranchStore
+	traceOn  bool
+	logger   logx.Logger
 }
 
 // NewPointsService 构造（cache / kv / lock 允许 nil，见字段注释）
+//
+// dtmStore 由装配层显式传入而不是在这里从 repo 反推：它是**另一个连接形态**
+// （官方 barrier 事务要用 *sql.Tx，见 dtm_points.go 的包注释），让它在装配层
+// 显式出现一次，装配审阅时能一眼看到「分支面用的是 launchx 那个 dbx 句柄」。
 func NewPointsService(
 	repo *repository.PointsRepository,
 	cache cachex.Cache,
 	kv kvx.KVStore,
 	lock lockx.Locker,
+	dtmStore *repository.DtmBranchStore,
 	traceOn bool,
 	logger logx.Logger,
 ) *PointsService {
 	if logger == nil {
 		logger = logx.GetGlobal()
 	}
-	return &PointsService{repo: repo, cache: cache, kv: kv, lock: lock, traceOn: traceOn, logger: logger}
+	return &PointsService{
+		repo: repo, cache: cache, kv: kv, lock: lock,
+		dtmStore: dtmStore, traceOn: traceOn, logger: logger,
+	}
 }
 
 // Repo 暴露仓储（pkg/handlecheck 断言 / 对账用）
@@ -112,7 +123,7 @@ func (s *PointsService) begin(ctx context.Context, op string) (context.Context, 
 // 也就是这份投影 —— 缓存值与回源值必须是同一个结构，否则"命中缓存就没有
 // 流水笔数"这种半截响应会反复出现。
 //
-// 读缓存走 cacheutil.Fetch（含空值哨兵）：查没开过户的 user 会回填一条短期
+// 读缓存走 loadthrough.Fetch（含空值哨兵）：查没开过户的 user 会回填一条短期
 // 负缓存，否则"批量请求不存在的用户"能把整层缓存旁路掉，压力直接落到 DB。
 // 首次入账会经 apply → invalidate 把这条负缓存删掉（开户即该键转为存在）。
 func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery) (out *model.AccountDetail, err error) {
@@ -124,11 +135,11 @@ func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery)
 	}
 	key := accountCacheKey(q.UserID)
 
-	a, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.AccountDetail, error) {
+	a, err := loadthrough.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.AccountDetail, error) {
 		return s.repo.GetAccount(ctx, q.UserID)
 	})
 	if err != nil {
-		// *cacheutil.NotFound 会 Unwrap 到 repository.ErrNotFound，
+		// *loadthrough.NotFound 会 Unwrap 到 repository.ErrNotFound，
 		// 因此 mapRepoErr 的 errors.Is 分支照样认得出 —— 命中负缓存与
 		// 回源 miss 走同一条翻译路径，不会给出两种不同的错误码。
 		return nil, s.mapRepoErr(ctx, err)
@@ -140,8 +151,8 @@ func (s *PointsService) GetAccount(ctx context.Context, q model.GetAccountQuery)
 //
 // 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
 // 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
-func (s *PointsService) cacheOpt() cacheutil.Options {
-	return cacheutil.Options{
+func (s *PointsService) cacheOpt() loadthrough.Options {
+	return loadthrough.Options{
 		Label: "points",
 		TTL:   accountCacheTTL,
 		NotFound: func(err error) bool {
@@ -223,7 +234,7 @@ func (s *PointsService) apply(ctx context.Context, userID uint64, orderNo string
 	}
 	defer unlock()
 
-	tp := traceparent.Of(ctx, s.traceOn)
+	tp := propagation.TraceparentIf(ctx, s.traceOn)
 	out, err := s.repo.ChangeTx(ctx, repository.ChangeInput{
 		UserID:  userID,
 		OrderNo: orderNo,

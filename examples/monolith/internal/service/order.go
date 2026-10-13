@@ -28,13 +28,13 @@ import (
 
 	"github.com/gospacex/otelx/layer"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/monolith/internal/cache"
 	"github.com/gospacex/launchx/examples/monolith/internal/docs"
 	"github.com/gospacex/launchx/examples/monolith/internal/messaging"
 	"github.com/gospacex/launchx/examples/monolith/internal/model"
 	"github.com/gospacex/launchx/examples/monolith/internal/repository"
 	"github.com/gospacex/launchx/examples/monolith/internal/search"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 )
 
 // 领域错误。handler 按类型映射 HTTP 状态码，故这里的取值是业务语义而非 HTTP 语义。
@@ -198,7 +198,7 @@ func (s *Service) clampLimit(limit int) int {
 // 缓存出错刻意**不返回错误** —— 它只是加速件，坏了必须降级到打库而不是让请求失败；
 // 但要在 span 上留 "cache.enabled / cache.hit" 之外的失败标记，否则命中率问题无从查。
 //
-// 读缓存走 cacheutil.Fetch（含空值哨兵）：查不存在的单号会回填一条短期负缓存，
+// 读缓存走 loadthrough.Fetch（含空值哨兵）：查不存在的单号会回填一条短期负缓存，
 // 否则"批量请求不存在的单号"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, err error) {
 	ctx, end := s.begin(ctx, "GetOrder")
@@ -208,11 +208,11 @@ func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, er
 	}
 	layer.Attrs(ctx, attribute.Bool("cache.enabled", s.cache != nil))
 
-	out, err = cacheutil.Fetch(ctx, s.store(), s.cacheOpt(), orderNo, func(ctx context.Context) (*model.Order, error) {
+	out, err = loadthrough.Fetch(ctx, s.store(), s.cacheOpt(), orderNo, func(ctx context.Context) (*model.Order, error) {
 		return s.repo.Get(ctx, orderNo)
 	})
 	if err != nil {
-		var nf *cacheutil.NotFound
+		var nf *loadthrough.NotFound
 		if errors.As(err, &nf) {
 			// 命中空值哨兵时 Cause 为 nil（缓存里没存原始错误），
 			// 回源 miss 时 Cause 是 repository.ErrNotFound —— 两者对外都是"没有这单"。
@@ -223,13 +223,13 @@ func (s *Service) Get(ctx context.Context, orderNo string) (out *model.Order, er
 	return out, nil
 }
 
-// store 交给 cacheutil 的缓存句柄（未配缓存时为 nil）。
+// store 交给 loadthrough 的缓存句柄（未配缓存时为 nil）。
 //
 // ⚠️ 判空必须在这里做，不能让调用方直接传 `s.cache`：`s.cache` 是 `*cache.Order`，
-// **typed nil 指针转成接口后 != nil**，直接传会让 cacheutil 以为缓存已装配，
+// **typed nil 指针转成接口后 != nil**，直接传会让 loadthrough 以为缓存已装配，
 // 转头在 nil 接收者上调方法。这个坑只出现在"没配缓存"这条降级路径上，
 // 而它恰恰是默认配置下最容易走到的那条。
-func (s *Service) store() cacheutil.Store {
+func (s *Service) store() loadthrough.Store {
 	if s.cache == nil {
 		return nil
 	}
@@ -240,12 +240,12 @@ func (s *Service) store() cacheutil.Store {
 //
 // TTL 从 cache.Order 取而不是再写一份：TTL 的真源是装配层给出的配置，
 // 抄一份到 service 会让"改了配置只有一半缓存跟着变"。
-func (s *Service) cacheOpt() cacheutil.Options {
+func (s *Service) cacheOpt() loadthrough.Options {
 	ttl := time.Duration(0)
 	if s.cache != nil {
 		ttl = s.cache.TTL()
 	}
-	return cacheutil.Options{
+	return loadthrough.Options{
 		Label: "order",
 		TTL:   ttl,
 		NotFound: func(err error) bool {
@@ -255,7 +255,7 @@ func (s *Service) cacheOpt() cacheutil.Options {
 	}
 }
 
-// orderCacheStore 把 *cache.Order 适配成 cacheutil.Store。
+// orderCacheStore 把 *cache.Order 适配成 loadthrough.Store。
 //
 // 为什么要适配而不是直接把 cachex.Cache 交出去：cache.Order 外面还包着一层业务
 // span（"谁在读缓存"）—— 直接用裸 cachex 的话，Jaeger 上只剩一条 redis 命令，

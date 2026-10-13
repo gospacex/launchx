@@ -10,7 +10,7 @@ import (
 // TestStoreNilWhenNoCache typed nil 陷阱的运行时守卫。
 //
 // `s.cache` 是 `*cache.Order`：一个 **nil 指针转成接口后 != nil**。
-// store() 若不显式判空，cacheutil 就会以为缓存已装配，转头在 nil 接收者上
+// store() 若不显式判空，loadthrough 就会以为缓存已装配，转头在 nil 接收者上
 // 调 Get —— 而"没配缓存"恰恰是默认配置下最容易走到的路径。
 //
 // 反向探针（已实测）：把 store() 里的判空删掉、直接 `return s.cache`
@@ -19,7 +19,7 @@ func TestStoreNilWhenNoCache(t *testing.T) {
 	s := &Service{} // 未配缓存
 	if got := s.store(); got != nil {
 		t.Fatalf("未配缓存时 store() 必须返回 nil 接口，实际 %T —— "+
-			"typed nil 会让 cacheutil 以为缓存已装配", got)
+			"typed nil 会让 loadthrough 以为缓存已装配", got)
 	}
 }
 

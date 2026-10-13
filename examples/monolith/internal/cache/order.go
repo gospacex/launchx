@@ -41,7 +41,7 @@ func key(orderNo string) string { return "order:" + orderNo }
 // TTL 正缓存的存活时间（构造时给定）。
 //
 // 装配层把 TTL 交给本层之后，service 就不该再有第二个 TTL 来源 —— 否则
-// "改了配置却只有一半缓存跟着变"。读策略层（cacheutil）要正缓存 TTL 时从这里取。
+// "改了配置却只有一半缓存跟着变"。读策略层（loadthrough）要正缓存 TTL 时从这里取。
 func (c *Order) TTL() time.Duration { return c.ttl }
 
 // begin 开本层 span（名字沿用既有的两段式 cache.<Op>，不走三段式，

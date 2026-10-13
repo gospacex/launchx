@@ -1,0 +1,83 @@
+// dtm 分支面协议（srv-stock）。
+//
+// 为什么单独一份 busi.proto 而不扩 stock.thrift：
+//   - 传输面不同。stock.thrift 走 kitex（+ thriftgo 生成物落在 pkg/kitex_gen，
+//     四域共用一份），dtm server 只按 URL 回调 gRPC 端点。共用一份 IDL 会让
+//     dtm 的生成物混进 kitex_gen，而 spec 明确要求这两面互不渗透
+//     （dtm-branch-facade:「dtm 分支 pb 生成产物只落在 internal/dtm/proto/，
+//     kitex_gen 保持原样」）。
+//   - 载荷形状不同。dtm 分支收的是「原始业务体 JSON + traceparent + 失败注入」
+//     三件套，各域的 biz JSON 互不相同；硬塞进 thrift 结构体就得给四域各写一份
+//     结构体字段，而分支面根本不解析它（解析发生在 service 层的领域 DTO 上）。
+//
+// 生成命令（在 internal/dtm/ 下执行，产物落在 protos/ 内，不进 pkg/kitex_gen）：
+//
+//	protoc --go_out=. --go_opt=paths=source_relative \
+//	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+//	       -I . protos/busi.proto
+//
+// 注意 `-I .` 而不是 `-I protos`：source_relative 按「输入文件相对 proto_path 的
+// 路径」落盘，写成 `-I protos` 时 protos/ 成了根，产物会落在 internal/dtm/ 下、
+// 与 busi.proto 分家两处（而 pkg/kitex_gen 里绝不能有它 —— kitex_gen 是 kitex
+// 的生成物，混进 grpc-go 生成码会让 kitex 工具按错误假设处理该目录）。
+//
+// 编排侧据此拼 URL：grpc://<listen_addr>/dtmbranch.stock.StockBusi/<Method>
+// 全方法名由 proto package + service + 方法名唯一决定，改 package 即改 URL，
+// 两边必须同步 —— TestFullMethodNamesMatchDtmCallbackURL 钉住这一条。
+
+syntax = "proto3";
+
+package dtmbranch.stock;
+
+option go_package = "github.com/gospacex/launchx/examples/micro/srv-stock/internal/dtm/protos;protos";
+
+// StockBusiReq 分支请求。
+//
+// 三个字段对应 dtm 载荷的三件事，多一个都没有：
+message StockBusiReq {
+  // biz 业务体的原始 JSON。反序列化在 service 层（领域 DTO），本层不碰 ——
+  // 分支 handler 只做协议转换，业务规则一律不在这一层。
+  string biz = 1;
+  // traceparent W3C 链路上下文。正向分支由编排侧（bff）编进载荷，分支面
+  // Extract 回来挂回同一条 trace；补偿 / Cancel 由 dtm 异步发起，载荷里没有它，
+  // 此时按「新根 trace + biz.dtm.gid 关联」口径处理。
+  string traceparent = 2;
+  // fail_inject 失败注入目标分支名（演示用）：等于本分支名即直接返业务失败，
+  // 用于点火 Saga 补偿 / TCC Cancel 链。真机恒为空。
+  string fail_inject = 3;
+}
+
+// StockBusiResp 分支响应。
+//
+// code / message 是给人和排障看的（与 kitex 面响应体同构，便于对照）。
+// **dtm server 不读这两个字段**：它只看 gRPC status —— codes.Aborted 表示
+// 业务失败（不重试、转而补偿），其余 status 视作基础失败（按退避重试）。
+// 判定逻辑在 dtmgrpc.DtmError2GrpcError（dtm 客户端库里）。
+// 也就是说：把 code 置成 4002 而 status 仍是 OK，dtm 会当成成功往下走 ——
+// 这是分支面最容易写错的一处，故在实现里以 status 为唯一出口。
+message StockBusiResp {
+  int64 code = 1;
+  string message = 2;
+}
+
+// StockBusi 库存域的 dtm 分支服务。
+//
+// 方法命名沿 dtm 官方 Saga/TCC 惯例：Saga 正向 action / 逆向 compensate，
+// TCC try / confirm / cancel。编排侧 saga 序为
+// stock.Deduct → order.CreateOrder → product.销+1 → points.Debit，
+// 补偿按逆序调 stock.Release。
+service StockBusi {
+  // Deduct Saga 正向：扣减可售库存（落 stocks + stock_logs 流水）。
+  rpc Deduct(StockBusiReq) returns (StockBusiResp) {}
+  // Release Saga 补偿：把 Deduct 扣掉的量原样回补。逆序执行到本分支时，
+  // dtm 的 barrier 会先判它是否为「空补偿」（正向从未到达）—— 是则只记 barrier
+  // 不写业务库。
+  rpc Release(StockBusiReq) returns (StockBusiResp) {}
+
+  // TryFreeze TCC 一阶段：可售 → 冻结（尚未实扣，可被 Cancel 原样退回）。
+  rpc TryFreeze(StockBusiReq) returns (StockBusiResp) {}
+  // ConfirmFreeze TCC 二阶段：冻结 → 实扣，永久生效。
+  rpc ConfirmFreeze(StockBusiReq) returns (StockBusiResp) {}
+  // CancelFreeze TCC 二阶段：冻结 → 可售，完全回原状。
+  rpc CancelFreeze(StockBusiReq) returns (StockBusiResp) {}
+}

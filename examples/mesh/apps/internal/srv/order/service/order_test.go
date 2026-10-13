@@ -143,7 +143,7 @@ type fakeLogger struct {
 func (l *fakeLogger) Warn(msg string, _ ...logx.Field) { l.warns = append(l.warns, msg) }
 
 // WarnContext 必须一并实现：logx.Logger 是**嵌入的 nil 接口**，只补 Warn 的话，
-// 走 WarnContext 的调用（cacheutil 的告警就走它）会被转发到 nil 接口上 panic。
+// 走 WarnContext 的调用（loadthrough 的告警就走它）会被转发到 nil 接口上 panic。
 // 那是替身的洞，不是被测代码的问题 —— 别为了绕开它去改被测代码用哪个方法。
 func (l *fakeLogger) WarnContext(_ context.Context, msg string, _ ...logx.Field) {
 	l.warns = append(l.warns, msg)

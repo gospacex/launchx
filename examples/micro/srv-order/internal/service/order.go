@@ -37,13 +37,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/repository"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
-	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/otelx/propagation"
 )
 
 // orderLockTTL 同用户下单互斥的持锁上限。
@@ -128,7 +128,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 	}
 	defer unlock()
 
-	tp := traceparent.Of(ctx, s.traceOn)
+	tp := propagation.TraceparentIf(ctx, s.traceOn)
 	rec, err := s.repo.CreateOrderTx(ctx, repository.CreateOrderInput{
 		UserID:      cmd.UserID,
 		OrderNo:     orderNo,
@@ -182,7 +182,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, cmd model.CreateOrderCmd
 // 由 Delete 显式失效），故走 cachex；限流计数那种需要原子自增的状态走 kvx。
 // 缓存读失败（含 key 不存在）一律按 miss 处理：缓存是加速路径，不是数据源。
 //
-// 读缓存走 cacheutil.Fetch（含空值哨兵）：查不存在的订单会回填一条短期负缓存，
+// 读缓存走 loadthrough.Fetch（含空值哨兵）：查不存在的订单会回填一条短期负缓存，
 // 否则"批量请求不存在的 ID"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out *model.OrderWithItems, err error) {
 	ctx, end := s.begin(ctx, "GetOrder")
@@ -196,11 +196,11 @@ func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out
 	}
 	key := orderCacheKey(q.UserID, q.OrderID)
 
-	ow, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.OrderWithItems, error) {
+	ow, err := loadthrough.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.OrderWithItems, error) {
 		return s.repo.GetOrder(ctx, q)
 	})
 	if err != nil {
-		var nf *cacheutil.NotFound
+		var nf *loadthrough.NotFound
 		if errors.As(err, &nf) {
 			return nil, codes.Wrap(codes.CodeOrderNotFound, "order not found", err)
 		}
@@ -213,8 +213,8 @@ func (s *OrderService) GetOrder(ctx context.Context, q model.GetOrderQuery) (out
 //
 // 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
 // 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
-func (s *OrderService) cacheOpt() cacheutil.Options {
-	return cacheutil.Options{
+func (s *OrderService) cacheOpt() loadthrough.Options {
+	return loadthrough.Options{
 		Label: "order",
 		TTL:   orderCacheTTL,
 		NotFound: func(err error) bool {

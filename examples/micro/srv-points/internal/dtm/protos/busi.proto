@@ -1,0 +1,72 @@
+// dtm 分支协议：srv-points 域（Saga 两段 + TCC 三段）。
+//
+// 落在 internal/dtm/protos 而不是 pkg/kitex_gen：kitex_gen 是**对外 RPC 面**
+// 的生成产物，由 examples/micro/pkg/api 的 IDL 决定、四个域共用一套装配约定；
+// dtm 分支面是 dtm server 按 URL 回调的**内部编排协议**，它的服务名
+// （dtmbranch.points）、方法名与载荷字段都跟着 dtm 的分支 URL 走。
+// 混进 kitex_gen 会让「改 IDL 就重新生成」把分支 URL 一并改掉，而 URL 一旦
+// 与已提交给 dtm server 的全局事务不一致，回调就落到不存在的分支上 ——
+// 表现为该分支永远不被调、事务悬挂到超时，且没有任何本地信号。
+//
+// 方法名必须与编排侧（bff）提交的分支 URL **逐字一致**：dtm 不做名字映射，
+// 它只拿 URL 去调；两侧各写各的会在第一次真机跑时以「分支 404 / 方法未实现」
+// 暴露，而那时已有一笔真实资金停在半路。
+//
+// 生成命令（cwd = internal/dtm）：
+//
+//	protoc --go_out=. --go_opt=paths=source_relative \
+//	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+//	       -I . protos/busi.proto
+//
+// include 目录必须是 `-I .` 而不是 `-I protos`：后者会让 protoc 认为输入文件
+// 名是 `busi.proto`，paths=source_relative 于是把产物写进 internal/dtm/ 根目录
+// —— 编译照过，但「proto 与产物同放 protos/」这条目录约定当场失效，下一个人
+// 再生成一次就会得到两份不同位置的同名产物。
+syntax = "proto3";
+
+package dtmbranch.points;
+
+option go_package = "github.com/gospacex/launchx/examples/micro/srv-points/internal/dtm/protos;pointsbusi";
+
+// PointsBusi 积分域的 dtm 分支面。
+//
+// 请求/响应刻意做得极薄：biz 放业务体原始 JSON，traceparent 与 fail_inject
+// 各占一个字段。三者的归属是编排侧的职责，分支面只做搬运与校验。
+service PointsBusi {
+  // Saga 动作段：扣积分（余额↓ + 流水）。
+  rpc Debit(PointsBusiReq) returns (PointsBusiResp);
+  // Saga 补偿段：回补积分（余额↑ + 流水）。与 Debit 的 barrier 行 op 不同，
+  // 故补偿可以安全地与动作段反向到达而不互相判重。
+  rpc Refund(PointsBusiReq) returns (PointsBusiResp);
+
+  // TCC 三段：Try 冻结（可用↓ 冻结↑）→ Confirm 实扣（冻结↓）或 Cancel 解冻
+  // （冻结↓ 可用↑）。三段共用同一份载荷，取消语义由 dtm 侧的 barrier 裁决。
+  rpc TryFreeze(PointsBusiReq) returns (PointsBusiResp);
+  rpc ConfirmFreeze(PointsBusiReq) returns (PointsBusiResp);
+  rpc CancelFreeze(PointsBusiReq) returns (PointsBusiResp);
+}
+
+// PointsBusiReq 分支请求。
+message PointsBusiReq {
+  // biz 业务体（积分域的 JSON：user_id / cost / order_no）。
+  // 用 string 而不是嵌套 message：四个域的分支载荷各不相同，
+  // 用字符串载荷可以让 payload proto 保持完全对称，谁都不必认识谁。
+  string biz = 1;
+  // traceparent W3C 上下文，由编排侧从自己的 span 注入。补偿段为空
+  // （dtm 异步发起，载荷里没有它），此时分支按「新根 trace + biz.dtm.gid 关联」
+  // 处理。
+  string traceparent = 2;
+  // fail_inject 失败注入目标分支名（演示用，编排侧填；真机恒空）。
+  string fail_inject = 3;
+}
+
+// PointsBusiResp 分支响应。
+message PointsBusiResp {
+  // code 业务码，取 examples/micro/pkg/codes 的积分域段（0 成功 / 5xxx 失败）。
+  int64 code = 1;
+  // message 文案。业务失败时**必须**以 dtm 官方失败哨兵文案 "FAILURE" 开头
+  // （dtmx.BusinessFailure 包装后的 err.Error() 天然满足）：dtm server 判
+  // 「业务失败、不重试」靠的就是响应体里出现这个标记，只填 code 会被当成
+  // 基础失败无限重试。
+  string message = 2;
+}

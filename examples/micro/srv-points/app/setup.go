@@ -10,6 +10,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/pkg/handlecheck"
 	pointsrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/points/points"
 	"github.com/gospacex/launchx/examples/micro/pkg/routing"
+	dtmsetup "github.com/gospacex/launchx/examples/micro/srv-points/internal/dtm"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/handler"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/middleware"
 	"github.com/gospacex/launchx/examples/micro/srv-points/internal/repository"
@@ -37,6 +39,12 @@ import (
 const (
 	rateLimitPerMinute = 120 // 积分是写多读少的域（入账/消费都要过），上限比商品域紧
 	rateLimitWindow    = time.Minute
+	// branchStopTimeout 分支面优雅停机的上限。
+	//
+	// 为什么要有上限：GracefulStop 会等在途的 barrier 事务做完，而 barrier 事务
+	// 里含着一次真实落库 —— 若那条分支正在等锁（等另一个分支的账户行锁），
+	// 无上限的停机会把整个进程挂住：进程挂着 → dtm 的补偿链也全部停滞。
+	branchStopTimeout = 5 * time.Second
 )
 
 // Setup 是注册给 App.OnSetup 的装配回调：
@@ -110,6 +118,15 @@ func Setup(a *launchx.App) error {
 	// model（纯数据，无装配） ← repository ← service ← handler ← route ← rpc
 	repo := repository.NewPointsRepository(db, traceOn)
 
+	// dtm 分支写通道：与 repo 同一个 gorm 句柄，但形态不同 —— 它取的是底层
+	// *sql.DB，因为官方 barrier 要在自己的事务里插行（见 repository/dtmstore.go
+	// 的包注释）。构造失败即启动失败：分支面不可用却照常起服务的话，dtm 会一直
+	// 重试一个永远调不通的分支，那笔全局事务悬到超时。
+	dtmStore, err := repository.NewDtmBranchStore(db)
+	if err != nil {
+		return errors.New("srv-points: " + err.Error())
+	}
+
 	// 缓存 / KV / 锁句柄：三者都允许为 nil，由 service 内部按 fail-open 处理
 	// 并留日志。KV 缺失时幂等只剩数据库唯一键一层（仍然安全，只是慢一点）。
 	svc := service.NewPointsService(
@@ -117,9 +134,25 @@ func Setup(a *launchx.App) error {
 		a.Cache()[name], // cachex 实例（账户缓存）
 		a.KV()[name],    // kvx 实例（限流计数 + 幂等键）
 		a.Lock(),        // lockx 锁器（入账/消费互斥）
+		dtmStore,        // dtm 分支写通道（Saga/TCC 五个方法的落库通道）
 		traceOn,
 		logger,
 	)
+
+	// ---- dtm 分支面 listener（Saga Debit/Refund + TCC 三段）----
+	// 地址只来自 config（dtm.branch.listen_addr，见 config.yaml）：Go 代码里
+	// 不出现任何地址字面量，否则换个部署形态就得改代码再发一版。
+	// **不注册 consul**（分支只被 dtm 回调，注册了反而让调用方调到它）。
+	branch, err := dtmsetup.Start(cfg.GetString(dtmsetup.ListenAddrKey), svc, traceOn, logger)
+	if err != nil {
+		return errors.New("srv-points: dtm branch face: " + err.Error())
+	}
+	// 退出链：分支面先停（在途的 barrier 事务做完），再停组件。
+	a.OnStop(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), branchStopTimeout)
+		defer cancel()
+		return branch.Stop(ctx)
+	})
 
 	// 限流器只在 KV 组件可用时启用（kv 为 nil 时 Allow 恒 true：fail-open）
 	var limiter *middleware.RateLimiter

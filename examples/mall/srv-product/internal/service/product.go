@@ -22,18 +22,17 @@ import (
 
 	"github.com/gospacex/cachex"
 	"github.com/gospacex/kvx"
-	"github.com/gospacex/launchx"
 	"github.com/gospacex/lockx"
 	"github.com/gospacex/logx"
+	"github.com/gospacex/otelx/propagation"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/mall/pkg/codes"
 	"github.com/gospacex/launchx/examples/mall/pkg/events"
 	"github.com/gospacex/launchx/examples/mall/srv-product/internal/model"
 	"github.com/gospacex/launchx/examples/mall/srv-product/internal/repository"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 	"github.com/gospacex/otelx/layer"
 )
 
@@ -111,7 +110,7 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 		return nil, codes.Wrap(codes.CodeInternal, "load category failed", err)
 	}
 
-	tp := s.traceparentOf(ctx)
+	tp := propagation.TraceparentIf(ctx, s.traceOn)
 	rec, err := s.repo.CreateProductTx(ctx, repository.CreateProductInput{
 		Title:      cmd.Title,
 		Price:      cmd.Price,
@@ -157,7 +156,7 @@ func (s *ProductService) CreateProduct(ctx context.Context, cmd model.CreateProd
 // 一次计数只是热度偏低，不影响正确性；反过来若为了它去动 cachex 的缓存值，
 // 读-改-写会在并发下互相覆盖。两者因此分工明确。
 //
-// 读缓存走 cacheutil.Fetch（含空值哨兵）：查不存在的商品 ID 会回填一条短期
+// 读缓存走 loadthrough.Fetch（含空值哨兵）：查不存在的商品 ID 会回填一条短期
 // 负缓存，否则"批量请求不存在的 ID"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery) (out *model.ProductDetail, err error) {
 	ctx, end := s.begin(ctx, "GetProduct")
@@ -169,11 +168,11 @@ func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery
 	key := productCacheKey(q.ProductID)
 	s.bumpHot(ctx, q.ProductID)
 
-	d, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.ProductDetail, error) {
+	d, err := loadthrough.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.ProductDetail, error) {
 		return s.repo.GetProduct(ctx, q.ProductID)
 	})
 	if err != nil {
-		var nf *cacheutil.NotFound
+		var nf *loadthrough.NotFound
 		if errors.As(err, &nf) {
 			return nil, codes.Wrap(codes.CodeProductNotFound, "product not found", err)
 		}
@@ -186,8 +185,8 @@ func (s *ProductService) GetProduct(ctx context.Context, q model.GetProductQuery
 //
 // 为什么要抽：8 处读缓存若各写一份 Options，改负缓存策略就要改 8 遍，
 // 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
-func (s *ProductService) cacheOpt() cacheutil.Options {
-	return cacheutil.Options{
+func (s *ProductService) cacheOpt() loadthrough.Options {
+	return loadthrough.Options{
 		Label: "product",
 		TTL:   productCacheTTL,
 		NotFound: func(err error) bool {
@@ -386,17 +385,6 @@ func (s *ProductService) invalidate(ctx context.Context, productID uint64) {
 		// 失效失败只告警：下一次读会拿到旧值，但 TTL 兜底（10 分钟）不会永久错
 		s.logger.WarnContext(ctx, "product: cache invalidate failed", logx.Err(err))
 	}
-}
-
-// traceparentOf 取当前链路的 W3C traceparent（随 outbox header 透传）。
-// 仅当调用链开时经 otel 全局传播器注入；无活动 span 时为空串。
-func (s *ProductService) traceparentOf(ctx context.Context) string {
-	if !s.traceOn {
-		return ""
-	}
-	carrier := propagation.MapCarrier(map[string]string{})
-	launchx.Inject(ctx, carrier)
-	return carrier.Get(events.TraceHeaderKey)
 }
 
 // evTraceID 事件体内嵌 trace_id（无活动 span 时为空）

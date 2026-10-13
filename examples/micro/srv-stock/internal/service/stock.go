@@ -35,13 +35,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/model"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/repository"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
-	"github.com/gospacex/launchx/examples/pkg/traceparent"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/otelx/propagation"
 )
 
 // stockLockTTL 预占互斥的持锁上限。
@@ -110,7 +110,7 @@ func (s *StockService) begin(ctx context.Context, op string) (context.Context, l
 // 修正需要锁 + 事务，读路径上做会把"查询"变成"写入"，让读请求也承担
 // 写热点；这里只留告警，由人工/对账任务处置。
 //
-// 读缓存走 cacheutil.Fetch（含空值哨兵）：查没建过库存的商品会回填一条短期
+// 读缓存走 loadthrough.Fetch（含空值哨兵）：查没建过库存的商品会回填一条短期
 // 负缓存，否则"批量请求不存在的商品"能把整层缓存旁路掉，压力直接落到 DB。
 func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (out *model.StockDetail, err error) {
 	ctx, end := s.begin(ctx, "GetStock")
@@ -121,11 +121,11 @@ func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (out
 	}
 	key := stockCacheKey(q.ProductID)
 
-	d, err := cacheutil.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.StockDetail, error) {
+	d, err := loadthrough.Fetch(ctx, s.cache, s.cacheOpt(), key, func(ctx context.Context) (*model.StockDetail, error) {
 		return s.repo.GetStock(ctx, q.ProductID)
 	})
 	if err != nil {
-		// *cacheutil.NotFound 会 Unwrap 到 repository.ErrNotFound，
+		// *loadthrough.NotFound 会 Unwrap 到 repository.ErrNotFound，
 		// 因此 mapRepoErr 的 errors.Is 分支照样认得出 —— 命中负缓存与
 		// 回源 miss 走同一条翻译路径，不会给出两种不同的错误码。
 		return nil, s.mapRepoErr(ctx, err)
@@ -142,8 +142,8 @@ func (s *StockService) GetStock(ctx context.Context, q model.GetStockQuery) (out
 // 空值 TTL 用包默认（30s）而不是 stockCacheTTL（30s 且强一致敏感）：
 // "该商品没有库存记录"是低频且会被首次预占立刻改写的事实，
 // 用与正缓存同样的窗口没有额外收益，只会拉长新建后不可见的窗口。
-func (s *StockService) cacheOpt() cacheutil.Options {
-	return cacheutil.Options{
+func (s *StockService) cacheOpt() loadthrough.Options {
+	return loadthrough.Options{
 		Label: "stock",
 		TTL:   stockCacheTTL,
 		// 只认归一化后的 ErrNotFound：gorm 直接抛出的 ErrRecordNotFound
@@ -196,7 +196,7 @@ func (s *StockService) ReserveStock(ctx context.Context, cmd model.ReserveCmd) (
 	}
 	defer unlock()
 
-	tp := traceparent.Of(ctx, s.traceOn)
+	tp := propagation.TraceparentIf(ctx, s.traceOn)
 	rec, err := s.repo.ReserveTx(ctx, repository.ReserveInput{
 		OrderNo:   cmd.OrderNo,
 		ProductID: cmd.ProductID,

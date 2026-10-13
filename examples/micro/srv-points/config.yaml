@@ -45,6 +45,15 @@ logx:
 metrics:
   enabled: true
   addr: "127.0.0.1:9032"
+
+# ----- dtm 分支面：dtm server 按 URL 回调的 gRPC listener（Saga/TCC）-----
+# 与 kitex 面（service.addr: 9024）是两个独立监听：分支只接受 dtm 的回调，
+# 业务流量不经过它。故它也不注册进 consul —— 注册了会让调用方照服务名调它、
+# 拿到 Unimplemented，把「分支面没起来」变成「一堆下游 500」。
+# 端口与其它域的分支面连号（stock 9043 / order 9042 一带），本域固定 9044。
+dtm:
+  branch:
+    listen_addr: "127.0.0.1:9044"
 # ----- 鉴权：只校验边界层（bff）透传下来的身份，不重复验签 -----
 # require=false 表示"内网可信、任何入站 RPC 都放行"：只在受控网络里用。
 # 这一段整体缺失时装配层按 **true** 处理（安全默认值），不会静默裸奔。

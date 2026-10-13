@@ -20,9 +20,9 @@ import (
 	"github.com/gospacex/otelx/layer"
 	"gorm.io/gorm"
 
+	"github.com/gospacex/cachex/loadthrough"
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/product/model"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
-	"github.com/gospacex/launchx/examples/pkg/cacheutil"
 )
 
 // detailTTL 商品详情缓存存活时间。
@@ -67,7 +67,7 @@ type ProductView struct {
 // 未命中（库里没有该 id）回 ProductNotFound，与「库报错」区分开：前者是用户
 // 拿错了 id，后者是下游故障，bff 对两者的映射不同（404 vs 502）。
 //
-// 读缓存走 cacheutil.FetchResult（含空值哨兵）：查不存在的 id 会回填一条短期
+// 读缓存走 loadthrough.FetchResult（含空值哨兵）：查不存在的 id 会回填一条短期
 // 负缓存，否则"批量请求不存在的 id"能把整层缓存旁路掉，压力直接落到 DB。
 // 用 FetchResult 而不是 Fetch 是因为 ProductView.Cached 是验收判据的一部分，
 // 进程内要能断言"这次到底命中了没有"（span 上的 cache.hit 属性读不到）。
@@ -75,12 +75,12 @@ func (s *ProductService) GetProduct(ctx context.Context, id uint64) (v *ProductV
 	ctx, end := layer.Begin(ctx, "service", "product", "GetProduct", s.traceOn, nil)
 	defer func() { end(err) }()
 
-	res, err := cacheutil.FetchResult(ctx, s.cache, s.cacheOpt(), s.key(id),
+	res, err := loadthrough.FetchResult(ctx, s.cache, s.cacheOpt(), s.key(id),
 		func(ctx context.Context) (*model.Product, error) {
 			return s.repo.FindByID(ctx, id)
 		})
 	if err != nil {
-		var nf *cacheutil.NotFound
+		var nf *loadthrough.NotFound
 		if errors.As(err, &nf) {
 			return nil, codes.New(codes.ProductNotFound, "product "+strconv.FormatUint(id, 10)+" not found")
 		}
@@ -93,8 +93,8 @@ func (s *ProductService) GetProduct(ctx context.Context, id uint64) (v *ProductV
 //
 // 为什么要抽：各域各写一份 Options 的话，改负缓存策略就要改 N 遍，
 // 漏改的那处不会报错，只会静默少一层保护 —— 这正是缓存穿透留下的方式。
-func (s *ProductService) cacheOpt() cacheutil.Options {
-	return cacheutil.Options{
+func (s *ProductService) cacheOpt() loadthrough.Options {
+	return loadthrough.Options{
 		Label: "product",
 		TTL:   detailTTL,
 		NotFound: func(err error) bool {
@@ -133,7 +133,7 @@ func (s *ProductService) key(id uint64) string {
 	return "mesh:product:detail:" + strconv.FormatUint(id, 10)
 }
 
-// 解码与回填不再在本域手写：都归 cacheutil（见 GetProduct）。
+// 解码与回填不再在本域手写：都归 loadthrough（见 GetProduct）。
 //
 // 留在域内的代价不是多几行，而是**语义各写一份**：此前"解码失败 → 当 miss"和
 // "回填失败 → 只告警"这两条规则只有 product 域遵守，改规则永远改不全。

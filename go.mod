@@ -7,6 +7,7 @@ require (
 	github.com/cloudwego/hertz v0.10.6
 	github.com/cloudwego/kitex v0.16.3
 	github.com/cloudwego/prutal v0.1.3
+	github.com/dtm-labs/client v1.18.7
 	github.com/goforj/wire v1.2.0
 	github.com/gospacex/cachex v0.0.0
 	github.com/gospacex/cachex/redis v0.0.0-00010101000000-000000000000
@@ -14,6 +15,7 @@ require (
 	github.com/gospacex/coordx v0.0.0
 	github.com/gospacex/coordx/consul v0.0.0
 	github.com/gospacex/dbx v0.0.0-00010101000000-000000000000
+	github.com/gospacex/dtmx v0.0.0
 	github.com/gospacex/kvx v0.0.0
 	github.com/gospacex/kvx/redis v0.0.0-00010101000000-000000000000
 	github.com/gospacex/lockx v0.0.0
@@ -22,7 +24,7 @@ require (
 	github.com/gospacex/mongodbx v0.0.0-00010101000000-000000000000
 	github.com/gospacex/mqx v0.0.1
 	github.com/gospacex/mqx/kafka v0.0.0-00010101000000-000000000000
-	github.com/gospacex/otelx v0.0.0-00010101000000-000000000000
+	github.com/gospacex/otelx v0.0.0
 	github.com/gospacex/rpcx v0.0.0
 	github.com/gospacex/searchx v0.0.0
 	github.com/gospacex/searchx/elasticsearch v0.0.0-00010101000000-000000000000
@@ -37,6 +39,9 @@ require (
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/sdk/metric v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
+	google.golang.org/grpc v1.83.1
+	google.golang.org/protobuf v1.36.12
+	gorm.io/driver/mysql v1.5.7
 	gorm.io/driver/sqlite v1.5.6
 	gorm.io/gorm v1.25.12
 )
@@ -67,7 +72,6 @@ require (
 	github.com/cloudwego/runtimex v0.1.1 // indirect
 	github.com/cloudwego/thriftgo v0.4.5 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
-	github.com/dtm-labs/client v1.18.7 // indirect
 	github.com/dtm-labs/dtmdriver v0.0.6 // indirect
 	github.com/dtm-labs/logger v0.0.1 // indirect
 	github.com/elastic/elastic-transport-go/v8 v8.6.0 // indirect
@@ -159,7 +163,6 @@ require (
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.14.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
@@ -172,14 +175,11 @@ require (
 	google.golang.org/genproto v0.0.0-20240227224415-6ceb2ff114de // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
-	google.golang.org/grpc v1.83.1 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/apollo.v0 v0.3.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/logger.v1 v1.0.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	gorm.io/driver/mysql v1.5.7 // indirect
 	gorm.io/driver/postgres v1.5.7 // indirect
 	gorm.io/driver/sqlserver v1.5.4 // indirect
 )
@@ -224,3 +224,5 @@ replace github.com/gospacex/searchx/elasticsearch => ../searchx/elasticsearch
 replace github.com/gospacex/mongodbx => ../mongodbx
 
 replace github.com/gospacex/hubx => ../hubx
+
+replace github.com/gospacex/dtmx => ../dtmx

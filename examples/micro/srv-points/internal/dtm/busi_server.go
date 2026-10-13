@@ -1,0 +1,233 @@
+// Package dtm srv-points 的 **dtm 分支面**：dtm server 按分支 URL 回调的
+// gRPC 服务（Saga 两段 + TCC 三段），以及它的装配（listener）。
+//
+// 在分层链上的位置：dtm(gRPC) → service → repository → model。它是 handler
+// 层的**兄弟**而不是替代品：对外 RPC 面（kitex，走 pkg/kitex_gen）与分支面
+// （dtm 自带的 proto）各自独立，共用同一个 service 层的分支方法。
+//
+// 三条协议事实决定了本包几乎全部写法，它们都来自 dtm-labs/client v1.18.7 与
+// dtm server v1.19.0 的真实实现（核实方式见各处的行号/函数名）：
+//
+//  1. **分支 URL 就是全方法名**：`grpc://` 不带 scheme，dtmdriver 的
+//     ParseServerMethod 按第一个 "/" 切开得到 server 与 method。所以
+//     proto package（dtmbranch.points）与方法名（Debit…）一字都不能改，
+//     而改动首先表现为「dtm 一直重试、这个分支从没被调到」。
+//
+//  2. **失败靠 gRPC status，不靠响应体**：dtm 调用分支时用 raw codec，响应
+//     字节被塞进一个 `*[]byte` 之后**从不解析**（dtmsvr/trans_status.go 的
+//     getGrpcResult）。它只看 status：Aborted ⇒ 业务失败（Saga 立即逆序
+//     补偿、TCC 不再等待）；FailedPrecondition+ONGOING ⇒ 稍后重试；其它码 ⇒
+//     按退避重试（见 dtmgrpc.GrpcError2DtmError）。因此 resp.Code/Message
+//     只作人读与未来 HTTP 桥接用，**判定失败不依赖它**。
+//
+//  3. **补偿段是新根 trace**：补偿由 dtm 定时器异步发起，载荷里没有
+//     traceparent。此时若沿用正向段的 trace ID 造一个"同链"的 span，得到的是
+//     一条永远不存在的父链 —— Jaeger 上表现为断链，且比独立 trace 更难查。
+//     本包按 dtmx.ExtractParent 的口径：载荷为空就原样开新根，并用
+//     biz.dtm.gid 把两段关联起来。
+package dtm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/gospacex/logx"
+	"github.com/gospacex/otelx/layer"
+	"go.opentelemetry.io/otel/attribute"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+
+	dtmgrpcmeta "github.com/dtm-labs/client/dtmgrpc/dtmgimp"
+	"github.com/gospacex/dtmx"
+	"github.com/gospacex/launchx/examples/micro/pkg/codes"
+	pointsbusi "github.com/gospacex/launchx/examples/micro/srv-points/internal/dtm/protos"
+	"github.com/gospacex/launchx/examples/micro/srv-points/internal/model"
+)
+
+// BranchService 分支面依赖的 service 能力面。
+//
+// 为什么是接口而不是 *service.PointsService：handler 的单测要注入桩（否则
+// 「协议翻译」与「业务规则」只能靠一个连着真库的真服务一起验，失败时定位不到
+// 是哪一层）；更重要的是，它让「本包不认识 repository、不认识 gorm」这条
+// 边界在类型上成立 —— 编译期就能看出来有没有把持久层捅进协议层。
+type BranchService interface {
+	DtmDebit(ctx context.Context, b model.DtmBiz) error
+	DtmRefund(ctx context.Context, b model.DtmBiz) error
+	DtmTryFreeze(ctx context.Context, b model.DtmBiz) error
+	DtmConfirmFreeze(ctx context.Context, b model.DtmBiz) error
+	DtmCancelFreeze(ctx context.Context, b model.DtmBiz) error
+}
+
+// BusiServer 积分域 dtm 分支服务实现。
+type BusiServer struct {
+	pointsbusi.UnimplementedPointsBusiServer
+
+	svc     BranchService
+	traceOn bool
+	logger  logx.Logger
+}
+
+// NewBusiServer 构造（logger 为 nil 时取全局）。
+func NewBusiServer(svc BranchService, traceOn bool, logger logx.Logger) *BusiServer {
+	if logger == nil {
+		logger = logx.GetGlobal()
+	}
+	return &BusiServer{svc: svc, traceOn: traceOn, logger: logger}
+}
+
+// Debit Saga 动作段。
+func (s *BusiServer) Debit(ctx context.Context, req *pointsbusi.PointsBusiReq) (*pointsbusi.PointsBusiResp, error) {
+	return s.run(ctx, methodDebit, req, s.svc.DtmDebit)
+}
+
+// Refund Saga 补偿段（biz.compensation=true）。
+func (s *BusiServer) Refund(ctx context.Context, req *pointsbusi.PointsBusiReq) (*pointsbusi.PointsBusiResp, error) {
+	return s.run(ctx, methodRefund, req, s.svc.DtmRefund)
+}
+
+// TryFreeze TCC 第一段。
+func (s *BusiServer) TryFreeze(ctx context.Context, req *pointsbusi.PointsBusiReq) (*pointsbusi.PointsBusiResp, error) {
+	return s.run(ctx, methodTryFreeze, req, s.svc.DtmTryFreeze)
+}
+
+// ConfirmFreeze TCC 第二段。
+func (s *BusiServer) ConfirmFreeze(ctx context.Context, req *pointsbusi.PointsBusiReq) (*pointsbusi.PointsBusiResp, error) {
+	return s.run(ctx, methodConfirmFreeze, req, s.svc.DtmConfirmFreeze)
+}
+
+// CancelFreeze TCC 第三段（补偿语义：biz.compensation=true）。
+func (s *BusiServer) CancelFreeze(ctx context.Context, req *pointsbusi.PointsBusiReq) (*pointsbusi.PointsBusiResp, error) {
+	return s.run(ctx, methodCancelFreeze, req, s.svc.DtmCancelFreeze)
+}
+
+// 分支方法名。单独钉成常量有两个用处：span 名与「是否补偿」判据都用它，
+// 写成字面量散落各处时，改名就会漏掉一处（漏掉的判据 = 补偿段不带
+// biz.compensation 标签，排障时看不出这段是回滚来的）。
+const (
+	methodDebit         = "Debit"
+	methodRefund        = "Refund"
+	methodTryFreeze     = "TryFreeze"
+	methodConfirmFreeze = "ConfirmFreeze"
+	methodCancelFreeze  = "CancelFreeze"
+)
+
+// spanEntity 参与 span 名的第二段，拼出的 span 名是 rpc.dtm.points.<Method>。
+const spanEntity = "dtm.points"
+
+// run 五个分支方法的公共骨架：续链/开 span → 失败注入 → 解析载荷 → 调 service
+// → 翻成 gRPC status。handler 只做协议转换，业务判定一律在 service 层。
+func (s *BusiServer) run(ctx context.Context, method string, req *pointsbusi.PointsBusiReq,
+	call func(ctx context.Context, b model.DtmBiz) error) (resp *pointsbusi.PointsBusiResp, err error) {
+
+	compensation := method == methodRefund || method == methodCancelFreeze
+	// 先续链再开 span：顺序反了的话 span 会挂在 dtm 传入的那个**无 tracestate
+	// 的**裸 ctx 上，等于白续。
+	ctx = dtmx.ExtractParent(ctx, req.GetTraceparent())
+
+	ctx, end := s.begin(ctx, method)
+	defer func() { end(err) }()
+	tagBranch(ctx, s.traceOn, method, compensation, req.GetTraceparent())
+
+	// 失败注入（演示用，真机恒空）：编排侧点名某一段让它失败，用来点火 Saga 的
+	// 逆序补偿与 TCC 的 Cancel。放在调 service **之前** —— 注入的语义是
+	// 「这一段不许落库」，事后报错已经晚了（钱已经扣了）。
+	if want := req.GetFailInject(); want != "" && want == method {
+		return s.reject(ctx, method, dtmx.BusinessFailure(
+			fmt.Errorf("fail_inject=%s: %w", method, codes.New(codes.CodePointsWriteFailed, "points branch failure injected"))))
+	}
+
+	var biz model.DtmBiz
+	if err := json.Unmarshal([]byte(req.GetBiz()), &biz); err != nil {
+		// 载荷坏掉同样按业务失败：重试不会让编排侧拼对的 JSON 变对，而报成
+		// Internal 会让 dtm 一直重试到超时，把整笔全局事务吊在那儿。
+		s.logger.WarnContext(ctx, "points: dtm branch payload is not valid json",
+			logx.String("method", method), logx.Err(err))
+		return s.reject(ctx, method, dtmx.BusinessFailure(fmt.Errorf("decode biz payload: %w", err)))
+	}
+
+	if err := call(ctx, biz); err != nil {
+		return s.reject(ctx, method, err)
+	}
+	ok := codes.OK()
+	return &pointsbusi.PointsBusiResp{Code: ok.Code, Message: ok.Message}, nil
+}
+
+// begin 开分支入口 span（rpc.dtm.points.<Method>）。
+//
+// 不设 quiet 豁免：非 nil error 一律标红。业务失败标红是对的 —— 它意味着这笔
+// 全局事务正在被回滚，正是运维要看见的那类失败。
+func (s *BusiServer) begin(ctx context.Context, method string) (context.Context, layer.End) {
+	return layer.Begin(ctx, "rpc", spanEntity, method, s.traceOn, nil)
+}
+
+// tagBranch 挂分支上下文标签：gid / branch / 是否补偿 / 链路来源。
+//
+// biz.dtm.gid 是补偿段与正向段的**唯一**关联手段（两段不在一条 trace 上），
+// 排障时「这个 gid 正向扣了多少、退了多少」全靠它串起来，故即便埋点关闭也要
+// 保持代码路径存在（layer.Attrs 自己判空）。
+func tagBranch(ctx context.Context, traceOn bool, method string, compensation bool, traceparent string) {
+	if !traceOn {
+		return
+	}
+	trace := traceSource(traceparent)
+	layer.Attrs(ctx,
+		attribute.String("biz.dtm.gid", dtmgrpcmeta.GetDtmMetaFromContext(ctx, "gid")),
+		attribute.String("biz.dtm.branch", dtmgrpcmeta.GetDtmMetaFromContext(ctx, "branch_id")),
+		attribute.String("biz.dtm.op", dtmgrpcmeta.GetDtmMetaFromContext(ctx, "op")),
+		attribute.Bool("biz.compensation", compensation),
+		// continued = 挂在编排侧那条链上；new_root = 补偿段独立成链，
+		// 靠 biz.dtm.gid 关联。两者在 Jaeger 上的形态完全不同，标签不写就分不出。
+		attribute.String("biz.dtm.trace", trace),
+		attribute.String("biz.dtm.method", method),
+	)
+}
+
+func traceSource(traceparent string) string {
+	if traceparent == "" {
+		return "new_root"
+	}
+	return "continued"
+}
+
+// reject 把 service/协议层的错误翻成「响应体 + gRPC status」。
+//
+// 判据只有一个：errors.Is(err, dtmcli.ErrFailure)（dtmx.IsBusinessFailure）。
+// 命中 → Aborted（dtm 判业务失败，立即逆序补偿，不再重试）；否则 → Internal
+// （dtm 按退避重试，等于把「连不上库」这类故障交给时间解决）。
+//
+// 刻意用 errors.Is 而不是 errors.As(codes.Error)：能不能重试取决于**业务语义**
+// （这个失败会不会自己好），不取决于错误被翻译成了哪个码。
+//
+// 响应体在返回 error 时会被 grpc 丢弃（客户端只拿到 status），它仍被填满的
+// 理由是：① 直调 handler 的单测与将来的 HTTP 桥接都要读它；② 服务端日志里的
+// 失败现场比一个裸 status 信息量大。
+func (s *BusiServer) reject(ctx context.Context, method string, err error) (*pointsbusi.PointsBusiResp, error) {
+	resp := &pointsbusi.PointsBusiResp{Message: err.Error()}
+	code := int64(codes.CodeInternal)
+	grpcCode := grpccodes.Internal
+	if dtmx.IsBusinessFailure(err) {
+		grpcCode = grpccodes.Aborted
+		if be, ok := codes.As(err); ok {
+			code = be.Code
+		} else {
+			// 带哨兵却没有 codes 码：fail_inject 之外出现的未知业务失败。
+			// 报内部错误码而不是 0 —— 0 是成功，用它会让调用方以为这段过了。
+			code = codes.CodePointsWriteFailed
+		}
+	} else {
+		s.logger.WarnContext(ctx, "points: dtm branch base failure (dtm will retry)",
+			logx.String("method", method), logx.Err(err))
+	}
+	resp.Code = code
+	if be, ok := codes.As(err); ok && be.Message != "" {
+		// 保留业务文案（首行），FAILURE 哨兵文案在后半段 —— dtm 对 grpc 分支
+		// 只看 status code，不解析响应体，故这里不会误导判定。
+		resp.Message = be.Message + ": " + err.Error()
+	}
+	return resp, grpcstatus.Error(grpcCode, resp.Message)
+}
+
+// errNotWired 分支面未装配。
+var errNotWired = errors.New("dtm: branch service not wired")
