@@ -878,17 +878,19 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/scripts/dtm
 ---
 
 ### Task 15: 文档同步（对应 tasks.md 4.4）
+> **trace:** plan-ready.md → `### Task 15: 文档同步（对应 4.4）` | tasks.md → `- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`examples/micro/docs/verify-chain.md` 增补「DTM Saga/TCC 两链 trace 实测」两节（含正向单 trace span 清单与补偿段同链查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径`
+> **sync:** tasks.md → `- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`examples/micro/docs/verify-chain.md` 增补「DTM Saga/TCC 两链 trace 实测」两节（含正向单 trace span 清单与补偿段同链查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径` | plan-ready.md → `### Task 15: 文档同步（对应 4.4）`
 
-> **trace:** plan-ready.md → `### Task 15: 文档同步（对应 4.4）` | tasks.md → `- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`docs/trace-chain-audit.md` §3 微服形态增补「DTM Saga/TCC 两链 trace 实测」小节（含正向单 trace span 清单与补偿段 gid 关联查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径`
-> **sync:** tasks.md → `- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`docs/trace-chain-audit.md` §3 微服形态增补「DTM Saga/TCC 两链 trace 实测」小节（含正向单 trace span 清单与补偿段 gid 关联查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径` | plan-ready.md → `### Task 15: 文档同步（对应 4.4）`
+> **trace:** plan-ready.md → `### Task 15: 文档同步（对应 4.4）` | tasks.md → `- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`examples/micro/docs/verify-chain.md` §3 微服形态增补「DTM Saga/TCC 两链 trace 实测」小节（含正向单 trace span 清单与补偿段 gid 关联查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径`
+> **sync:** tasks.md → `- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`examples/micro/docs/verify-chain.md` §3 微服形态增补「DTM Saga/TCC 两链 trace 实测」小节（含正向单 trace span 清单与补偿段 gid 关联查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径` | plan-ready.md → `### Task 15: 文档同步（对应 4.4）`
 
 **Files:**
 - 修改：`examples/micro/README.md`（拓扑 / 端口 / 起停 / dtm_e2e）
 - 修改：`examples/ACCEPTANCE.md`（新增 DTM 验收节 + E3 口径改 Saga）
-- 修改：`docs/trace-chain-audit.md`（§3 增补两链 trace 实测小节）
+- 修改：`examples/micro/docs/verify-chain.md`（增补两链 trace 实测两节）
 
 > **目标文件更正**：tasks.md 4.4 原文指向 `docs/verify-chain.md`，但该文件在仓内**不存在**
-> （`docs/` 下最接近的是 `docs/trace-chain-audit.md`「调用链入链核对」）。spec 阶段已同步修正
+> （`docs/` 下最接近的是 `examples/micro/docs/verify-chain.md`「调用链入链核对」）。spec 阶段已同步修正
 > tasks.md / plan-ready / dtm-acceptance spec 三处指向，本 Task 按修正后落点执行。
 
 - [ ] **Step 15.1：README 拓扑与端口**
@@ -934,9 +936,9 @@ bash examples/micro/scripts/dtm_e2e.sh    # 三段：Saga 正向 / Saga 补偿 /
 
 其余 E1/E2/T1-T9 验收**不回退**。
 
-- [ ] **Step 15.3：trace-chain-audit.md §3 增补两链实测小节**
+- [ ] **Step 15.3：verify-chain.md 增补两链实测小节**
 
-在 `docs/trace-chain-audit.md` 的 `## 3. 微服形态` 末尾追加：
+在 `examples/micro/docs/verify-chain.md` 的 `## 3. 微服形态` 末尾追加：
 
 ```markdown
 ### 3bis. DTM Saga / TCC 两链 trace 实测（2026-10-13）
@@ -988,7 +990,7 @@ grep -rn "手动补偿\|ReleaseStock" examples/micro/README.md examples/ACCEPTAN
 - [ ] **Step 15.5：Commit**
 
 ```bash
-cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/README.md examples/ACCEPTANCE.md docs/trace-chain-audit.md && git commit -m "docs(examples/micro): DTM Saga/TCC 验收口径与两链 trace 实测入链核对"
+cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/README.md examples/ACCEPTANCE.md examples/micro/docs/verify-chain.md && git commit -m "docs(examples/micro): DTM Saga/TCC 验收口径与两链 trace 实测入链核对"
 ```
 
 - [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）

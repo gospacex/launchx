@@ -95,7 +95,7 @@
 
 ### Task 15: 文档同步（对应 4.4）
 - [ ] **任务完成**
-- 目标：README（拓扑/端口/起停/dtm_e2e）、`examples/ACCEPTANCE.md` DTM 节、`docs/trace-chain-audit.md` §3 增补两链 trace 实测小节、E3 口径改 Saga（其余验收不回退）
+- 目标：README（拓扑/端口/起停/dtm_e2e）、`examples/ACCEPTANCE.md` DTM 节、`examples/micro/docs/verify-chain.md` 增补两链 trace 实测两节、E3 口径改 Saga（其余验收不回退）
 - 改动文件：`examples/micro/README.md`、`examples/ACCEPTANCE.md`、`docs/trace-chain-audit.md`
 - 验证方式：README/config 端口逐一核对成立；下单链章节零「手动补偿」措辞
 

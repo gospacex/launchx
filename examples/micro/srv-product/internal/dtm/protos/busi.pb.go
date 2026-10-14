@@ -31,7 +31,8 @@ type ProductBusiReq struct {
 	Biz string `protobuf:"bytes,1,opt,name=biz,proto3" json:"biz,omitempty"`
 	// traceparent W3C 链路上下文。正向分支由编排侧（bff）编进载荷，分支面
 	// Extract 回来挂回同一条 trace；补偿由 dtm 定时器异步发起，载荷里没有它，
-	// 此时按「新根 trace + biz.dtm.gid 关联」口径处理。
+	// 此时按 biz.dtm.gid 关联（常规补偿/Cancel 不会出现空值 —— dtm 按 step
+	// 共享载荷，它们挂回正向那条 trace；见 design.md D4）。
 	Traceparent string `protobuf:"bytes,2,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
 	// fail_inject 失败注入目标分支名（演示用）：等于本分支名即直接返业务失败，
 	// 用于点火 Saga 逆序补偿链。真机恒为空。

@@ -159,7 +159,13 @@ func Setup(a *launchx.App) error {
 	engine.Engine.POST("/order", mallH.PlaceOrder)
 	// 第二条复合编排：预检商品 + 提交 dtm TCC（bff 只发三个 Try，
 	// Confirm / Cancel 由 dtm 在 Submit 之后驱动）。
-	engine.Engine.POST("/api/presale/lock", presaleH.Lock)
+	//
+	// 路径不带 /api：gateway 的路由表是 `prefix: /api, strip: true`
+	// （gateway/config.yaml），转发时会剥掉前缀。所以对外契约是
+	// `POST /api/presale/lock`，而 bff 侧注册的是 `/presale/lock` ——
+	// 与上面六条路由同口径。带 /api 注册会让网关一路 404，且直连 bff 才通，
+	// 这种「只有一种入口能跑通」的错最难在验收里被发现。
+	engine.Engine.POST("/presale/lock", presaleH.Lock)
 	return nil
 }
 

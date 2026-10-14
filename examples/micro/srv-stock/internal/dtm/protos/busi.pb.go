@@ -29,7 +29,7 @@
 // versions:
 // 	protoc-gen-go v1.36.6
 // 	protoc        v7.34.1
-// source: protos/busi.proto
+// source: internal/dtm/protos/busi.proto
 
 package protos
 
@@ -58,7 +58,8 @@ type StockBusiReq struct {
 	Biz string `protobuf:"bytes,1,opt,name=biz,proto3" json:"biz,omitempty"`
 	// traceparent W3C 链路上下文。正向分支由编排侧（bff）编进载荷，分支面
 	// Extract 回来挂回同一条 trace；补偿 / Cancel 由 dtm 异步发起，载荷里没有它，
-	// 此时按「新根 trace + biz.dtm.gid 关联」口径处理。
+	// 此时按 biz.dtm.gid 关联（常规补偿/Cancel 不会出现空值 —— dtm 按 step
+	// 共享载荷，它们挂回正向那条 trace；见 design.md D4）。
 	Traceparent string `protobuf:"bytes,2,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
 	// fail_inject 失败注入目标分支名（演示用）：等于本分支名即直接返业务失败，
 	// 用于点火 Saga 补偿 / TCC Cancel 链。真机恒为空。
@@ -69,7 +70,7 @@ type StockBusiReq struct {
 
 func (x *StockBusiReq) Reset() {
 	*x = StockBusiReq{}
-	mi := &file_protos_busi_proto_msgTypes[0]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -81,7 +82,7 @@ func (x *StockBusiReq) String() string {
 func (*StockBusiReq) ProtoMessage() {}
 
 func (x *StockBusiReq) ProtoReflect() protoreflect.Message {
-	mi := &file_protos_busi_proto_msgTypes[0]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -94,7 +95,7 @@ func (x *StockBusiReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StockBusiReq.ProtoReflect.Descriptor instead.
 func (*StockBusiReq) Descriptor() ([]byte, []int) {
-	return file_protos_busi_proto_rawDescGZIP(), []int{0}
+	return file_internal_dtm_protos_busi_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *StockBusiReq) GetBiz() string {
@@ -136,7 +137,7 @@ type StockBusiResp struct {
 
 func (x *StockBusiResp) Reset() {
 	*x = StockBusiResp{}
-	mi := &file_protos_busi_proto_msgTypes[1]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -148,7 +149,7 @@ func (x *StockBusiResp) String() string {
 func (*StockBusiResp) ProtoMessage() {}
 
 func (x *StockBusiResp) ProtoReflect() protoreflect.Message {
-	mi := &file_protos_busi_proto_msgTypes[1]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -161,7 +162,7 @@ func (x *StockBusiResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StockBusiResp.ProtoReflect.Descriptor instead.
 func (*StockBusiResp) Descriptor() ([]byte, []int) {
-	return file_protos_busi_proto_rawDescGZIP(), []int{1}
+	return file_internal_dtm_protos_busi_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *StockBusiResp) GetCode() int64 {
@@ -178,11 +179,11 @@ func (x *StockBusiResp) GetMessage() string {
 	return ""
 }
 
-var File_protos_busi_proto protoreflect.FileDescriptor
+var File_internal_dtm_protos_busi_proto protoreflect.FileDescriptor
 
-const file_protos_busi_proto_rawDesc = "" +
+const file_internal_dtm_protos_busi_proto_rawDesc = "" +
 	"\n" +
-	"\x11protos/busi.proto\x12\x0fdtmbranch.stock\"c\n" +
+	"\x1einternal/dtm/protos/busi.proto\x12\x0fdtmbranch.stock\"c\n" +
 	"\fStockBusiReq\x12\x10\n" +
 	"\x03biz\x18\x01 \x01(\tR\x03biz\x12 \n" +
 	"\vtraceparent\x18\x02 \x01(\tR\vtraceparent\x12\x1f\n" +
@@ -199,23 +200,23 @@ const file_protos_busi_proto_rawDesc = "" +
 	"\fCancelFreeze\x12\x1d.dtmbranch.stock.StockBusiReq\x1a\x1e.dtmbranch.stock.StockBusiResp\"\x00BQZOgithub.com/gospacex/launchx/examples/micro/srv-stock/internal/dtm/protos;protosb\x06proto3"
 
 var (
-	file_protos_busi_proto_rawDescOnce sync.Once
-	file_protos_busi_proto_rawDescData []byte
+	file_internal_dtm_protos_busi_proto_rawDescOnce sync.Once
+	file_internal_dtm_protos_busi_proto_rawDescData []byte
 )
 
-func file_protos_busi_proto_rawDescGZIP() []byte {
-	file_protos_busi_proto_rawDescOnce.Do(func() {
-		file_protos_busi_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_protos_busi_proto_rawDesc), len(file_protos_busi_proto_rawDesc)))
+func file_internal_dtm_protos_busi_proto_rawDescGZIP() []byte {
+	file_internal_dtm_protos_busi_proto_rawDescOnce.Do(func() {
+		file_internal_dtm_protos_busi_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_dtm_protos_busi_proto_rawDesc), len(file_internal_dtm_protos_busi_proto_rawDesc)))
 	})
-	return file_protos_busi_proto_rawDescData
+	return file_internal_dtm_protos_busi_proto_rawDescData
 }
 
-var file_protos_busi_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_protos_busi_proto_goTypes = []any{
+var file_internal_dtm_protos_busi_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_internal_dtm_protos_busi_proto_goTypes = []any{
 	(*StockBusiReq)(nil),  // 0: dtmbranch.stock.StockBusiReq
 	(*StockBusiResp)(nil), // 1: dtmbranch.stock.StockBusiResp
 }
-var file_protos_busi_proto_depIdxs = []int32{
+var file_internal_dtm_protos_busi_proto_depIdxs = []int32{
 	0, // 0: dtmbranch.stock.StockBusi.Deduct:input_type -> dtmbranch.stock.StockBusiReq
 	0, // 1: dtmbranch.stock.StockBusi.Release:input_type -> dtmbranch.stock.StockBusiReq
 	0, // 2: dtmbranch.stock.StockBusi.TryFreeze:input_type -> dtmbranch.stock.StockBusiReq
@@ -233,26 +234,26 @@ var file_protos_busi_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_protos_busi_proto_init() }
-func file_protos_busi_proto_init() {
-	if File_protos_busi_proto != nil {
+func init() { file_internal_dtm_protos_busi_proto_init() }
+func file_internal_dtm_protos_busi_proto_init() {
+	if File_internal_dtm_protos_busi_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protos_busi_proto_rawDesc), len(file_protos_busi_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_dtm_protos_busi_proto_rawDesc), len(file_internal_dtm_protos_busi_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_protos_busi_proto_goTypes,
-		DependencyIndexes: file_protos_busi_proto_depIdxs,
-		MessageInfos:      file_protos_busi_proto_msgTypes,
+		GoTypes:           file_internal_dtm_protos_busi_proto_goTypes,
+		DependencyIndexes: file_internal_dtm_protos_busi_proto_depIdxs,
+		MessageInfos:      file_internal_dtm_protos_busi_proto_msgTypes,
 	}.Build()
-	File_protos_busi_proto = out.File
-	file_protos_busi_proto_goTypes = nil
-	file_protos_busi_proto_depIdxs = nil
+	File_internal_dtm_protos_busi_proto = out.File
+	file_internal_dtm_protos_busi_proto_goTypes = nil
+	file_internal_dtm_protos_busi_proto_depIdxs = nil
 }

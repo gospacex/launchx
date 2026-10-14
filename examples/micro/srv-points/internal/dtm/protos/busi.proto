@@ -52,9 +52,11 @@ message PointsBusiReq {
   // 用 string 而不是嵌套 message：四个域的分支载荷各不相同，
   // 用字符串载荷可以让 payload proto 保持完全对称，谁都不必认识谁。
   string biz = 1;
-  // traceparent W3C 上下文，由编排侧从自己的 span 注入。补偿段为空
-  // （dtm 异步发起，载荷里没有它），此时分支按「新根 trace + biz.dtm.gid 关联」
-  // 处理。
+  // traceparent W3C 上下文，由编排侧从自己的 span 注入。常规补偿/Cancel
+  // **不会**为空 —— dtm 按 step 共享载荷（Saga 的 compensate 与 action 同取
+  // BinPayloads[i]；TCC 的 cancel 与 confirm 是同一份 TransBranch 的副本），
+  // 它们挂回正向那条 trace；仅 dtm 重启续推等无原始载荷的推进才落新 trace，
+  // 此时按 biz.dtm.gid 关联（见 design.md D4）。
   string traceparent = 2;
   // fail_inject 失败注入目标分支名（演示用，编排侧填；真机恒空）。
   string fail_inject = 3;

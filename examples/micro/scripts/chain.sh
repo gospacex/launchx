@@ -7,7 +7,12 @@
 #
 # 用法：
 #   bash examples/micro/scripts/chain.sh            # 跑全部路径
-#   bash examples/micro/scripts/chain.sh --compensate   # 只打补偿路径（需先停 srv-order）
+#   bash examples/micro/scripts/chain.sh --compensate   # 打补偿路径（fail_inject 点火，见下）
+#
+# ⚠️ --compensate 已改口径（2026-10-13，dtm Saga 上线）：下游单链是 bff 手动编排 +
+#   手工 ReleaseStock 补偿；现在改由 dtm Saga 驱动、逆序补偿由 dtm 发起（见 README
+#   §1bis）。故本模式不再「先停 srv-order」，改为由 fail_inject 点火——停服注入的是
+#   **基础设施故障**，走的是 dtm 的重试路径，产不出补偿段。
 #
 # 前置：consul / jaeger / mysql / redis / kafka 已起，六个进程已起（见 README §5）。
 
@@ -32,8 +37,8 @@ get() { "${CURL[@]}" -w '\nHTTP %{http_code}\n' "$GATEWAY$1"; }
 post() { "${CURL[@]}" -X POST -H 'Content-Type: application/json' -d "$2" -w '\nHTTP %{http_code}\n' "$GATEWAY$1"; }
 
 if [ "${1:-}" = "--compensate" ]; then
-  step "补偿路径：srv-order 已停时下单（预占成功但建单失败 → ReleaseStock 补偿）"
-  post /api/order "{\"user_id\":$USER_ID,\"product_id\":$PRODUCT_ID,\"quantity\":1}"
+  step "补偿路径：fail_inject 点火 points 分支 → dtm 逆序补偿（见 README §1bis）"
+  post /api/order "{\"user_id\":$USER_ID,\"product_id\":$PRODUCT_ID,\"quantity\":1,\"fail_inject\":\"Debit\"}"
   exit 0
 fi
 

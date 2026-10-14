@@ -29,7 +29,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v7.34.1
-// source: protos/busi.proto
+// source: internal/dtm/protos/busi.proto
 
 package protos
 
@@ -324,5 +324,5 @@ var StockBusi_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "protos/busi.proto",
+	Metadata: "internal/dtm/protos/busi.proto",
 }

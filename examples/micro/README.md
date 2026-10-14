@@ -14,7 +14,46 @@ hubx SDK 句柄，跨进程靠 RPC 双边的 trace suite 续链，Jaeger 上一�
 | 库存域 | `srv-stock/` | `demo-stock` | `127.0.0.1:9023` | `9034` | 预占/释放/确认（加锁 + 三表事务） |
 | 积分域 | `srv-points/` | `demo-points` | `127.0.0.1:9024` | `9032` | 入账/消费（幂等键 + 两表事务） |
 
-端口段：`90xx` 是 RPC（kitex），`8080/8081` 是 HTTP。
+端口段：`90xx` 是 RPC（kitex），`8080/8081` 是 HTTP，`904x` 是 dtm 分支面（gRPC）。
+
+### 1bis. DTM 事务面
+
+dtm（[dtm-labs/dtm](https://github.com/dtm-labs/dtm)）承担两条分布式事务。
+公共件三件套（失败语义 / traceparent 续链 / 官方 barrier 包装）已独立为
+**hubx 平级组件仓 `github.com/gospacex/dtmx`**（物理 `../dtmx`），launchx 以
+`replace => ../dtmx` 消费。
+
+| 组件 | 地址 | 说明 |
+|---|---|---|
+| dtm server | `127.0.0.1:36789`(HTTP) / `36790`(gRPC) | 官方 server，`STORE_DRIVER=mysql`，存储库 `dtm_db` |
+| srv-product 分支面 | `127.0.0.1:9041` | gRPC，不注册 consul |
+| srv-order 分支面 | `127.0.0.1:9042` | 同上 |
+| srv-stock 分支面 | `127.0.0.1:9043` | 同上 |
+| srv-points 分支面 | `127.0.0.1:9044` | 同上 |
+
+**端点**：`POST /api/order`（Saga 下单，取代原手动编排）、`POST /api/presale/lock`（TCC 预售锁定）。
+两条路的分支数据操作都经既有 `handler → service → repository` 六层链入 Jaeger trace。
+
+**分支 URL 形态**：`<host:port>/<proto-service>/<method>`，**无 scheme 前缀**。
+写成 `grpc://…` 会让 dtm 的 `dtmdriver.ParseServerMethod` 直接报错，且失败只出现在
+dtm server 日志里 —— 编排与业务侧都看不到线索。
+
+**起停 dtm**：
+
+```bash
+export MYSQL_PWD=<底座 mysql root 口令>
+docker exec -i -e MYSQL_PWD mysql mysql -uroot \
+  -e "CREATE DATABASE IF NOT EXISTS dtm_db DEFAULT CHARACTER SET utf8mb4;"
+# 事务表 DDL：官方 sqls/dtmsvr.storage.mysql.sql，去掉 CREATE DATABASE 行、库前缀 dtm.→dtm_db.
+STORE_DRIVER=mysql STORE_HOST=127.0.0.1 STORE_PORT=3306 STORE_USER=root \
+  STORE_PASSWORD="$MYSQL_PWD" STORE_DB=dtm_db $(go env GOPATH)/bin/dtm
+```
+
+健康判据：日志里 `recovered panic` 计数必须为 0（dtm **不会**自建事务表，不灌 DDL
+就会持续 panic 报 `Table 'dtm_db.trans_global' doesn't exist`）。
+
+**验收脚本**：`bash examples/micro/scripts/dtm_e2e.sh`（三段：Saga 正向 / Saga 补偿 /
+TCC 二阶段；Want/Observed 分离、退出码即结论、每段带反向探针）。
 
 **采集口（`/metrics`）落在哪，取决于该档有没有 HTTP 面** —— 这是同一套开关的两种落法：
 
@@ -120,10 +159,13 @@ curl -s --noproxy '*' 'http://127.0.0.1:16686/api/traces?service=demo-gateway&li
 > 本机 shell 有 `HTTP_PROXY`，curl 不带 `--noproxy '*'` 会返回
 > "upstream connect failed" 的假故障。
 
-**判读提醒**：`chain.sh --compensate`（或手工停掉某个域服后下单）产出的是
-**故意注入的失败链路** —— span 数更少、服务数更少、带 `biz.compensation=true`。
+**判读提醒**：故障注入（`POST /api/order` 带 `fail_inject`）产出的是
+**故意注入的失败链路** —— span 数更少、带 `biz.compensation=true`。
 它长得很像"链路断了"，但不是故障证据，别拿它当故障报。三类形态对照见
-`docs/verify-chain.md` §9。
+`docs/verify-chain.md`。
+
+> ⚠️ 补偿已改由 dtm Saga 驱动，`chain.sh --compensate` 那条手工停服的口径已退役：
+> 下单链现在是 bff 组事务、dtm 逆序补偿，看补偿请用 `fail_inject`。
 
 ## 5. 起停
 

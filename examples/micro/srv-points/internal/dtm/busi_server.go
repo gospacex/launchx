@@ -20,11 +20,12 @@
 //     按退避重试（见 dtmgrpc.GrpcError2DtmError）。因此 resp.Code/Message
 //     只作人读与未来 HTTP 桥接用，**判定失败不依赖它**。
 //
-//  3. **补偿段是新根 trace**：补偿由 dtm 定时器异步发起，载荷里没有
-//     traceparent。此时若沿用正向段的 trace ID 造一个"同链"的 span，得到的是
-//     一条永远不存在的父链 —— Jaeger 上表现为断链，且比独立 trace 更难查。
-//     本包按 dtmx.ExtractParent 的口径：载荷为空就原样开新根，并用
-//     biz.dtm.gid 把两段关联起来。
+//  3. **补偿段与正向同一条 trace**：dtm 按 step 共享载荷（Saga 的 compensate 与
+//     action 同取 BinPayloads[i]；TCC 的 cancel 与 confirm 是同一份 TransBranch
+//     的副本），补偿分支拿到的是**真 traceparent**，dtmx.ExtractParent 把它挂回
+//     正向那条链。一笔 saga 的正向与回滚因此在一棵树上，不必跨 trace 拼接。
+//     biz.dtm.gid 仍是按业务号检索的关联键，biz.compensation=true 区分两类段。
+//     （只有 dtm 重启续推这类没有原始载荷的推进才落新 trace。）
 package dtm
 
 import (

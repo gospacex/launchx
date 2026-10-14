@@ -69,7 +69,7 @@ func (s *BusiServer) CreateOrder(ctx context.Context, req *protos.OrderBusiReq) 
 	return s.branch(ctx, model.DtmCreateOrderBranch, req, s.svc.DtmCreateOrder)
 }
 
-// CancelOrder Saga 补偿分支（由 dtm 异步发起，载荷里没有 traceparent）
+// CancelOrder Saga 补偿分支（与正向同一条 trace：dtm 按 step 共享载荷，故这里仍有真 traceparent）
 func (s *BusiServer) CancelOrder(ctx context.Context, req *protos.OrderBusiReq) (*protos.OrderBusiResp, error) {
 	return s.branch(ctx, model.DtmCancelOrderBranch, req, s.svc.DtmCancelOrder)
 }
@@ -96,9 +96,12 @@ func (s *BusiServer) CancelFreeze(ctx context.Context, req *protos.OrderBusiReq)
 // 编排侧按 URL 里的方法名点火才不会写错。TestFullMethodNamesMatchDtmCallbackURL
 // 把「方法名 == 分支名」也钉住了。
 func (s *BusiServer) branch(ctx context.Context, branch string, req *protos.OrderBusiReq, write branchWrite) (*protos.OrderBusiResp, error) {
-	// ① 续链。载荷无 traceparent 时 ExtractParent 原样返回 ctx —— 补偿 / Cancel
-	//    就是这种情况，它们按「新根 trace + biz.dtm.gid 关联」记录，凭空造一个
-	//    同 ID 的孤儿 span 只是让 Jaeger 看起来像连上了。
+	// ① 续链。dtm 按 step 共享载荷（Saga 的 compensate 与 action 同取
+	//    BinPayloads[i]；TCC 的 cancel 与 confirm 是同一份 TransBranch 的副本），
+	//    所以**补偿段拿到的也是真 traceparent**，挂回的是正向那条 trace ——
+	//    真机已实测（见 design.md D4）。只有 dtm 重启续推这类没有原始载荷
+	//    的推进才会让这里拿到空值；那种情况按 biz.dtm.gid 关联，凭空造一个
+	//    同 ID 的孤儿 span 才是自欺。
 	ctx = dtmx.ExtractParent(ctx, req.GetTraceparent())
 
 	ctx, end := s.begin(ctx, branch)
@@ -183,7 +186,7 @@ func failResp(err error) *protos.OrderBusiResp {
 // isCompensation 该分支是不是逆向分支。
 //
 // CancelOrder 是 Saga 补偿、CancelFreeze 是 TCC 的回退；两者都由 dtm 异步发起，
-// 都没有 traceparent。反过来 CreateOrder / TryPlace / ConfirmFreeze 属正向段。
+// 都不是正向段（反向的补偿段同样带 traceparent）。反过来 CreateOrder / TryPlace / ConfirmFreeze 属正向段。
 var compensationBranches = map[string]bool{
 	model.DtmCancelOrderBranch:  true,
 	model.DtmCancelFreezeBranch: true,

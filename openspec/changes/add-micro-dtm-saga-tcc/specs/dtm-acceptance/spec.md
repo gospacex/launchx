@@ -31,8 +31,8 @@
 ### Requirement: 验收文档口径 SHALL 与 Saga 替换同步改写
 
 `examples/ACCEPTANCE.md` SHALL 新增 DTM 验收节（两条链的目录树/调用链/观测细节），
-`docs/trace-chain-audit.md` §3 SHALL 增补「DTM Saga/TCC 两链 trace 实测」小节
-（仓内不存在 `docs/verify-chain.md`，入链核对的既有落点是本文件），
+`examples/micro/docs/verify-chain.md` SHALL 增补「DTM Saga/TCC 两链 trace 实测」两节
+（该文件是 micro 既有���「全链路实测证据」落点），
 `examples/micro/README.md`
 的拓扑/端口/起停段 SHALL 同步（:9041-9044 分支面、dtm 部署、`dtm_e2e.sh`）。
 E3 下单链验收口径 SHALL 由手动编排改为 Saga 口径；现有其余验收（E1/E2 等）

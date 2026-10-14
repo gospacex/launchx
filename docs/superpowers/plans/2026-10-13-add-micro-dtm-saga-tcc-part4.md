@@ -34,7 +34,7 @@ dtm:
     points:  "127.0.0.1:9044"
 ```
 
-- [ ] **Step 10.1：saga 编排器全量代码 `bff/internal/dtm/saga.go`**
+- [x] **Step 10.1：saga 编排器全量代码 `bff/internal/dtm/saga.go`**
 
 ```go
 // Package dtm bff 的事务编排面（saga / tcc 两套，本文件 saga）。
@@ -145,7 +145,7 @@ bizFor := func(domain, op string) any {
 
 （`PointsCost/OutboxPayload` 由 handler 组命令时带进来 —— Saga 命令结构里全字段：{ProductID, Quantity, PointsCost, TotalAmount, OrderNo, UserID, FailInject, Items, OutboxPayload}；ItemDTOs() = domain map。）
 
-- [ ] **Step 10.2：handler 改挂（现下单 handler 的业务段替换为调编排器）**
+- [x] **Step 10.2：handler 改挂（现下单 handler 的业务段替换为调编排器）**
 
 以现文件为准的锚点（落地时打开 `bff/internal/handler/**.go`，找到 `POST /api/order` 的 handler 函数与「下单失败补偿」段）。替换的业务动词（全代码，参数形态按现文件变量名同位替换）：
 
@@ -176,14 +176,14 @@ sagaOrch := dtm.NewOrderSaga(dtmAddr, func(domain string) string { return branch
 handler 传入（NewHandler(svc, sagaOrch)——按现 handler 构造函数签名扩展参数）
 ```
 
-- [ ] **Step 10.3：**撤手动补偿**（**删除证据**）**
+- [x] **Step 10.3：**撤手动补偿**（**删除证据**）**
 
 ```bash
 grep -rn "ReleaseStock\|biz.compensation=true\|compensation" examples/micro/bff/ --include='*.go'
 ```
 预期：**零命中**（bff 里不再手动调 stock release）。若有命中 → 删除该调用段与相关测试（上线前由 Task 15 文档把 E3 失败演示口径迁到 fail_inject）。
 
-- [ ] **Step 10.4：编排器单测（不起 dtm：只截在「Add 语义序列正确 + 载荷带 traceparent」上，用 fake dtmgrpc 转接）**
+- [x] **Step 10.4：编排器单测（不起 dtm：只截在「Add 语义序列正确 + 载荷带 traceparent」上，用 fake dtmgrpc 转接）**
 
 > dtmgrpc 的构造体与 `Add` 难以单层 mock —— 单测改测**纯函数形态**：把「分支序表 + 地址 + 载荷」的构造函数抽出来（`buildEntries(cmd) [][2]string { url, payload }`），单测断言四分支的 action/comp 序对、payload JSON 各带 traceparent 与 fail_inject。dtm 真实调用语义归 Task 13 集成测试。**全代码（bff/internal/dtm/saga_test.go）**：
 
@@ -224,7 +224,7 @@ func TestBuildOrderSagaEntries(t *testing.T) {
 }
 ```
 
-- [ ] **Step 10.5：build + ci + Commit**
+- [x] **Step 10.5：build + ci + Commit**
 
 ```bash
 bash examples/scripts/ci.sh micro
@@ -232,7 +232,7 @@ git add examples/micro
 git commit -m "feat(micro-bff): saga orchestration replaces manual order chain"
 ```
 
-- [ ] **Task complete**
+- [x] **Task complete**
 
 ---
 
@@ -247,7 +247,7 @@ API 形态：dtm TCC 的 bff 侧是**两段函数**：先 Try 全部、finalize 
 
 - `tcc := dtmgrpc.NewTcc(dtmAddr, gid)`；Try 编排在 `tcc.Call(func(t *dtmgrpc.Tcc){ t.CallBranch(url, payload) ... })`；Try 全绿 → 由 dtm「用户二次触发」——demo 里 bff 在 Try 成功后走 `t.Submit()` 路由到「立即 Confirm」语义（或验收脚本直接打 Confirm 分支入口——**demo 落法**：Try 成功后 bff 立即再提交一次 Confirm 分支集；Cancel 路径由验收脚本 fail_inject 驱动）。
 
-- [ ] **Step 11.1：tcc 编排器全量代码 `bff/internal/dtm/tcc.go`**
+- [x] **Step 11.1：tcc 编排器全量代码 `bff/internal/dtm/tcc.go`**
 
 ```go
 package dtm
@@ -325,7 +325,7 @@ func payloadEncode(tp, failInject string, biz any) (string, error) {
 
 > ⚠️ **`SubmitConfirm` 里那个空 return 是本计划的登记占位 —— build 阶段禁止以此出仓。归还路径**：Task 1 Step 1.3 的 grep 清单里已经列出「官方确认二阶段 API 名」；执行按 grep 结果写一行真实调用（等价「二阶段 finalize 提交」）。若官方 dtm 形态根本没有独立二阶段调用 API（全部由 dtm server 自己推进），则该函数**删除**，SubmitTry 的「Try 全绿 → 二阶段」交由 dtm 推进（demo 脚本改用 wait 叙述）——**这两种形态必居其一，禁止半归半不归**。
 
-- [ ] **Step 11.2：新 handler + 路由（锚点：现 bff handler/route 文件，同 Task 10.2 装配挂钩；路由：`POST /api/presale/lock`）**
+- [x] **Step 11.2：新 handler + 路由（锚点：现 bff handler/route 文件，同 Task 10.2 装配挂钩；路由：`POST /api/presale/lock`）**
 
 handler 内的命令组装（全代码；变量名同现有文件另置）：
 
@@ -345,19 +345,19 @@ if err != nil {
 r.POST("/api/presale/lock", authed(h.HandlePresaleLock))
 ```
 
-- [ ] **Step 11.3：tcc 单测（同 Task 10.4 形态：抽取 `BuildPresaleTryEntries` 纯函数断言三对 Try 序与 payload）**
+- [x] **Step 11.3：tcc 单测（同 Task 10.4 形态：抽取 `BuildPresaleTryEntries` 纯函数断言三对 Try 序与 payload）**
 
 ```bash
 go test ./examples/micro/bff/... -count=1 && bash examples/scripts/ci.sh micro
 ```
 
-- [ ] **Step 11.4：Commit**
+- [x] **Step 11.4：Commit**
 
 ```bash
 git add examples/micro
 git commit -m "feat(micro-bff): presale tcc orchestration + /api/presale/lock"
 ```
 
-- [ ] **Task complete**
+- [x] **Task complete**
 
 ---

@@ -214,7 +214,32 @@ grep -rn "micro_apps/infra" examples/micro/srv/ # 必须为空（infra 复制件
 判定：
 - `main.go ≤ 50` 行 → 否则 FAIL
 - 无 `micro_apps/infra` import（改走 `App.DB/Cache/MQ/Registry/Tracer`）→ 否则 FAIL
-- 下单 e2e 全绿，且 outbox 对应 topic 在 kafka `9092` 可见消息（topic 自动创建）→ PASS
+- 下单链经 **dtm Saga** 提交（`POST /api/order`），补偿由 dtm 逆序驱动
+  （不再手工 `ReleaseStock`）；Saga 正向 + 补偿两段全绿，且 outbox 对应 topic 在
+  kafka `9092` 可见消息（topic 自动创建）→ PASS
+
+## 7bis. DTM — Saga / TCC 事务链验收（tasks 4.2 / 4.3）
+
+```bash
+export HUBX_DB_PW=hubx123 MYSQL_ROOT_PW=<底座 mysql root 口令>
+# 先起 dtm server（见 examples/micro/README.md §1bis），再起六进程
+bash examples/micro/scripts/dtm_e2e.sh
+```
+
+三段：①Saga 正向 ②Saga 补偿（fail_inject） ③TCC Try/Confirm 与 Try/Cancel。
+
+判定：
+- 三段全部 PASS 且退出码 0 → PASS
+- 任一段 `FAIL`（Want/Observed 分离打印）→ FAIL，指明第几段
+- 退出码 2 = 前置缺失（dtm / 六进程未起）→ **不是 PASS**，是「没验成」
+
+关键判据（两段各自钉死）：
+- Saga 正向：`POST /api/order` 后 **Jaeger 单条 trace** 含 bff 提交 span + 四域 `rpc.dtm.*`
+  + 各域 `service.*`/`db.*`，根 span 恰 1，每 span 带 `biz.dtm.gid`
+- Saga 补偿：补偿 span 与正向 span **同一条 traceID**、带 `biz.compensation=true`；
+  四库回到基线
+- TCC：outbox 行**只在 Confirm 后出现**（Try 后行数不变）；Cancel 路径三域冻结归零、
+  占位单零残留
 
 ## 8. E1/E2 收尾：T9 尾部不缺（tasks 4.7）
 

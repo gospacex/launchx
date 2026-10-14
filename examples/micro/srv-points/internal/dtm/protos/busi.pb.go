@@ -27,7 +27,7 @@
 // versions:
 // 	protoc-gen-go v1.36.6
 // 	protoc        v7.34.1
-// source: protos/busi.proto
+// source: internal/dtm/protos/busi.proto
 
 package pointsbusi
 
@@ -53,9 +53,11 @@ type PointsBusiReq struct {
 	// 用 string 而不是嵌套 message：四个域的分支载荷各不相同，
 	// 用字符串载荷可以让 payload proto 保持完全对称，谁都不必认识谁。
 	Biz string `protobuf:"bytes,1,opt,name=biz,proto3" json:"biz,omitempty"`
-	// traceparent W3C 上下文，由编排侧从自己的 span 注入。补偿段为空
-	// （dtm 异步发起，载荷里没有它），此时分支按「新根 trace + biz.dtm.gid 关联」
-	// 处理。
+	// traceparent W3C 上下文，由编排侧从自己的 span 注入。常规补偿/Cancel
+	// **不会**为空 —— dtm 按 step 共享载荷（Saga 的 compensate 与 action 同取
+	// BinPayloads[i]；TCC 的 cancel 与 confirm 是同一份 TransBranch 的副本），
+	// 它们挂回正向那条 trace；仅 dtm 重启续推等无原始载荷的推进才落新 trace，
+	// 此时按 biz.dtm.gid 关联（见 design.md D4）。
 	Traceparent string `protobuf:"bytes,2,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
 	// fail_inject 失败注入目标分支名（演示用，编排侧填；真机恒空）。
 	FailInject    string `protobuf:"bytes,3,opt,name=fail_inject,json=failInject,proto3" json:"fail_inject,omitempty"`
@@ -65,7 +67,7 @@ type PointsBusiReq struct {
 
 func (x *PointsBusiReq) Reset() {
 	*x = PointsBusiReq{}
-	mi := &file_protos_busi_proto_msgTypes[0]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -77,7 +79,7 @@ func (x *PointsBusiReq) String() string {
 func (*PointsBusiReq) ProtoMessage() {}
 
 func (x *PointsBusiReq) ProtoReflect() protoreflect.Message {
-	mi := &file_protos_busi_proto_msgTypes[0]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -90,7 +92,7 @@ func (x *PointsBusiReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PointsBusiReq.ProtoReflect.Descriptor instead.
 func (*PointsBusiReq) Descriptor() ([]byte, []int) {
-	return file_protos_busi_proto_rawDescGZIP(), []int{0}
+	return file_internal_dtm_protos_busi_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *PointsBusiReq) GetBiz() string {
@@ -130,7 +132,7 @@ type PointsBusiResp struct {
 
 func (x *PointsBusiResp) Reset() {
 	*x = PointsBusiResp{}
-	mi := &file_protos_busi_proto_msgTypes[1]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -142,7 +144,7 @@ func (x *PointsBusiResp) String() string {
 func (*PointsBusiResp) ProtoMessage() {}
 
 func (x *PointsBusiResp) ProtoReflect() protoreflect.Message {
-	mi := &file_protos_busi_proto_msgTypes[1]
+	mi := &file_internal_dtm_protos_busi_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -155,7 +157,7 @@ func (x *PointsBusiResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PointsBusiResp.ProtoReflect.Descriptor instead.
 func (*PointsBusiResp) Descriptor() ([]byte, []int) {
-	return file_protos_busi_proto_rawDescGZIP(), []int{1}
+	return file_internal_dtm_protos_busi_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PointsBusiResp) GetCode() int64 {
@@ -172,11 +174,11 @@ func (x *PointsBusiResp) GetMessage() string {
 	return ""
 }
 
-var File_protos_busi_proto protoreflect.FileDescriptor
+var File_internal_dtm_protos_busi_proto protoreflect.FileDescriptor
 
-const file_protos_busi_proto_rawDesc = "" +
+const file_internal_dtm_protos_busi_proto_rawDesc = "" +
 	"\n" +
-	"\x11protos/busi.proto\x12\x10dtmbranch.points\"d\n" +
+	"\x1einternal/dtm/protos/busi.proto\x12\x10dtmbranch.points\"d\n" +
 	"\rPointsBusiReq\x12\x10\n" +
 	"\x03biz\x18\x01 \x01(\tR\x03biz\x12 \n" +
 	"\vtraceparent\x18\x02 \x01(\tR\vtraceparent\x12\x1f\n" +
@@ -194,23 +196,23 @@ const file_protos_busi_proto_rawDesc = "" +
 	"\fCancelFreeze\x12\x1f.dtmbranch.points.PointsBusiReq\x1a .dtmbranch.points.PointsBusiRespBVZTgithub.com/gospacex/launchx/examples/micro/srv-points/internal/dtm/protos;pointsbusib\x06proto3"
 
 var (
-	file_protos_busi_proto_rawDescOnce sync.Once
-	file_protos_busi_proto_rawDescData []byte
+	file_internal_dtm_protos_busi_proto_rawDescOnce sync.Once
+	file_internal_dtm_protos_busi_proto_rawDescData []byte
 )
 
-func file_protos_busi_proto_rawDescGZIP() []byte {
-	file_protos_busi_proto_rawDescOnce.Do(func() {
-		file_protos_busi_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_protos_busi_proto_rawDesc), len(file_protos_busi_proto_rawDesc)))
+func file_internal_dtm_protos_busi_proto_rawDescGZIP() []byte {
+	file_internal_dtm_protos_busi_proto_rawDescOnce.Do(func() {
+		file_internal_dtm_protos_busi_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_dtm_protos_busi_proto_rawDesc), len(file_internal_dtm_protos_busi_proto_rawDesc)))
 	})
-	return file_protos_busi_proto_rawDescData
+	return file_internal_dtm_protos_busi_proto_rawDescData
 }
 
-var file_protos_busi_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_protos_busi_proto_goTypes = []any{
+var file_internal_dtm_protos_busi_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_internal_dtm_protos_busi_proto_goTypes = []any{
 	(*PointsBusiReq)(nil),  // 0: dtmbranch.points.PointsBusiReq
 	(*PointsBusiResp)(nil), // 1: dtmbranch.points.PointsBusiResp
 }
-var file_protos_busi_proto_depIdxs = []int32{
+var file_internal_dtm_protos_busi_proto_depIdxs = []int32{
 	0, // 0: dtmbranch.points.PointsBusi.Debit:input_type -> dtmbranch.points.PointsBusiReq
 	0, // 1: dtmbranch.points.PointsBusi.Refund:input_type -> dtmbranch.points.PointsBusiReq
 	0, // 2: dtmbranch.points.PointsBusi.TryFreeze:input_type -> dtmbranch.points.PointsBusiReq
@@ -228,26 +230,26 @@ var file_protos_busi_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_protos_busi_proto_init() }
-func file_protos_busi_proto_init() {
-	if File_protos_busi_proto != nil {
+func init() { file_internal_dtm_protos_busi_proto_init() }
+func file_internal_dtm_protos_busi_proto_init() {
+	if File_internal_dtm_protos_busi_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protos_busi_proto_rawDesc), len(file_protos_busi_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_dtm_protos_busi_proto_rawDesc), len(file_internal_dtm_protos_busi_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_protos_busi_proto_goTypes,
-		DependencyIndexes: file_protos_busi_proto_depIdxs,
-		MessageInfos:      file_protos_busi_proto_msgTypes,
+		GoTypes:           file_internal_dtm_protos_busi_proto_goTypes,
+		DependencyIndexes: file_internal_dtm_protos_busi_proto_depIdxs,
+		MessageInfos:      file_internal_dtm_protos_busi_proto_msgTypes,
 	}.Build()
-	File_protos_busi_proto = out.File
-	file_protos_busi_proto_goTypes = nil
-	file_protos_busi_proto_depIdxs = nil
+	File_internal_dtm_protos_busi_proto = out.File
+	file_internal_dtm_protos_busi_proto_goTypes = nil
+	file_internal_dtm_protos_busi_proto_depIdxs = nil
 }

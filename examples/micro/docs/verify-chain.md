@@ -77,6 +77,10 @@
 
 ## 4. 补偿路径 `43983186dcb7` / `950f07cc2817180d4d`（停掉 srv-order 注入建单失败）
 
+> 🕘 **历史证据（2026-10-07，dtm Saga 上线之前）。** 这里的 span 形态属于「bff 手动
+> 编排 + 手工 `ReleaseStock` 单跳补偿」那套实现。补偿已改由 dtm Saga 驱动，形态见
+> **§10.2**；本节保留原始记录不改写（改掉就等于篡改当时的实测证据）。
+
 > ⚠️ **这一节是「故意让它失败」的证据，不是链路故障。** 网关在这里返回的
 > **502 是正确行为**（下游真的不可达）。把本节与 §3 对照着看，不要单独拿去判
 > 「链路通没通」—— 二者长得完全不一样：本节的 trace 里**只有 4 个服务**
@@ -127,7 +131,8 @@ bash examples/micro/scripts/chain.sh --compensate        # 期望 502 + 补偿 s
 | service（幂等） | 重放命中 | `db.kvx.GET` / `db.kvx.EXISTS` 命中后直接返回，无 db 写入 |
 | middleware | 限流触发 | 只有 `db.kvx.INCR` 就返回，下面**没有** `handler.*`（本轮未触发） |
 | handler（bff） | 领域失败 | span 上记 `code != 0`，HTTP 侧映射 404/409，**不是** RPC error |
-| handler（bff） | 补偿 | `handler.ReleaseStock.compensate` + `biz.compensation=true` |
+| handler（bff） | 补偿 | **现行（dtm Saga）**：`rpc.dtm.<域>.<Compensate>` + `biz.compensation=true`，
+  与正向分支**同一条 trace**（见 §10.2）；dtm 之前的形态是 `handler.ReleaseStock.compensate` |
 
 ## 7. 本轮顺带修的一处判据缺陷
 
@@ -257,3 +262,95 @@ curl -s --noproxy '*' 'http://127.0.0.1:16686/api/services'   # 应有 demo-{pro
 - 六服务近 10 分钟孤儿 trace **全为 0**；主链路 `POST /api/order` 88-97 span、单根、树深 16
 - 同时段 `examples/micro/srv`（旧单档 `demo-srv` :9013）**未启动**，故本轮 trace 里
   不应出现 `demo-srv`；若出现，说明有人把它起起来了（与四域共 order_db，会互相补发事件）
+
+---
+
+## 10. DTM Saga / TCC 两链实测（2026-10-13）
+
+判据：**分布式事务的每一次数据操作都入链，且 Jaeger 可查**。
+
+与 §1-§9 的手动编排不同，下单链现由 [dtm](https://github.com/dtm-labs/dtm) Saga
+驱动、TCC 走二阶段；分支数据操作仍经既有 `handler → service → repository` 六层链。
+
+### 10.1 Saga 正向 —— 一条 trace 看完下单
+
+一笔真实提交（`POST /api/order`，`gid=Sk9x4iKb8QRwvqBLxLD2wk`）：
+
+| span | 服务 | 说明 |
+|---|---|---|
+| `handler.mall.PlaceOrder` | demo-bff | 提交入口 |
+| `rpc.dtm.stock.Deduct` | demo-stock | 分支入口，带 `biz.dtm.gid` / `biz.dtm.branch` |
+| `rpc.dtm.order.CreateOrder` | demo-order | 同上 |
+| `rpc.dtm.product.AddSales` | demo-product | 同上 |
+| `rpc.dtm.points.Debit` | demo-points | 同上 |
+
+共 **39 个 span 单树**，含五服务；`biz.dtm.gid` 在提交 span 与四个分支入口上一致。
+库侧对账：库存 `2991/2945 → 2990/2944`、`product_sales.sold=1`、积分 `396 → 387`、
+四库各 1 行 barrier，`trans_global.status=succeed`。
+
+**查法**：`Jaeger → service=demo-bff → 按 tag biz.dtm.gid 过滤`，根 span 恰 1。
+
+### 10.2 Saga 补偿 —— **与正向同一条 trace**（修正旧口径）
+
+⚠️ 早期文档写「补偿段是新根 trace」，**这是错的**，真机与源码双向证伪：
+
+- dtm 按 step **共享载荷** —— Saga `dtmsvr/trans_type_saga.go` 的 `GenBranches()` 对
+  compensate 与 action 同取 `BinData: t.BinPayloads[i]`；TCC
+  `dtmsvr/api.go` 的 `svcRegisterBranch()` 里 `branches := []TransBranch{*branch, *branch}`。
+- 真机：两笔补偿事务在 Jaeger 上**各自只出现在 1 条 trace 上**。
+
+```
+gid=ZZHHh8BEDQwmJHc2Vix7ki → trace 53b04ff0…（单条）
+  rpc.dtm.stock.Deduct     biz.compensation=false
+  rpc.dtm.stock.Release    biz.compensation=true
+  rpc.dtm.order.CreateOrder  false  ／  rpc.dtm.order.CancelOrder   true
+  rpc.dtm.product.AddSales   false  ／  rpc.dtm.product.ReduceSales  true
+  根 span 数 = 1，悬空父引用 = 0
+
+gid=kNuEHDT788ThiHG8dQEaKe → trace 856f7915…（TCC，单条）
+  TryFreeze×3(false) + CancelFreeze×3(true)
+```
+
+所以一笔 saga 的正向与回滚在同一棵树上，**不必跨 trace 拼接**，也不存在伪造的同 ID
+孤儿 span（补偿段是真实前序 span 的合法子节点）。区分两类段看 `biz.compensation`；
+按业务号检索看 `biz.dtm.gid`。
+
+> 只有 dtm 重启续推这类**没有原始载荷上下文**的推进才会落新 trace。
+
+### 10.3 TCC 二阶段 —— outbox 只在 Confirm 后出现
+
+`POST /api/presale/lock`，`gid=kT9Uda7Pepgg6yThgvBZwA`：
+
+```
+Try:  outbox=63（不变）  stock avail 2940→2938, frozen 0→2   points frozen 0→19
+      order_status_log: presale_locked → paid                ← 占位单转正式单
+Confirm: outbox 63→64                                          ← 此刻才写事件
+      stock frozen 2→0（实扣）  points frozen 19→0
+barrier: try / confirm 成对，cancel 从未执行
+trans_global.status=succeed，三 confirm 全 succeed、三 cancel 全 prepared
+```
+
+Cancel 路径（`fail_inject` 点火）：`orders 87→87`、`outbox 64→64`、
+`presale_locked` 残留 0、三域 frozen 全归零；dtm 侧三 cancel 全 succeed、
+三 confirm 全 prepared —— 与上条严格镜像。
+
+**查法**：`SELECT COUNT(*) FROM order_db.outbox WHERE event_type LIKE '%order%'`
+在 Try 后不增长、Confirm 后 +1。
+
+### 10.4 分支 URL 形态（踩过的坑）
+
+分支地址是 **`<host:port>/<proto-service>/<method>`，无 scheme 前缀**。
+写 `grpc://…` 会被 `dtmdriver.ParseServerMethod` 直接判错，而失败**只出现在 dtm
+server 日志里**，编排与业务侧看不到任何线索。
+
+### 10.5 复验
+
+```bash
+export HUBX_DB_PW=hubx123 MYSQL_ROOT_PW=<底座 mysql root 口令>
+bash examples/micro/scripts/dtm_e2e.sh     # 三段，退出码即结论
+```
+
+> ⚠️ 若本机 `mall_rw` 账号连不上（`Access denied ...@192.168.32.1`）而 root/testuser
+> 正常，那是 demo 库的账号状态问题，与链路无关：`ALTER` 改口令后容易进入
+> 「hash 稳定但认证态不一致」的中间态，用 `DROP USER` + `CREATE USER` + `GRANT`
+> 重建一次即可恢复。
