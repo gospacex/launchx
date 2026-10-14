@@ -64,7 +64,7 @@
 > 落 Step 12.4；**空补偿/悬挂/重放三条**移入 Task 13 真机（真 MySQL + 真 dtm），
 > 落 Step 13.6。Task 编号与三向勾选不变。
 
-- [ ] **Step 12.1：写静态守卫测试（含直连探针）**
+- [x] **Step 12.1：写静态守卫测试（含直连探针）**
 
 创建 `examples/micro/dtm_surface_test.go`：
 
@@ -189,7 +189,7 @@ func probeDirect(db *gorm.DB) *sql.DB {
 }
 ```
 
-- [ ] **Step 12.2：运行守卫，预期 FAIL 且指名道姓**
+- [x] **Step 12.2：运行守卫，预期 FAIL 且指名道姓**
 
 运行：
 ```bash
@@ -199,7 +199,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx/examples/micro && go test . -run Test
 预期：FAIL，报错点名 `srv-stock/internal/dtm/zz_probe_direct.go:N  import database/sql` 与 `... import gorm.io/gorm`。
 若 PASS → 守卫写错了（路径或 allowed 判断失效），**停下修正，不要继续**。
 
-- [ ] **Step 12.3：删探针，预期 PASS**
+- [x] **Step 12.3：删探针，预期 PASS**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx && rm examples/micro/srv-stock/internal/dtm/zz_probe_direct.go
@@ -208,7 +208,7 @@ cd examples/micro && go test . -run TestDtmBranchFaceHasNoDirectDBImports -v
 
 预期：PASS，日志含 `dtm 分支面依赖面干净：四域共扫过 N 个 .go 文件`。
 
-- [ ] **Step 12.4：写 barrier 边界契约单测**
+- [x] **Step 12.4：写 barrier 边界契约单测**
 
 创建 `examples/micro/pkg/dtmx/barrier_contract_test.go`：
 
@@ -270,7 +270,7 @@ func TestPayloadCarriesTraceparentAndFailInject(t *testing.T) {
 }
 ```
 
-- [ ] **Step 12.5：运行 barrier 契约单测**
+- [x] **Step 12.5：运行 barrier 契约单测**
 
 运行：
 ```bash
@@ -279,7 +279,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && go test ./examples/micro/pkg/dtmx/
 
 预期：三条 PASS（`TestBarrierFromCtxRejectsMissingGrpcMeta`、`TestNormalizeKeepsBusinessFailureSentinel`、`TestPayloadCarriesTraceparentAndFailInject`）。
 
-- [ ] **Step 12.6：全量 micro 单测**
+- [x] **Step 12.6：全量 micro 单测**
 
 运行：
 ```bash
@@ -288,13 +288,13 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && go test ./examples/micro/... -coun
 
 预期：全绿。真机用例（`dtm_e2e_test.go` 等）在底座未起时输出 `SKIP` 并写明原因——**SKIP 不写成 PASS**。
 
-- [ ] **Step 12.7：Commit**
+- [x] **Step 12.7：Commit**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/dtm_surface_test.go examples/micro/pkg/dtmx/barrier_contract_test.go && git commit -m "test(examples/micro): dtm 分支面依赖面守卫 + barrier 边界契约单测"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
 
 ---
 
@@ -316,7 +316,7 @@ docker compose -f /Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml up 
 bash examples/micro/scripts/e2e.sh --keep   # 起六进程（dtm server 由 compose 追加，Task 2 已落）
 ```
 
-- [ ] **Step 13.1：写 dtm 探活与 gid 取值助手**
+- [x] **Step 13.1：写 dtm 探活与 gid 取值助手**
 
 创建 `examples/micro/dtm_e2e_test.go` 的第一段：
 
@@ -398,7 +398,7 @@ func fetchDtmTraceSince(t *testing.T, c *traceutil.Client, service string, since
 }
 ```
 
-- [ ] **Step 13.2：写 Saga 正向单 trace 断言**
+- [x] **Step 13.2：写 Saga 正向单 trace 断言**
 
 追加到 `examples/micro/dtm_e2e_test.go`：
 
@@ -455,7 +455,7 @@ func TestDtmSagaPositiveIsOneTrace(t *testing.T) {
 }
 ```
 
-- [ ] **Step 13.3：写 fail 注入 → 补偿同 trace + gid 关联断言**
+- [x] **Step 13.3：写 fail 注入 → 补偿同 trace + gid 关联断言**
 
 ```go
 // fail_inject 触发逆序补偿。dtm 按 step 共享载荷（Saga 的 compensate 与 action
@@ -535,7 +535,7 @@ func TestDtmSagaCompensationIsNewRootLinkedByGid(t *testing.T) {
 }
 ```
 
-- [ ] **Step 13.4：写 TCC Confirm / Cancel 路径断言**
+- [x] **Step 13.4：写 TCC Confirm / Cancel 路径断言**
 
 ```go
 // TCC：Try 全绿 → Confirm（outbox 行**仅在 Confirm 后**出现）；
@@ -591,7 +591,7 @@ func TestDtmTccCancelUnfreezesAllDomains(t *testing.T) {
 }
 ```
 
-- [ ] **Step 13.5：写 dtm kill → 重启续推进断言**
+- [x] **Step 13.5：写 dtm kill → 重启续推进断言**
 
 ```go
 // dtm server 是事务推进的唯一引擎：kill 掉正在跑的事务，重启后必须靠
@@ -612,7 +612,7 @@ func TestDtmSurvivesRestartAndResumesTransaction(t *testing.T) {
 }
 ```
 
-- [ ] **Step 13.6：barrier 三条幂等真机断言（空补偿 / 悬挂 / 重放）**
+- [x] **Step 13.6：barrier 三条幂等真机断言（空补偿 / 悬挂 / 重放）**
 
 ```go
 // 这三条必须打真 MySQL + 真 dtm：barrier 的行锁语义（SELECT … FOR UPDATE）
@@ -637,7 +637,7 @@ func TestDtmBarrierDuplicateCallbackIsIdempotent(t *testing.T) {
 }
 ```
 
-- [ ] **Step 13.7：运行（底座未起时应全 SKIP）**
+- [x] **Step 13.7：运行（底座未起时应全 SKIP）**
 
 运行：
 ```bash
@@ -646,7 +646,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && go test ./examples/micro/ -run 'Te
 
 预期（底座未起）：全部 `SKIP`，每条都打印**具体起法**——不得出现 `PASS`。
 
-- [ ] **Step 13.8：真机运行（底座 + dtm + 六进程已起）**
+- [x] **Step 13.8：真机运行（底座 + dtm + 六进程已起）**
 
 运行：
 ```bash
@@ -656,13 +656,13 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && go test ./examples/micro/ -run 'Te
 预期：三条 PASS。若 `TestDtmSagaPositiveIsOneTrace` 报「实际 N 个根 span」，
 说明 traceparent 没编进载荷或分支面没 Extract —— 回 Task 4 / Task 5 修，不是本 Task 的问题。
 
-- [ ] **Step 13.9：Commit**
+- [x] **Step 13.9：Commit**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/dtm_e2e_test.go && git commit -m "test(examples/micro): DTM Saga/TCC 真机集成验收（单 trace / 补偿 gid 关联 / Confirm-Cancel）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
 
 ---
 
@@ -674,7 +674,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/dtm_e2e_tes
 **Files:**
 - 创建：`examples/micro/scripts/dtm_e2e.sh`
 
-- [ ] **Step 14.1：写脚本骨架（前置探活 + Want/Observed + 退出码）**
+- [x] **Step 14.1：写脚本骨架（前置探活 + Want/Observed + 退出码）**
 
 创建 `examples/micro/scripts/dtm_e2e.sh`：
 
@@ -837,7 +837,7 @@ echo "存在失败判据（末段：${SEGMENT}）"
 exit 1
 ```
 
-- [ ] **Step 14.2：赋可执行位并做 shell 语法检查**
+- [x] **Step 14.2：赋可执行位并做 shell 语法检查**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx && chmod +x examples/micro/scripts/dtm_e2e.sh && bash -n examples/micro/scripts/dtm_e2e.sh && echo "语法 OK"
@@ -845,7 +845,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && chmod +x examples/micro/scripts/dt
 
 预期：打印 `语法 OK`（`bash -n` 只查语法，不执行）。
 
-- [ ] **Step 14.3：跑全链三段**
+- [x] **Step 14.3：跑全链三段**
 
 运行：
 ```bash
@@ -855,7 +855,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && bash examples/micro/scripts/dtm_e2
 
 预期：三段全部 `PASS`，末尾 `三段全绿（末段：3/3 TCC 二阶段）`，退出码 0。
 
-- [ ] **Step 14.4：验证反向探针真的会红**
+- [x] **Step 14.4：验证反向探针真的会红**
 
 运行（人为破坏判据：把段 1 的期望值改成不可能值）：
 ```bash
@@ -867,13 +867,13 @@ cp /tmp/dtm_e2e.bak examples/micro/scripts/dtm_e2e.sh
 
 预期：输出 `Want: …-999` 与 `Observed: …-1`，且脚本退出码非 0。恢复后脚本回到全绿。
 
-- [ ] **Step 14.5：Commit**
+- [x] **Step 14.5：Commit**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/scripts/dtm_e2e.sh && git commit -m "test(examples/micro): DTM 三段脚本级验收（Saga 正向/补偿/TCC 二阶段）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
 
 ---
 
@@ -893,7 +893,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/scripts/dtm
 > （`docs/` 下最接近的是 `examples/micro/docs/verify-chain.md`「调用链入链核对」）。spec 阶段已同步修正
 > tasks.md / plan-ready / dtm-acceptance spec 三处指向，本 Task 按修正后落点执行。
 
-- [ ] **Step 15.1：README 拓扑与端口**
+- [x] **Step 15.1：README 拓扑与端口**
 
 在 `examples/micro/README.md` 的拓扑/端口表补入（其余章节不动）：
 
@@ -912,7 +912,7 @@ cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/scripts/dtm
 验收脚本：`bash examples/micro/scripts/dtm_e2e.sh`（三段，退出码即结论）。
 ```
 
-- [ ] **Step 15.2：ACCEPTANCE.md 新增 DTM 验收节**
+- [x] **Step 15.2：ACCEPTANCE.md 新增 DTM 验收节**
 
 在 `examples/ACCEPTANCE.md` 的 `## 7. E3` 之后插入：
 
@@ -936,7 +936,7 @@ bash examples/micro/scripts/dtm_e2e.sh    # 三段：Saga 正向 / Saga 补偿 /
 
 其余 E1/E2/T1-T9 验收**不回退**。
 
-- [ ] **Step 15.3：verify-chain.md 增补两链实测小节**
+- [x] **Step 15.3：verify-chain.md 增补两链实测小节**
 
 在 `examples/micro/docs/verify-chain.md` 的 `## 3. 微服形态` 末尾追加：
 
@@ -975,7 +975,7 @@ Cancel（`rpc.dtm.*.Cancel`，三域解冻，零脏数据）。
 自证：`bash examples/micro/scripts/dtm_e2e.sh`（三段 + 每段反向探针，退出码即结论）。
 ```
 
-- [ ] **Step 15.4：校验文档与事实一致**
+- [x] **Step 15.4：校验文档与事实一致**
 
 运行：
 ```bash
@@ -987,10 +987,10 @@ grep -rn "手动补偿\|ReleaseStock" examples/micro/README.md examples/ACCEPTAN
 
 预期：四个分支面地址各命中一处；bff 配置含 `36790`；最后一条打印「下单链文档已无手动补偿口径」。
 
-- [ ] **Step 15.5：Commit**
+- [x] **Step 15.5：Commit**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx && git add examples/micro/README.md examples/ACCEPTANCE.md examples/micro/docs/verify-chain.md && git commit -m "docs(examples/micro): DTM Saga/TCC 验收口径与两链 trace 实测入链核对"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）

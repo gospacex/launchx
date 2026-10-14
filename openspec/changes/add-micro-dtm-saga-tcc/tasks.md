@@ -16,27 +16,23 @@
 
 ## 2. 四域分支（Saga + TCC 语义齐备）
 
-- [x] 2.1 <!-- 已实现: Deduct/Release + TryFreeze/ConfirmFreeze/CancelFreeze，24 用例/99 子用例，5 探针真红 -->
-- [x] 2.1 `srv-stock` 分支集：service 层 `Deduct` / `Release`（Saga，多表事务：库存表 + 流水表，barrier 包裹）与 TCC 三兄弟 `TryFreeze` / `Confirm` / `Cancel`（可售↓冻结↑ → 冻结实扣 / 解冻）；业务失败（库存不足、冻结不足）与基础失败显式分流；rpc.dtm 入口 handler 从载荷提取 traceparent。验收：单测覆盖两类返回与 barrier 重放；注入 `ResultFailure` 误改普通 error 的反向探针使测试 FAIL
-- [x] 2.2 <!-- 已实现: Debit/Refund + 三兄弟，72 用例，5 探针真红 -->
-- [x] 2.2 `srv-points` 分支集：service 层 `Debit` / `Refund`（Saga，两表事务 + barrier）与 TCC `TryFreeze` / `Confirm` / `Cancel`（冻结量入账/消账/回退）；业务失败（余额不足）分流同上。验收：同 2.1 口径单测
-- [x] 2.3 <!-- 已实现: CreateOrder/CancelOrder + TryPlace/ConfirmFreeze/CancelFreeze，38 用例/93 子用例，5 探针真红 -->
-- [x] 2.3 `srv-order` 分支集：service 层 `CreateOrder` / 作废补偿（orders+items+outbox 三表事务 / 终态标记+outbox 必不扣回）与 TCC `TryPlace`（占位单 `presale_locked`，不写 outbox）/ `Confirm`（转 `paid`，**此刻才写 outbox**）/ `Cancel`（废占位）；幂等按 gid/barrier。验收：单测断言「outbox 行仅在 Confirm 后出现」与「作废补偿不重复落 outbox」
-- [x] 2.4 <!-- 已实现: AddSales/ReduceSales，39 用例 + 真 gRPC 端到端，9 探针真红 -->
-- [x] 2.4 `srv-product` 分支集：service 层销量 +1 / -1（新销量表，Saga 第三分支，使四服全参与 Saga）；幂等/barrier 同口径。验收：单测断言补偿回退后销量回到基线
+- [x] 2.1 `srv-stock` 分支集：service 层 `Deduct` / `Release`（Saga，多表事务：库存表 + 流水表，barrier 包裹）与 TCC 三兄弟 `TryFreeze` / `Confirm` / `Cancel`（可售↓冻结↑ → 冻结实扣 / 解冻）；业务失败（库存不足、冻结不足）与基础失败显式分流；rpc.dtm 入口 handler 从载荷提取 traceparent。验收：单测覆盖两类返回与 barrier 重放；注入 `ResultFailure` 误改普通 error 的反向探针使测试 FAIL <!-- 已实现: Deduct/Release + TryFreeze/ConfirmFreeze/CancelFreeze，24 用例/99 子用例，5 探针真红 -->
+- [x] 2.2 `srv-points` 分支集：service 层 `Debit` / `Refund`（Saga，两表事务 + barrier）与 TCC `TryFreeze` / `Confirm` / `Cancel`（冻结量入账/消账/回退）；业务失败（余额不足）分流同上。验收：同 2.1 口径单测 <!-- 已实现: Debit/Refund + 三兄弟，72 用例，5 探针真红 -->
+- [x] 2.3 `srv-order` 分支集：service 层 `CreateOrder` / 作废补偿（orders+items+outbox 三表事务 / 终态标记+outbox 必不扣回）与 TCC `TryPlace`（占位单 `presale_locked`，不写 outbox）/ `Confirm`（转 `paid`，**此刻才写 outbox**）/ `Cancel`（废占位）；幂等按 gid/barrier。验收：单测断言「outbox 行仅在 Confirm 后出现」与「作废补偿不重复落 outbox」 <!-- 已实现: CreateOrder/CancelOrder + TryPlace/ConfirmFreeze/CancelFreeze，38 用例/93 子用例，5 探针真红 -->
+- [x] 2.4 `srv-product` 分支集：service 层销量 +1 / -1（新销量表，Saga 第三分支，使四服全参与 Saga）；幂等/barrier 同口径。验收：单测断言补偿回退后销量回到基线 <!-- 已实现: AddSales/ReduceSales，39 用例 + 真 gRPC 端到端，9 探针真红 -->
 - [x] 2.5 四域分支失败语义统测：对四域 service 分支方法跑「业务失败 → ResultFailure 不重试 / 基础失败 → dtm 重试」的分支返回建模单测矩阵（含每域至少一次反向探针）。验收：四域矩阵全绿且反向探针记录在案 <!-- 跨域真跑测试写不出来：internal 规则禁止 examples/micro import srv-*/internal，故改为 AST 结构守卫（四域失败出口须 IsBusinessFailure→Aborted、显式 Internal）；顺带统一 stock 基础失败由 Unknown 改为 Internal；2 条探针已实测报红 -->
 
 ## 3. bff 编排
 
-- [x] 3.1 Saga 编排接入：bff 新增 `internal/dtm`（saga 编排器：分支序 `stock.Deduct → order.CreateOrder → product.销+1 → points.Debit`、补偿逆序、`DtmAddr` 读 config、traceparent 编入载荷、`fail_inject` 透传）；`POST /api/order` handler 改挂 saga 提交（预检 `product.GetProduct` 失败 4xx 不提交）；现有手动 `ReleaseStock` 补偿代码退役删除 <!-- 已实现: 真机全链跑通（trans_global succeed、四库对账、outbox traceparent 在 Jaeger 单树含五服务）；fail_inject 逆序补偿四库回基线；dtm 不可达 5xx+Warn 进程不退 -->验收：gin-less 单测断言分支序与载荷含 traceparent；全仓 grep 手动补偿调用点为零
+- [x] 3.1 Saga 编排接入：bff 新增 `internal/dtm`（saga 编排器：分支序 `stock.Deduct → order.CreateOrder → product.销+1 → points.Debit`、补偿逆序、`DtmAddr` 读 config、traceparent 编入载荷、`fail_inject` 透传）；`POST /api/order` handler 改挂 saga 提交（预检 `product.GetProduct` 失败 4xx 不提交）；现有手动 `ReleaseStock` 补偿代码退役删除 验收：gin-less 单测断言分支序与载荷含 traceparent；全仓 grep 手动补偿调用点为零 <!-- 已实现: 真机全链跑通（trans_global succeed、四库对账、outbox traceparent 在 Jaeger 单树含五服务）；fail_inject 逆序补偿四库回基线；dtm 不可达 5xx+Warn 进程不退 -->
 - [x] 3.2 TCC 编排接入：bff 同包新增 tcc 编排器（Try 三分支：stock/points/order；Confirm/Cancel 二阶段；配置与 trace 口径与 saga 同构）与新增 `POST /api/presale/lock` 路由。验收：单测断言 Try 失败 → Cancel 逆序构造、Try 全绿 → Confirm 构造；路由注册可见 <!-- 已实现: 真机 Try 全绿→Confirm（outbox 停在 63、Confirm 后才 +1，占位单 presale_locked→paid 见于 order_status_log）与 fail_inject→Cancel（三域解冻、零脏数据、confirm/cancel 严格镜像）双路径验过 -->
 
 ## 4. 测试、验收与文档
 
-- [ ] 4.1 单元测试与静态守卫：a)「分支 handler 禁直连 dbx / 必经 service」静态守卫（反向断言：注入直连探针必红）；b) barrier 空补偿/悬挂/重放三条幂等单测（以假 barrier 存储为主口径）；c) bff 两编排器的分支序/补偿序/载荷单测。验收：`go test ./examples/... -count=1` 全绿
-- [ ] 4.2 真机集成测试：Go test（dtm 或底座缺任一即 Skip，不可写成 PASS）：Saga 成功四库断言、fail 注入补偿基线还原断言、TCC Confirm/Cancel 路径断言、dtm kill → 重启续推进、Jaeger trace 集成断言（正向单 trace 含四域 rpc.dtm/service/repository/db span；补偿段与正向**同一条 traceID**、带 `biz.compensation=true`，真机已实测 dtm 按 step 共享载荷）——扩展现有 `examples/micro/trace_e2e_test.go` 口径。验收：起底座 + dtm 时全绿，无底座时 Skip 且日志写明跳过原因
-- [ ] 4.3 脚本级验收 `examples/micro/scripts/dtm_e2e.sh`：三段——①全绿 Saga（单 traceID、四库正确）；②fail 注入 Saga（自动逆序补偿、四库回基线、补偿 span 带 `biz.dtm.gid`/`biz.compensation=true`）；③TCC Try 全绿→Confirm 与 Try 失败→Cancel 路径。`Want/Observed` 分离、退出码即结论（无 `|| true`）、每段至少一次反向探针。验收：起全链跑三段全绿；人为破坏某判据（如注入失败分支）脚本报红且指明失败段
-- [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`examples/micro/docs/verify-chain.md` 增补「DTM Saga/TCC 两链 trace 实测」两节（含正向单 trace span 清单与补偿段同链查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径
+- [x] 4.1 单元测试与静态守卫：a)「分支 handler 禁直连 dbx / 必经 service」静态守卫（反向断言：注入直连探针必红）；b) barrier 空补偿/悬挂/重放三条幂等单测（以假 barrier 存储为主口径）；c) bff 两编排器的分支序/补偿序/载荷单测。验收：`go test ./examples/... -count=1` 全绿
+- [x] 4.2 真机集成测试：Go test（dtm 或底座缺任一即 Skip，不可写成 PASS）：Saga 成功四库断言、fail 注入补偿基线还原断言、TCC Confirm/Cancel 路径断言、dtm kill → 重启续推进、Jaeger trace 集成断言（正向单 trace 含四域 rpc.dtm/service/repository/db span；补偿段与正向**同一条 traceID**、带 `biz.compensation=true`，真机已实测 dtm 按 step 共享载荷）——扩展现有 `examples/micro/trace_e2e_test.go` 口径。验收：起底座 + dtm 时全绿，无底座时 Skip 且日志写明跳过原因
+- [x] 4.3 脚本级验收 `examples/micro/scripts/dtm_e2e.sh`：三段——①全绿 Saga（单 traceID、四库正确）；②fail 注入 Saga（自动逆序补偿、四库回基线、补偿 span 带 `biz.dtm.gid`/`biz.compensation=true`）；③TCC Try 全绿→Confirm 与 Try 失败→Cancel 路径。`Want/Observed` 分离、退出码即结论（无 `|| true`）、每段至少一次反向探针。验收：起全链跑三段全绿；人为破坏某判据（如注入失败分支）脚本报红且指明失败段
+- [x] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`examples/micro/docs/verify-chain.md` 增补「DTM Saga/TCC 两链 trace 实测」两节（含正向单 trace span 清单与补偿段同链查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径
 
 ## 5. dtmx 组件仓（2026-10-13 amend 追加，见 design.md D8）
 

@@ -76,25 +76,25 @@
 - 验证方式：单测断言 Try 失败→Cancel 逆序、Try 全绿→Confirm；路由注册可见
 
 ### Task 12: 单测与静态守卫（对应 4.1）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：「分支 handler 禁直连 dbx / 必经 service」静态守卫（注入直连探针必红）；barrier 空补偿/悬挂/重放三条幂等单测（假 barrier 存储）；bff 两编排单测已随 Task 10/11 归位，此 Task 下补齐矩阵汇总
 - 改动文件：`examples/micro/pkg/handlecheck/` 口径扩展或新增 `examples/micro/scripts/` 判据、各域测试文件
 - 验证方式：`go test ./examples/micro/... -count=1` 全绿；守卫反向探针（分支 handler 直连 dbx）FAIL 由其报出
 
 ### Task 13: 真机集成测试（对应 4.2）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：Go test（无 dtm/底座即 Skip 且日志写明原因）：Saga 四库断言、fail 注入重建基线、TCC Confirm/Cancel、dtm kill 重启续推进、trace 集成断言（正向单 trace 四域 span 齐全；补偿段与正向同一条 traceID、带 `biz.dtm.gid` 与 `biz.compensation=true`）
 - 改动文件：`examples/micro/trace_e2e_test.go`（扩展）或新增 `examples/micro/dtm_e2e_test.go`
 - 验证方式：起底座 + dtm + 六进程时全绿；无底座时 Skip 输出可见（不写成 PASS）
 
 ### Task 14: 脚本级验收 dtm_e2e.sh（对应 4.3）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：三段脚本——①全绿 Saga（单 traceID 四库正确）②fail 注入（逆序补偿、四库回基线、补偿 span 带 gid/compensation）③TCC Confirm/Cancel 两路径；`Want/Observed` 分离、退出码即结论、每段至少一次反向探针
 - 改动文件：`examples/micro/scripts/dtm_e2e.sh`（新增）
 - 验证方式：起全链跑全绿；人为注入失败判据时报红并指明失败段
 
 ### Task 15: 文档同步（对应 4.4）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：README（拓扑/端口/起停/dtm_e2e）、`examples/ACCEPTANCE.md` DTM 节、`examples/micro/docs/verify-chain.md` 增补两链 trace 实测两节、E3 口径改 Saga（其余验收不回退）
 - 改动文件：`examples/micro/README.md`、`examples/ACCEPTANCE.md`、`docs/trace-chain-audit.md`
 - 验证方式：README/config 端口逐一核对成立；下单链章节零「手动补偿」措辞
