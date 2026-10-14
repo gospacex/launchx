@@ -17,8 +17,11 @@ a.Run()                                       // 3. 起 HTTP 服务并托管退�
 examples/micro/bff/
 ├── cmd/main.go                  # 49 行：Bootstrap → OnSetup → Run
 ├── app/setup.go                 # 装配层：Engine + RPCClientOptions → 下游客户端 → 挂路由
-├── internal/handler/order.go    # HTTP 层：绑参 + 状态码映射，自开 handler.* span
-├── internal/downstream/client.go # 业务 + 下游调用：自开 span，RPC client span 由 rpcx 产出
+├── internal/handler/mall.go     # HTTP 层：绑参 + 状态码映射，自开 handler.* span
+├── internal/downstream/clients.go # 业务 + 下游调用：自开 span，RPC client span 由 rpcx 产出
+├── internal/dtm/saga.go         # 下单 Saga 编排器（dtm 分支序 + 载荷 + traceparent）
+├── internal/dtm/config.go       # 从 config.yaml 读 dtm server / 四域分支面地址
+├── internal/dtm/protos/         # bff 侧分支请求信封（wire 兼容四域的 busi.proto）
 ├── config.yaml                  # 唯一配置源（无任何地址硬编码）
 └── README.md                    # 本文件
 ```
@@ -26,8 +29,10 @@ examples/micro/bff/
 分层边界是**硬**的，因为它直接决定 T13 的分层断言：
 
 - `handler` 是 hertz 唯一出现的地方，往下没有任何 HTTP 概念；
-- `downstream` 是唯一持有 kitex 客户端的地方，往上没有任何 RPC 概念；
-- `downstream` 的客户端**只能**由 launchx 产出的选项构造，自己不碰地址。
+- `downstream` 是唯一持有 kitex 客户端的地方（**只读路径**），往上没有任何 RPC 概念；
+- `downstream` 的客户端**只能**由 launchx 产出的选项构造，自己不碰地址；
+- `dtm` 是**唯一**持有写路径的地方：bff 对四域的写只经 dtm 分支回调，
+  handler 层不再有任何直连写型下游调用（手动补偿已于 Saga 接入时退役）。
 
 ## 2. 三层 span 是怎么落的
 
@@ -46,13 +51,25 @@ GET /order/:id                     (SERVER, webx 的 otel 中间件开的根 spa
 
 ```
 POST /order                        (SERVER)
-└── handler.PlaceOrder
-    ├── downstream.product.GetProduct → client.demo-product.GetProduct → demo-product
-    ├── downstream.stock.ReserveStock → client.demo-stock.ReserveStock → demo-stock
-    ├── downstream.order.CreateOrder  → client.demo-order.CreateOrder  → demo-order
-    └── downstream.points.Earn        → client.demo-points.Earn        → demo-points
-    （失败补偿）handler.ReleaseStock.compensate → client.demo-stock.ReleaseStock
+└── handler.PlaceOrder             预检 → 提交 Saga
+    ├── downstream.product.GetProduct → client.demo-product.GetProduct → demo-product   ← 预检，不进事务
+    └── dtm saga Sk9x4iKb…（提交后由 dtm 异步推进，traceparent 编进载荷续链）
+        ├── rpc.dtm.stock.Deduct     → demo-stock   → service.stock.DtmDeduct    → db
+        ├── rpc.dtm.order.CreateOrder → demo-order   → service.order.DtmCreateOrder → db
+        ├── rpc.dtm.product.AddSales  → demo-product → service.product.DtmAddSales  → db
+        └── rpc.dtm.points.Debit      → demo-points  → service.points.DtmDebit     → db
+    （任一分支业务失败）dtm 逆序补偿：
+        points.Refund → product.ReduceSales → order.CancelOrder → stock.Release
 ```
+
+两处与旧版编排的差别值得单独记一笔：
+
+- **预检不进事务**：`product.GetProduct` 仍走 kitex RPC，失败 4xx 且 `dtm_db`
+  里不会多一行全局事务。
+- **补偿不在 bff 里**：分支地址是 `<host:port>/<proto-service>/<method>`
+  （**无 scheme**，dtm 的默认 driver 见到 `://` 直接报错），dtm 按
+  `trans_branch_op` 里已成功的分支逆序回调。`handler.mall` 里已经没有
+  `ReleaseStock` 调用 —— 手动补偿与 dtm 补偿并存就是重复回补。
 
 `client.<服>.<方法>` 由 rpcx 的 `ClientSpanMiddleware` 产出（经
 `App.RPCClientOptions` 带下来的选项挂上），**本 demo 不再在它外面包一层 span**
@@ -68,12 +85,17 @@ POST /order                        (SERVER)
   -f /Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml up -d consul jaeger
 
 # 2) 起下游四服：必须在 bff 之前就绪（bff 启动时不校验下游存活，首次调用才发现）
+#    顺带会把四域的 dtm 分支面 listener 也起起来（9041-9044），dtm server 要回调它们
 export HUBX_DB_PW=hubx123
 for d in product order stock points; do
   (cd examples/micro/srv-$d && go run ./cmd &)
 done
 # 端口：demo-product 9021 / demo-order 9022 / demo-stock 9023 / demo-points 9024
+#       （各域的 dtm 分支面：product 9041 / order 9042 / stock 9043 / points 9044）
 ```
+
+> 下单（`POST /order`）还需要 **dtm server 在 `xmiddleware.dtm.grpc_addr`
+> （缺省 `127.0.0.1:36790`）上可达**。dtm 不可达时 bff 照常起来，但下单返回 500。
 
 > 四条域链路走的就是上面这四个 `srv-*`（demo-product / demo-order /
 > demo-stock / demo-points）。拆分前的单域样例 `examples/micro/srv`
@@ -108,7 +130,16 @@ consul 不在时按 A3 降级：一条 `register failed, running unregistered` �
 | GET | `/stock/:product_id` | 库存域 `demo-stock` → `GetStock` |
 | GET | `/order/:id?user_id=N` | 订单域 `demo-order` → `GetOrder` |
 | GET | `/points/:user_id` | 积分域 `demo-points` → `GetAccount` |
-| POST | `/order` | **复合下单**：商品 → 库存预占 → 建单 → 积分入账，失败补偿释放预占 |
+| POST | `/order` | **复合下单**：预检商品（普通 RPC）→ 提交 dtm Saga（扣库存 → 建单 → 加销量 → 扣积分），响应带 `dtm_gid` |
+
+`POST /order` 请求体：`{"product_id":1,"quantity":2}`；可选 `"fail_inject":"AddSales"`
+（演示用，点火某个分支的逆序补偿链，真机留空）。响应含 `dtm_gid`（全局事务号）、
+`order_no`、`total_amount` 与 `branches`（实际编排的域与分支，回显便于确认
+「四域是否都参与了事务」）。
+
+提交失败（dtm 不可达 / Submit 被拒）一律 **500 + Warn**：全局事务**没有建立**，
+四域没有任何写入，调用方可原样重试。`strict.dtm: false`（config.yaml 显式声明）
+保证这类故障**不会**让进程退出，其余路由照常服务。
 
 `user_id` 是可选查询参数（下游按它做归属校验，缺省 0）。
 
@@ -190,6 +221,8 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=demo-bff&limit=1' > /tmp/bff-
 | 不覆盖 rpcx 产出的 client span | 再包一层 span 会把三段父子链压成两段（T6 判据） |
 | 不在代码里写 `127.0.0.1` | 换部署形态只改配置，地址必须全部配置化 |
 | 不建数据层（无 sqlx/mqx 段） | BFF 不做数据落地，订单数据的唯一入口是下游四个域服 |
+| 不持有补偿逻辑 | Saga 的补偿由 dtm 按已成功分支逆序发起；bff 再来一次就是重复回补 |
+| 不 import 四域的 dtm 分支 proto | 那是各域 `internal/` 产物（Go internal 规则）；bff 在 `internal/dtm/protos/` 自带一份 wire 兼容的信封，有单测对着四域 pb.go 钉字段编号 |
 | 不复制第二份 kitex_gen | 直接 import `examples/micro/pkg/kitex_gen`（同 module，四域共用） |
 | 不写死 `/ping` 回显的形态名 | 取 `App.Mode()`，业务分层里不出现形态字面量（C4） |
 

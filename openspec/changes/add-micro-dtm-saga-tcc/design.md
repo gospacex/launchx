@@ -125,6 +125,25 @@ dtm server v1.19.0 的 `dtmsvr/trans_status.go::getGrpcResult` 把响应字节�
 - `CancelFreeze`：`frozen -= n, available += n`（total 不动）
 - Saga 的 `Deduct`/`Release` 同样做成 `total ∓ n, available ∓ n` 的严格逆运算
 
+### D7c. 分支 URL 不带 scheme（2026-10-13 amend 新增，实测钉死）
+
+`dtmdriver.defaultDriver.ParseServerMethod`（v0.0.6）先按第一个 `/` 切成
+server 与 method，然后**对任何含 `://` 的 URL 直接报错**：
+
+```go
+if strings.Contains(url, "://") {
+    return "", "", fmt.Errorf("call dtmdriver.Use() before you use custom scheme for '%s'", url)
+}
+```
+
+故 action / compensate / try / confirm / cancel 的正确形态是
+`<host:port>/<proto-service>/<method>`（**无 scheme 前缀**），例如
+`127.0.0.1:9043/dtmbranch.stock.StockBusi/Deduct`。
+
+写 `grpc://…` 的后果不是"多一层前缀被忽略"，而是**每次回调都失败**，且失败
+只出现在 dtm server 日志里 —— 编排侧与业务侧都看不到任何线索。
+各域 `setup.go` 启动日志里打印的 `grpc://` 示意串与真实形态不符，是误导，须改。
+
 ### D8. dtmx 独立为 hubx 平级组件仓（2026-10-13 amend 新增）
 
 公共件三件套（失败语义 / traceparent 续链 / 官方 barrier 包装）落

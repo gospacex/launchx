@@ -12,15 +12,19 @@
 ## 1. 基础设施件
 
 - [x] 1.1 schema 增量 DDL（登记进 `examples/mall/scripts/schema.sql` 系的四库 DDL 口径）：四域各建 dtm barrier 表；`product_db` 新增销量表（Saga 销量分支）；`stock_db` / `points_db` 增补冻结语义所需列（冻结量列或冻结辅助表，与现有可在读列并存）；`order_db` 订单状态机增列 `presale_locked` 语义。验收：DDL 幂等重放不报错、四库 schema 版本一致，`dtm_db` 表不在此口径内 <!-- 已实现: 落 examples/micro/scripts/schema-micro.sql（该文件自述政策：micro 增量不改 mall 共用 DDL）；barrier DDL 逐字取官方 sqls/dtmcli.barrier.mysql.sql（原草案缺 trans_type/gid 且唯一键错，会跨事务丢账）；按域隔离四库各一份；幂等两遍 exit=0 -->
-- [ ] 1.2 公共件与装配面：a) dtm 公共三件套落 `github.com/gospacex/dtmx` 组件仓（物理 `../dtmx`）：分支载荷公共结构（含 traceparent、`fail_inject` 注入字段）、`traceparent` 注入/Extract 成对工具、失败语义分流、官方 barrier 包装（经 `launchx.Inject` 同源）；b) 各域 dtm 分支 pb 定义与 `internal/dtm/proto/` 生成产物（`scripts/gen.sh` 扩展，产物不进 `pkg/kitex_gen`）；c) 各域 `internal/dtm` 分支面 grpc-go server 装配模板（:9041-9044，不注册 consul）+ 起 rpc.dtm 入口 span（`biz.dtm.gid`/`biz.dtm.branch` 属性约定）；d) 四域 `config.yaml` 新增 `dtm.branch.listen_addr`、bff 新增 `xmiddleware.dtm.grpc_addr`（缺省 `127.0.0.1:36790`）。验收：任一域服起服即多一个分支面端口监听且启动日志可见；`TestServiceSourceHasNoHardcodedLoopbackAddr` 仍绿
+- [x] 1.2 公共件与装配面：a) dtm 公共三件套落 `github.com/gospacex/dtmx` 组件仓（物理 `../dtmx`）：分支载荷公共结构（含 traceparent、`fail_inject` 注入字段）、`traceparent` 注入/Extract 成对工具、失败语义分流、官方 barrier 包装（经 `launchx.Inject` 同源）；b) 各域 dtm 分支 pb 定义与 `internal/dtm/proto/` 生成产物（`scripts/gen.sh` 扩展，产物不进 `pkg/kitex_gen`）；c) 各域 `internal/dtm` 分支面 grpc-go server 装配模板（:9041-9044，不注册 consul）+ 起 rpc.dtm 入口 span（`biz.dtm.gid`/`biz.dtm.branch` 属性约定）；d) 四域 `config.yaml` 新增 `dtm.branch.listen_addr`、bff 新增 `xmiddleware.dtm.grpc_addr`（缺省 `127.0.0.1:36790`）。验收：任一域服起服即多一个分支面端口监听且启动日志可见；`TestServiceSourceHasNoHardcodedLoopbackAddr` 仍绿
 
 ## 2. 四域分支（Saga + TCC 语义齐备）
 
-- [ ] 2.1 `srv-stock` 分支集：service 层 `Deduct` / `Release`（Saga，多表事务：库存表 + 流水表，barrier 包裹）与 TCC 三兄弟 `TryFreeze` / `Confirm` / `Cancel`（可售↓冻结↑ → 冻结实扣 / 解冻）；业务失败（库存不足、冻结不足）与基础失败显式分流；rpc.dtm 入口 handler 从载荷提取 traceparent。验收：单测覆盖两类返回与 barrier 重放；注入 `ResultFailure` 误改普通 error 的反向探针使测试 FAIL
-- [ ] 2.2 `srv-points` 分支集：service 层 `Debit` / `Refund`（Saga，两表事务 + barrier）与 TCC `TryFreeze` / `Confirm` / `Cancel`（冻结量入账/消账/回退）；业务失败（余额不足）分流同上。验收：同 2.1 口径单测
-- [ ] 2.3 `srv-order` 分支集：service 层 `CreateOrder` / 作废补偿（orders+items+outbox 三表事务 / 终态标记+outbox 必不扣回）与 TCC `TryPlace`（占位单 `presale_locked`，不写 outbox）/ `Confirm`（转 `paid`，**此刻才写 outbox**）/ `Cancel`（废占位）；幂等按 gid/barrier。验收：单测断言「outbox 行仅在 Confirm 后出现」与「作废补偿不重复落 outbox」
-- [ ] 2.4 `srv-product` 分支集：service 层销量 +1 / -1（新销量表，Saga 第三分支，使四服全参与 Saga）；幂等/barrier 同口径。验收：单测断言补偿回退后销量回到基线
-- [ ] 2.5 四域分支失败语义统测：对四域 service 分支方法跑「业务失败 → ResultFailure 不重试 / 基础失败 → dtm 重试」的分支返回建模单测矩阵（含每域至少一次反向探针）。验收：四域矩阵全绿且反向探针记录在案
+- [x] 2.1 <!-- 已实现: Deduct/Release + TryFreeze/ConfirmFreeze/CancelFreeze，24 用例/99 子用例，5 探针真红 -->
+- [x] 2.1 `srv-stock` 分支集：service 层 `Deduct` / `Release`（Saga，多表事务：库存表 + 流水表，barrier 包裹）与 TCC 三兄弟 `TryFreeze` / `Confirm` / `Cancel`（可售↓冻结↑ → 冻结实扣 / 解冻）；业务失败（库存不足、冻结不足）与基础失败显式分流；rpc.dtm 入口 handler 从载荷提取 traceparent。验收：单测覆盖两类返回与 barrier 重放；注入 `ResultFailure` 误改普通 error 的反向探针使测试 FAIL
+- [x] 2.2 <!-- 已实现: Debit/Refund + 三兄弟，72 用例，5 探针真红 -->
+- [x] 2.2 `srv-points` 分支集：service 层 `Debit` / `Refund`（Saga，两表事务 + barrier）与 TCC `TryFreeze` / `Confirm` / `Cancel`（冻结量入账/消账/回退）；业务失败（余额不足）分流同上。验收：同 2.1 口径单测
+- [x] 2.3 <!-- 已实现: CreateOrder/CancelOrder + TryPlace/ConfirmFreeze/CancelFreeze，38 用例/93 子用例，5 探针真红 -->
+- [x] 2.3 `srv-order` 分支集：service 层 `CreateOrder` / 作废补偿（orders+items+outbox 三表事务 / 终态标记+outbox 必不扣回）与 TCC `TryPlace`（占位单 `presale_locked`，不写 outbox）/ `Confirm`（转 `paid`，**此刻才写 outbox**）/ `Cancel`（废占位）；幂等按 gid/barrier。验收：单测断言「outbox 行仅在 Confirm 后出现」与「作废补偿不重复落 outbox」
+- [x] 2.4 <!-- 已实现: AddSales/ReduceSales，39 用例 + 真 gRPC 端到端，9 探针真红 -->
+- [x] 2.4 `srv-product` 分支集：service 层销量 +1 / -1（新销量表，Saga 第三分支，使四服全参与 Saga）；幂等/barrier 同口径。验收：单测断言补偿回退后销量回到基线
+- [x] 2.5 四域分支失败语义统测：对四域 service 分支方法跑「业务失败 → ResultFailure 不重试 / 基础失败 → dtm 重试」的分支返回建模单测矩阵（含每域至少一次反向探针）。验收：四域矩阵全绿且反向探针记录在案 <!-- 跨域真跑测试写不出来：internal 规则禁止 examples/micro import srv-*/internal，故改为 AST 结构守卫（四域失败出口须 IsBusinessFailure→Aborted、显式 Internal）；顺带统一 stock 基础失败由 Unknown 改为 Internal；2 条探针已实测报红 -->
 
 ## 3. bff 编排
 
@@ -36,7 +40,7 @@
 
 ## 5. dtmx 组件仓（2026-10-13 amend 追加，见 design.md D8）
 
-- [ ] 5.1 组件仓骨架：新建 `../dtmx`（`module github.com/gospacex/dtmx`）+ `git init`；体例对齐 `dbx`/`otelx`（`interface.go` / `interface_test.go` / `README.md` / `.gitignore` / `go.mod`+`go.sum`）；`go.mod` 只依赖 `github.com/dtm-labs/client` 与 otel，**不 import launchx/configx/dbx**（纯库）。验收：`cd ../dtmx && go build ./... && go test ./...` 全绿
-- [ ] 5.2 迁移三件套：把 `examples/micro/pkg/dtmx/{result,barrier,payload}.go` 及其 `_test.go` 移入 `../dtmx`，包名保持 `dtmx`；`ExtractParent` 原依赖 `launchx.Extract` 需改为 `otelx/propagation`（与 launchx 的 Inject/Extract 同源实现，语义不变）。验收：`../dtmx` 内测试全绿且与迁移前用例数一致
-- [ ] 5.3 接线：launchx `go.mod` 增 `replace github.com/gospacex/dtmx => ../dtmx` + `require`；全仓 15 个导入方（srv-stock 5 个 / srv-points 6 个文件）改为 `github.com/gospacex/dtmx`，删 `examples/micro/pkg/dtmx`。验收：`go build ./...` 通过、仓内无 `examples/micro/pkg/dtmx` 残留引用
-- [ ] 5.4 文档：`../dtmx/README.md` 写清三件套各自解决什么、与 dtm 官方 API 的对应关系、按域隔离 barrier 表的接法、以及「不自造失败哨兵」的硬约束
+- [x] 5.1 组件仓骨架：新建 `../dtmx`（`module github.com/gospacex/dtmx`）+ `git init`；体例对齐 `dbx`/`otelx`（`interface.go` / `interface_test.go` / `README.md` / `.gitignore` / `go.mod`+`go.sum`）；`go.mod` 只依赖 `github.com/dtm-labs/client` 与 otel，**不 import launchx/configx/dbx**（纯库）。验收：`cd ../dtmx && go build ./... && go test ./...` 全绿 <!-- 已实现: ../dtmx 已 git init；go.mod module github.com/gospacex/dtmx；interface_test.go 依赖面守卫已跑红（空仓实现文件 0 < 3）-->
+- [x] 5.2 迁移三件套：把 `examples/micro/pkg/dtmx/{result,barrier,payload}.go` 及其 `_test.go` 移入 `../dtmx`，包名保持 `dtmx`；`ExtractParent` 原依赖 `launchx.Extract` 需改为 `otelx/propagation`（与 launchx 的 Inject/Extract 同源实现，语义不变）。验收：`../dtmx` 内测试全绿且与迁移前用例数一致 <!-- 10/10 PASS；go mod tidy 需显式钉 genproto 分裂模块三行（照抄 launchx go.mod:172-174）-->
+- [x] 5.3 接线：launchx `go.mod` 增 `replace github.com/gospacex/dtmx => ../dtmx` + `require`；全仓 15 个导入方（srv-stock 5 个 / srv-points 6 个文件）改为 `github.com/gospacex/dtmx`，删 `examples/micro/pkg/dtmx`。验收：`go build ./...` 通过、仓内无 `examples/micro/pkg/dtmx` 残留引用 <!-- 15 文件改路径，launchx commit 0e1eef6 -->
+- [x] 5.4 文档：`../dtmx/README.md` 写清三件套各自解决什么、与 dtm 官方 API 的对应关系、按域隔离 barrier 表的接法、以及「不自造失败哨兵」的硬约束

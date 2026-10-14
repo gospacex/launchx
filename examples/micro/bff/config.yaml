@@ -71,11 +71,33 @@ demo:
   auth_token: "demo-token"
   seed_user_id: 1001        # 该令牌绑定的用户 ID
 
-# 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决。
-# 本档刻意不设 strict：consul 不在时须带病运行（降级 Warn + 进程不退出），
-# 见 ACCEPTANCE §10 降级路径。
+# ----- dtm 事务编排（下单走 dtm Saga）-----
+#
+# dtm server 的 gRPC 端口（官方双端口里的那个；HTTP 口 :36789 是给外部 HTTP
+# 分支用的，本档四域分支全是 gRPC，用不到）。它与四域各自的分支面地址是
+# **两回事**：这一段是「事务去哪儿登记」，下面 dtm.branches 是「事务的分支回调
+# 谁」。两者都只在这里出现一次，Go 代码零硬编码。
+#
+# 缺省值 127.0.0.1:36790 写在本文件而不是代码里 —— 写进代码会让
+# examples_addr_hygiene_test.go 的地址红线变红，且换部署形态就得重新编译。
+dtm:
+  branches:
+    # 四个分支面的 gRPC 监听地址，与各域 config.yaml 的 dtm.branch.listen_addr
+    # 逐字对应（同一个进程、两个监听口：kitex 面 + dtm 分支面）。
+    # 分支 URL 由编排侧拼成 `<host:port>/<proto-service>/<method>`，
+    # **不带 scheme** —— dtm 的默认 driver 见到 "://" 会直接报错。
+    stock:   "127.0.0.1:9043"
+    order:   "127.0.0.1:9042"
+    product: "127.0.0.1:9041"
+    points:  "127.0.0.1:9044"
 
 xmiddleware:
+  # ----- dtm：全局事务管理器（Saga / TCC 的提交面）-----
+  # launchx 不构造 dtm 组件（它不是内建组件），编排地址由本档的 app/setup.go
+  # 直接读，见那里的 installDtmSaga。
+  dtm:
+    grpc_addr: "127.0.0.1:36790"
+
   # ----- 出向 RPC 治理（重试 / 熔断 / 负载均衡）-----
   # 它不是组件：三项都只在客户端选项装配那一刻起作用，故配置面收在 rpcx、
   # 由 mode 在装配期读进 App.RPCClientOptions 产出的选项里。**零值全关**，
@@ -130,3 +152,11 @@ xmiddleware:
     enable_trace: true
 
   # bff 不建数据层：无 sqlx / cachex / mqx 段。业务数据的唯一入口是下游四个域服。
+
+# 组件的启用是 presence-based（配了段才构造），失败姿态由 strict.<name> 裁决。
+# 本档只对 dtm 显式声明，缺省同样是 false（降级），写出来是为了把这条口径
+# 摆到明面上而不是靠默认值：dtm 不可达时 bff 提交 5xx + Warn **带病运行**，
+# 进程不能退 —— 交易链路挂掉不该把商品/库存/订单的查询面一起带走。
+# 其余组件（consul 等）本档同样不设 strict，理由见 ACCEPTANCE §10 降级路径。
+strict:
+  dtm: false

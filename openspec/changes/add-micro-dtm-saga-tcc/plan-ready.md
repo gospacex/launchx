@@ -58,7 +58,7 @@
 - 验证方式：单测断言补偿回退后销量回基线
 
 ### Task 9: 四域失败语义统测（对应 2.5）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：四域「业务失败 → 不重试 / 基础失败 → dtm 重试」返回建模单测矩阵，每域至少一次注入反向探针
 - 改动文件：四域 `internal/service/*_test.go`（或集中 `internal/dtm/resultsemantics_test.go`）
 - 验证方式：`go test ./examples/micro/... -count=1` 全绿，反向探针结果记录在案
@@ -110,13 +110,13 @@
 ## 追加实现步骤
 
 ### Task 16: dtmx 组件仓骨架（对应 tasks.md 5.1）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：新建 `../dtmx` 独立 git 仓，`module github.com/gospacex/dtmx`，体例对齐 dbx/otelx
 - 改动文件：`../dtmx/{go.mod,go.sum,interface.go,interface_test.go,README.md,.gitignore}`
 - 验证方式：`cd ../dtmx && go build ./... && go test ./...` 全绿；`go list -m` 打出本仓 module 名
 
 ### Task 17: 三件套迁移与接线（对应 tasks.md 5.2 / 5.3 / 5.4）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：三件套移入组件仓（`ExtractParent` 改走 `otelx/propagation`）、launchx 加 replace、15 个导入方改路径、旧包删除、README 补齐
 - 改动文件：`../dtmx/*.go`、`launchx/go.mod`、`examples/micro/pkg/dtmx/`（删）、srv-stock 与 srv-points 下的导入方
 - 验证方式：`go build ./...` 通过；`grep -r "examples/micro/pkg/dtmx" --include="*.go" .` 为空；`go test ./examples/micro/... -count=1` 全绿

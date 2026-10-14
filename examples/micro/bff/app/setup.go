@@ -1,5 +1,5 @@
 // Package app 业务装配层：把 launchx 装配好的句柄（webx 引擎、下游 RPC 客户端
-// 选项）接成 handler → downstream 两层，并注册路由。
+// 选项、dtm 编排器）接成 handler → downstream / dtm 三层，并注册路由。
 //
 // 这一层不含任何形态分支（不出现 monolith / bff / gateway 等取值）：
 // 换形态只改 config.yaml 的 service.mode，与本装配无关。
@@ -20,6 +20,7 @@ import (
 
 	"github.com/gospacex/launchx"
 	"github.com/gospacex/launchx/examples/micro/bff/internal/downstream"
+	bffdtm "github.com/gospacex/launchx/examples/micro/bff/internal/dtm"
 	"github.com/gospacex/launchx/examples/micro/bff/internal/handler"
 	"github.com/gospacex/launchx/examples/micro/pkg/auth"
 	orderrpc "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order/order"
@@ -124,6 +125,11 @@ func Setup(a *launchx.App) error {
 		return err
 	}
 
+	saga, err := installDtmSaga(a, cfg, logger)
+	if err != nil {
+		return err
+	}
+
 	h := handler.New(
 		downstream.New(downstream.Clients{
 			Product: productCli,
@@ -131,6 +137,7 @@ func Setup(a *launchx.App) error {
 			Order:   orderCli,
 			Points:  pointsCli,
 		}, traceOn),
+		saga,
 		traceOn,
 	)
 
@@ -139,9 +146,48 @@ func Setup(a *launchx.App) error {
 	engine.Engine.GET("/stock/:product_id", h.GetStock)
 	engine.Engine.GET("/order/:id", h.GetOrder)
 	engine.Engine.GET("/points/:user_id", h.GetAccount)
-	// 复合编排：一次请求串起四个域服 —— 全链路验收就看这一条。
+	// 复合编排：预检商品 + 提交 dtm Saga（dtm 推进四分支并负责逆序补偿）——
+	// 全链路验收就看这一条。
 	engine.Engine.POST("/order", h.PlaceOrder)
 	return nil
+}
+
+// installDtmSaga 构造下单 Saga 的编排器（装配期一次）。
+//
+// 失败姿态由 `strict.dtm` 裁决（config.yaml 显式写 false）：
+//   - 构造失败（地址缺失 / 配错）+ strict.dtm=false → Warn 后装一个
+//     dtm.Unavailable 编排器，**进程照常起来**，下单这一条返回 5xx，其余路由
+//     （商品/库存/订单/积分查询、/ping）不受影响。理由：交易链路挂掉不该把
+//     整个 bff 带走，而「起不来」在现场是比「下单不可用」更难定位的状态。
+//   - strict.dtm=true → 装配期即退，把配置问题挡在上线之前。
+//
+// 注意这里区分了两种 dtm 故障：**装配期**的配置缺口由 strict 裁决，**运行期**
+// 的 dtm 不可达一律 5xx + Warn（编排器内部已 Warn），两种情况进程都不退。
+func installDtmSaga(a *launchx.App, cfg configx.Config, logger logx.Logger) (*bffdtm.Orchestrator, error) {
+	dtmAddr := cfg.GetString("xmiddleware.dtm.grpc_addr")
+	orch, err := bffdtm.New(bffdtm.Config{
+		DTMAddr:     dtmAddr,
+		BranchAddrs: bffdtm.BranchAddrsFrom(cfg),
+		Logger:      logger,
+	})
+	if err == nil {
+		logger.Info("bff: dtm saga orchestrator installed",
+			logx.String("dtm_addr", dtmAddr),
+			logx.String("branches", strings.Join(bffdtm.DescribeBranchAddrs(cfg), " ")),
+			logx.String("branch_order", bffdtm.DescribeBranchOrder()))
+		return orch, nil
+	}
+	// 为什么不把地址原样塞进 Unavailable：把「哪个键没配」与「这台机器上默认值
+	// 是多少」一起打进 5xx 响应没有意义 —— 调用方要的是结论，运维要的是配置键。
+	cause := fmt.Errorf("bff: dtm saga 编排器不可用: %w", err)
+	if cfg.IsSet("strict.dtm") && cfg.GetBool("strict.dtm") {
+		return nil, cause
+	}
+	logger.Warn("bff: dtm saga 编排器不可用，下单将 5xx（全局事务不会建立，四域无写入；其余路由正常）",
+		logx.Err(cause),
+		logx.String("hint", "补齐 xmiddleware.dtm.grpc_addr 与 dtm.branches.<domain>；"+
+			"置 strict.dtm: true 可让这类配置缺失在装配期即退"))
+	return bffdtm.Unavailable(cause), nil
 }
 
 // authSkipPrefixes 免鉴权路径前缀。

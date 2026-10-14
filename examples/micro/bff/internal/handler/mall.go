@@ -1,9 +1,9 @@
 // Package handler HTTP 层：只做参数绑定、状态码映射与响应封装，业务一律
-// 下沉到 downstream 层；每个 handler 自开 `handler.mall.<Op>` span。
+// 下沉到 downstream 层与 dtm 编排层；每个 handler 自开 `handler.mall.<Op>` span。
 //
-// 复合编排 PlaceOrder 是全链路验收的锚点：一次 HTTP 请求把
-// 商品 → 库存 → 订单 → 积分 四个域服串进同一根 trace，
-// 失败路径还会补一次库存释放（补偿也入链，可整段回放）。
+// 复合编排 PlaceOrder 是全链路验收的锚点：一次 HTTP 请求先经商品域做一次
+// **普通 RPC 预检**，再把一次下单编成 dtm Saga 提交，由 dtm 推进
+// 库存扣减 → 建单 → 销量 → 扣积分四段，失败由 dtm 逆序补偿。
 //
 // 本包是 webx/hertz 唯一出现的地方（handler 签名是 hertz 的 app.HandlerFunc）。
 package handler
@@ -11,7 +11,6 @@ package handler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gospacex/launchx/examples/micro/bff/internal/downstream"
+	dtmorch "github.com/gospacex/launchx/examples/micro/bff/internal/dtm"
 	"github.com/gospacex/launchx/examples/micro/pkg/auth"
 	"github.com/gospacex/launchx/examples/micro/pkg/codes"
 	orderpb "github.com/gospacex/launchx/examples/micro/pkg/kitex_gen/order"
@@ -35,16 +35,21 @@ import (
 // MallHandler mall 聚合 HTTP 入口。
 type MallHandler struct {
 	d       *downstream.Downstream
+	orch    *dtmorch.Orchestrator
 	traceOn bool
 }
 
 // New 构造 handler。
 //
+// saga 是必传项而不是可选能力：下单是本服务唯一的复合编排入口，配了编排器却
+// 传 nil 进来只可能是一次装配疏忽，而那次疏忽表现为「POST /order 永远 panic」。
+// dtm 不可用时装配层传 dtmorch.Unavailable —— 提交恒 5xx、进程照常服务其余路由。
+//
 // 不再收一个 trace.Tracer（与 downstream 同因）：tracer 一律向 otel 全局现取，
 // 全局 provider 由 launchx 的 telemetry 步骤注册。从装配层手里接 provider 进来，
 // 会让本层与 CLIENT span 分家的风险变成"取决于装配顺序"。
-func New(d *downstream.Downstream, traceOn bool) *MallHandler {
-	return &MallHandler{d: d, traceOn: traceOn}
+func New(d *downstream.Downstream, saga *dtmorch.Orchestrator, traceOn bool) *MallHandler {
+	return &MallHandler{d: d, orch: saga, traceOn: traceOn}
 }
 
 // span 开本层 span（handler.mall.<Op>）。
@@ -178,21 +183,30 @@ type placeOrderReq struct {
 	UserId    int64 `json:"user_id"`
 	ProductID int64 `json:"product_id"`
 	Quantity  int32 `json:"quantity"`
+	// FailInject 演示用：点名一个分支方法名（Deduct / CreateOrder / AddSales /
+	// Debit），该分支直接返业务失败，用来点火 dtm 的逆序补偿链。
+	//
+	// 真机恒为空，且**绝不能**从真实业务参数派生：载荷里 fail_inject 非空就
+	// 等于「点名让某个分支失败」，一个透传失误就是提交即全局回滚。
+	FailInject string `json:"fail_inject,omitempty"`
 }
 
-// PlaceOrder POST /order —— 复合编排：一次请求串起四个域服。
+// PlaceOrder POST /order —— 复合编排：预检 + 提交 dtm Saga。
 //
-// 成功路径（同一根 trace 上的顺序）：
+// 两段，边界清楚：
 //
-//	handler.PlaceOrder（bff 根 span 由 webx otel 中间件开）
-//	├── downstream.product.GetProduct   → srv-product（服务端 suite span + service/db/cache span）
-//	├── downstream.stock.ReserveStock   → srv-stock（锁 + 3 表事务 + outbox）
-//	├── downstream.order.CreateOrder    → srv-order（3 表事务 + outbox）
-//	└── downstream.points.Earn          → srv-points（幂等键 + 2 表事务）
+//	① 预检（**不进事务**）：product.GetProduct 走现有 kitex RPC，商品不存在 /
+//	   已下架直接 4xx，此时 dtm 里没有任何全局事务、四个库都没有写入。
+//	   它只是一次便宜的普通读 —— 放进事务当分支要付 barrier 与重试的代价，
+//	   换来的是「查得到才扣」这一点预检已经完全做到。
 //
-// 失败补偿：库存已预占而订单没建成时，必须 ReleaseStock 回滚预占 ——
-// 补偿也走同一条 trace（span 属性 biz.compensation=true），排查时整段可回放。
-// 成功后积分入账用同一 orderNo：srv-points 的唯一键使重放天然幂等。
+//	② 提交 Saga：dtm 按 stock.Deduct → order.CreateOrder → product.AddSales →
+//	   points.Debit 推进，失败逆序补偿 stock.Release / CancelOrder /
+//	   ReduceSales / Refund。**补偿由 dtm 发起，本层不再有任何补偿调用**：
+//	   手动 ReleaseStock 已退役，两套补偿并存就是重复回补。
+//
+// 返回体给的是 gid 而不是 order_id：Saga 是异步的，提交返回时四个分支一个都
+// 还没跑完，此刻报一个 order_id 只会是编的。要查结果拿 gid 去问 dtm。
 func (h *MallHandler) PlaceOrder(ctx context.Context, c *app.RequestContext) {
 	ctx, span := h.span(ctx, "PlaceOrder")
 	defer span.End()
@@ -218,7 +232,7 @@ func (h *MallHandler) PlaceOrder(ctx context.Context, c *app.RequestContext) {
 		attribute.Int64("biz.product_id", req.ProductID),
 	)
 
-	// ① 商品域：存在且上架才往下走（也是给整条链一个便宜的预检）。
+	// ① 预检：商品存在且上架才往下走。失败一律 4xx/5xx，**不提交事务**。
 	p, err := h.d.GetProduct(ctx, &productpb.GetProductReq{UserId: req.UserId, ProductId: req.ProductID})
 	if err != nil {
 		fail(span, c, http.StatusBadGateway, err)
@@ -228,90 +242,69 @@ func (h *MallHandler) PlaceOrder(ctx context.Context, c *app.RequestContext) {
 		fail(span, c, statusOf(code), errors.New(p.GetMessage()))
 		return
 	}
+	unitPrice := p.GetProduct().GetPrice()
 
-	// ② 库存域：预占（失败即终止，没有需要补偿的东西）。
-	rs, err := h.d.ReserveStock(ctx, &stockpb.ReserveStockReq{
-		UserId: req.UserId, OrderNo: orderNo, ProductId: req.ProductID, Quantity: req.Quantity,
+	// ② 提交 Saga。分支出错由 dtm 兜，本层只判「事务提交成功没有」。
+	//
+	// fail_inject 由请求体带入，仅用于演示点火补偿链；真机留空。
+	res, err := h.orch.Submit(ctx, dtmorch.OrderCmd{
+		UserID:     req.UserId,
+		ProductID:  req.ProductID,
+		Quantity:   req.Quantity,
+		OrderNo:    orderNo,
+		Title:      p.GetProduct().GetTitle(),
+		UnitPrice:  unitPrice,
+		PointsCost: pointsReward(unitPrice, req.Quantity),
+		FailInject: req.FailInject,
 	})
 	if err != nil {
-		fail(span, c, http.StatusBadGateway, err)
+		// 5xx：dtm 不可达或提交被拒 —— 全局事务没建立，四域没有任何写入，
+		// 调用方原样重试是安全的（且订单号每次都是新的，不存在重复单）。
+		// 这里**不能**回落手动编排链：手动补偿已退役，回落就是两套补偿。
+		fail(span, c, http.StatusInternalServerError, err)
 		return
 	}
-	if code := rs.GetCode(); code != codes.CodeOK {
-		fail(span, c, statusOf(code), errors.New(rs.GetMessage()))
-		return
-	}
-
-	// ③④ 订单 + 积分：任一失败都要释放预占（补偿入链）。
-	r, err := h.d.CreateOrder(ctx, &orderpb.CreateOrderReq{
-		UserId: req.UserId,
-		// 幂等键：与库存预占、积分入账**同一个号**。三个域各用各的关联号时，
-		// 重放一次 = 新单 + 新预占 + 被幂等掉的积分，对账永远对不平；共用一个
-		// 号之后，重试在订单域走 CreateOrderTx 的查重分支（回同一张单）。
-		OrderNo: orderNo,
-		Items: []*orderpb.OrderItem{{
-			ProductId: req.ProductID,
-			Name:      p.GetProduct().GetTitle(),
-			Quantity:  req.Quantity,
-			UnitPrice: p.GetProduct().GetPrice(),
-		}},
-	})
-	if err != nil {
-		h.compensate(ctx, span, req, orderNo)
-		fail(span, c, http.StatusBadGateway, err)
-		return
-	}
-	if code := r.GetCode(); code != codes.CodeOK {
-		h.compensate(ctx, span, req, orderNo)
-		fail(span, c, statusOf(code), errors.New(r.GetMessage()))
-		return
-	}
-
-	// 积分入账是「尽力而为」：失败不回滚订单（事件侧还有 outbox 兜底重试的
-	// 语义位），但在 trace 上必须留痕，否则对账时会莫名其妙。
-	pe, err := h.d.Earn(ctx, &pointspb.EarnReq{
-		UserId: req.UserId, OrderNo: orderNo,
-		Amount: r.GetTotalAmount() / 100, // 1% 返积分（示例口径），分→积分取整
-		Remark: "place-order",
-	})
-	if err != nil {
-		span.RecordError(err)
-		span.SetAttributes(attribute.Bool("biz.points_failed", true))
-	} else if code := pe.GetCode(); code != codes.CodeOK {
-		span.SetAttributes(attribute.Bool("biz.points_failed", true))
-	}
+	span.SetAttributes(
+		attribute.String("biz.dtm.gid", res.GID),
+		attribute.Int("biz.dtm.branches", len(res.Steps)),
+	)
 
 	c.JSON(http.StatusOK, map[string]any{
-		"code":           codes.CodeOK,
-		"order_id":       r.GetOrderId(),
-		"order_no":       r.GetOrderNo(),
-		"total_amount":   r.GetTotalAmount(),
-		"reservation_id": rs.GetReservationId(),
+		"code":         codes.CodeOK,
+		"dtm_gid":      res.GID,
+		"order_no":     orderNo,
+		"total_amount": unitPrice * int64(req.Quantity),
+		"branches":     branchView(res.Steps),
 	})
 }
 
-// compensate 库存预占的补偿路径：biz.compensation=true 让它在 Jaeger 上
-// 一眼可辨。补偿失败只记进 span —— 补偿失败的善后属于对账域，不属于本次请求。
-func (h *MallHandler) compensate(ctx context.Context, span trace.Span, req placeOrderReq, orderNo string) {
-	ctx, cspan := h.span(ctx, "CompensateReleaseStock")
-	defer cspan.End()
-	cspan.SetAttributes(
-		attribute.Bool("biz.compensation", true),
-		attribute.String("biz.order_no", orderNo),
-	)
-	r, err := h.d.ReleaseStock(ctx, &stockpb.ReleaseStockReq{
-		OrderNo: orderNo, ProductId: req.ProductID, Quantity: req.Quantity,
-	})
-	switch {
-	case err != nil:
-		cspan.RecordError(err)
-		cspan.SetStatus(otelcodes.Error, err.Error())
-	default:
-		// 领域码非 0 也是失败：补偿没成功必须在对账时能检索到。
-		if code := r.GetCode(); code != codes.CodeOK {
-			cspan.SetStatus(otelcodes.Error, fmt.Sprintf("code=%d msg=%s", code, r.GetMessage()))
-		}
+// branchView 分支列表回显：域 + 正向分支名。
+//
+// 带出来是因为提交响应是**唯一**能确认「编排了什么」的地方：四域是否都参与
+// （少一条就是某个域被静默漏掉）、按什么次序（决定回滚次序），都在这行里。
+func branchView(steps []dtmorch.Step) []map[string]string {
+	out := make([]map[string]string, 0, len(steps))
+	for _, s := range steps {
+		out = append(out, map[string]string{
+			"domain": s.Domain,
+			"branch": s.Action,
+		})
 	}
+	return out
+}
+
+// pointsReward 本单奖励积分数（示例口径：成交额的 1%，分 → 积分取整）。
+//
+// 下限 1 是必需的而不是美化：积分域分支的 validateDtmBiz 拒 cost<=0，
+// 而 0 在那里**不是「不扣积分」而是「这笔分支必然业务失败」**—— 整条 Saga
+// 会被判失败并把已经跑成功的三个分支回滚，代价远大于给一分钱。
+// 真机上 1% 的最小成交额（100 分）恰好压在这个下限上，低于它就该有积分。
+func pointsReward(unitPrice int64, quantity int32) int64 {
+	reward := unitPrice * int64(quantity) / 100
+	if reward < 1 {
+		reward = 1
+	}
+	return reward
 }
 
 // parseInt64 解析路径参数：解析失败直接渲染 400 并标记 span（各 handler 共用）。
