@@ -24,7 +24,7 @@
 
 - bff 上两种事务（saga / tcc）经 `dtmgrpc` 提交，四域服各回一个 gRPC 分支面承接 DTM 回调；
 - 分支数据操作直穿既有 `handler → service → repository` 六层入 trace（正向同 trace、
-  补偿新根 + `biz.dtm.gid` 关联）；
+  补偿与正向同一条 trace）；
 - dtm server 官方镜像 + `STORE_DRIVER=mysql` 追加底座 compose，独立 `dtm_db`；
 - 三层测试（单测 / dtm 真机集成 / `dtm_e2e.sh` 脚本三段）与文档口径同步。
 
@@ -64,8 +64,31 @@ bff 侧经 `dtm-labs/client` 的 `dtmgrpc`（:36790）提交。HTTP 回调被否
 
 traceparent 编入分支业务载荷（编号字段），正向分支在分支面 handler 入口
 Extract → `rpc.dtm.<entity>.<Method>` span（属性 `biz.dtm.gid`/`biz.dtm.branch`）。
-补偿/Cancel 由 dtm 异步发起 → 新根 trace + `biz.dtm.gid` 关联（与 outbox
-补发同口径）。不依赖 dtm 透传自定义 metadata（不可控）。
+不依赖 dtm 透传自定义 metadata（不可控）。
+
+**补偿/Cancel 与正向同处一条 trace，不是新根**（2026-10-13 真机实测修正，原设计写错）。
+dtm 把载荷按 step 共享给正向与补偿两侧，两侧拿到的是**同一份**字节：
+
+- Saga：服务端 `dtmsvr/trans_type_saga.go` 的 `GenBranches()` 对每个 step 生成
+  compensate 与 action 两条分支，二者都取 `BinData: t.BinPayloads[i]`；
+- TCC：`dtmsvr/api.go` 的 `svcRegisterBranch()` 里
+  `branches := []TransBranch{*branch, *branch}`，cancel 与 confirm 是同一份
+  `TransBranch` 的副本，`BusiPayload` 相同。
+
+故补偿分支面 `ExtractParent` 能拿到真 traceparent，直接挂回**正向那条 trace**，
+不是凭空造新根。实测证据（TCC `kNuEHDT788ThiHG8dQEaKe` 与 Saga
+`ZZHHh8BEDQwmJHc2Vix7ki`，各只出现在 1 条 trace 上）：
+
+```
+traceID=856f7915…  TryFreeze×3(compensation=false) + CancelFreeze×3(compensation=true)
+traceID=53b04ff0…  Deduct/CreateOrder/AddSales + Release/CancelOrder/ReduceSales
+```
+
+这比原设计**更好**：一笔 saga 的正向与回滚在一棵树里，Jaeger 上不必跨 trace 拼接；
+且「不伪造同 ID 孤儿 span」的要求依然成立 —— 这些是真实前序 span 的合法子节点。
+`biz.dtm.gid` 仍是唯一的跨段关联键（traceID 本身已足够，但 gid 让按业务号检索成立）。
+
+仅**定时补偿 / dtm 重启续推**这类没有原始载荷上下文的推进才会落在新 trace 上。
 
 公共件三件套（失败语义 / traceparent 续链 / 官方 barrier 包装）落
 `github.com/gospacex/dtmx`（物理路径 `../dtmx`，与 dbx/mqx/kvx/lockx/otelx 平级），

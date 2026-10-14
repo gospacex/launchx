@@ -29,7 +29,7 @@
   （库库存/积分/占位订单），Confirm 才实扣建正式单（此刻才写 outbox），
   Cancel 则全部解冻零脏数据。
 - **场景 ③（可观测）**：两条链四域服全部数据操作进同一条 Jaeger trace
-  （正向），补偿/Cancel 段以新根 trace + `biz.dtm.gid` 关联可整段回放。
+  （正向）；补偿/Cancel 段与正向**同一条 trace**，以 `biz.compensation=true` 区分，可整段回放。
 
 ## 设计方向
 
@@ -90,8 +90,11 @@ Cancel
 ```
 
 **调用链传递**：traceparent 编入分支业务载荷，正向各分支 Extract 后挂在
-同一 trace 下；补偿/Cancel 是 dtm 异步回调 → 域服新根 trace + `biz.dtm.gid`
-关联（与现有 outbox 补发同口径，不伪造同 ID 孤儿链）。
+同一 trace 下。补偿/Cancel 段**与正向同一条 trace** —— dtm 按 step 共享载荷
+（Saga 的 compensate 与 action 同取 `BinPayloads[i]`；TCC 的 cancel 与 confirm
+是同一份 `TransBranch` 的副本），两侧拿到同一份 traceparent。补偿 span 另置
+`biz.compensation=true`，并带 `biz.dtm.gid`。真机实测：一笔 saga 的正向与回滚
+在一条 trace 上，不必跨 trace 拼接，也不伪造同 ID 孤儿链。
 
 **幂等屏障**：分支写操作用 dtm 官方 barrier（`dtmgrpc.BarrierFromGrpc`），
 barrier 表进各域业务库。
@@ -143,7 +146,7 @@ barrier 表进各域业务库。
 - [ ] Saga 成功：`POST /api/order` 提交后四库落库正确，Jaeger 单 trace
       含正走四分支与各层 span（`rpc.dtm.*` / `service.*` / `db.*` 同链）
 - [ ] Saga 失败注入：`fail_inject` 触发逆序补偿，四库回到基线，补偿段
-      新根 trace 带 `biz.dtm.gid` 且可与正向链查关联
+      补偿段与正向同一条 traceID、带 `biz.dtm.gid` 与 `biz.compensation=true`
 - [ ] TCC Try 全成功 → Confirm：冻结转实扣、占位单转正式单、outbox 行
       **仅在 Confirm 后**出现
 - [ ] TCC 任一 Try 失败 → Cancel：三域解冻/废占位，零脏数据

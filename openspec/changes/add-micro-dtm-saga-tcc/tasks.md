@@ -34,7 +34,7 @@
 ## 4. 测试、验收与文档
 
 - [ ] 4.1 单元测试与静态守卫：a)「分支 handler 禁直连 dbx / 必经 service」静态守卫（反向断言：注入直连探针必红）；b) barrier 空补偿/悬挂/重放三条幂等单测（以假 barrier 存储为主口径）；c) bff 两编排器的分支序/补偿序/载荷单测。验收：`go test ./examples/... -count=1` 全绿
-- [ ] 4.2 真机集成测试：Go test（dtm 或底座缺任一即 Skip，不可写成 PASS）：Saga 成功四库断言、fail 注入补偿基线还原断言、TCC Confirm/Cancel 路径断言、dtm kill → 重启续推进、Jaeger trace 集成断言（正向单 trace 含四域 rpc.dtm/service/repository/db span；补偿新根带 `biz.dtm.gid`）——扩展现有 `examples/micro/trace_e2e_test.go` 口径。验收：起底座 + dtm 时全绿，无底座时 Skip 且日志写明跳过原因
+- [ ] 4.2 真机集成测试：Go test（dtm 或底座缺任一即 Skip，不可写成 PASS）：Saga 成功四库断言、fail 注入补偿基线还原断言、TCC Confirm/Cancel 路径断言、dtm kill → 重启续推进、Jaeger trace 集成断言（正向单 trace 含四域 rpc.dtm/service/repository/db span；补偿段与正向**同一条 traceID**、带 `biz.compensation=true`，真机已实测 dtm 按 step 共享载荷）——扩展现有 `examples/micro/trace_e2e_test.go` 口径。验收：起底座 + dtm 时全绿，无底座时 Skip 且日志写明跳过原因
 - [ ] 4.3 脚本级验收 `examples/micro/scripts/dtm_e2e.sh`：三段——①全绿 Saga（单 traceID、四库正确）；②fail 注入 Saga（自动逆序补偿、四库回基线、补偿 span 带 `biz.dtm.gid`/`biz.compensation=true`）；③TCC Try 全绿→Confirm 与 Try 失败→Cancel 路径。`Want/Observed` 分离、退出码即结论（无 `|| true`）、每段至少一次反向探针。验收：起全链跑三段全绿；人为破坏某判据（如注入失败分支）脚本报红且指明失败段
 - [ ] 4.4 文档同步：`examples/micro/README.md`（拓扑/端口 9041-9044、dtm 部署、起停、`dtm_e2e.sh`）、`examples/ACCEPTANCE.md` 新增 DTM 验收节、`docs/trace-chain-audit.md` §3 微服形态增补「DTM Saga/TCC 两链 trace 实测」小节（含正向单 trace span 清单与补偿段 gid 关联查法）、E3 下单链口径改为 Saga 验收（其余验收不回退）。验收：对照 README 与 config 端口逐一核对成立；下单链章节不再出现手动补偿口径
 

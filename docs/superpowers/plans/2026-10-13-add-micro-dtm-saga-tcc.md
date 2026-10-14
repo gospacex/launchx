@@ -4,7 +4,7 @@
 
 **目标：** 在 `examples/micro`（gateway → bff → 四域服）引入 dtm-labs/dtm：Saga 替换现有手动编排下单链，TCC 以新增「预售锁定」端点实现，四域服各挂轻量 gRPC 分支面，数据操作全部经既有六层链入 trace，官方 docker 形态部署 dtm server（独立 `dtm_db`），三层测试全落。
 
-**架构：** bff 新增 `internal/dtm` 编排器（`dtmgrpc` 提交 :36790）；四域服各新增 grpc-go 分支面（:9041-9044，独立 proto，不进 kitex_gen、不注册 consul），分支 handler → 既有 `service` → `repository` 落库；traceparent 编入分支载荷（正向同 trace），补偿/Cancel 新根 + `biz.dtm.gid`；分支写经 dtm 官方 barrier（barrier 表入域业务库）；所有新地址落 `config.yaml`。
+**架构：** bff 新增 `internal/dtm` 编排器（`dtmgrpc` 提交 :36790）；四域服各新增 grpc-go 分支面（:9041-9044，独立 proto，不进 kitex_gen、不注册 consul），分支 handler → 既有 `service` → `repository` 落库；traceparent 编入分支载荷，补偿/Cancel 与正向同一条 trace + `biz.compensation=true`；分支写经 dtm 官方 barrier（barrier 表入域业务库）；所有新地址落 `config.yaml`。
 
 **技术栈：** Go 1.27（workspace replace 体系）、`github.com/dtm-labs/client`（dtmgrpc API，钉版）、grpc-go、otelx/layer 分层 span、gorm/dbx（既有句柄面）、docker compose 底座（官方 dtm 镜像 + mysql）。
 
@@ -200,7 +200,7 @@ docker stop dtm && docker start dtm && sleep 3 && docker ps --filter name=dtm --
 ```
 预期：Status 显示 Up（重启即续推进的**行为**断言归 Task 13 的集成测试）。
 
-- [ ] **Step 2.4：Commit（底座仓不在本仓，改动在此登记即可；本仓登记该任务完成）**
+- [x] **Step 2.4：Commit（底座仓不在本仓，改动在此登记即可；本仓登记该任务完成）**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx
@@ -208,11 +208,37 @@ git add docs/superpowers/plans/2026-10-13-add-micro-dtm-saga-tcc.md
 git commit -m "docs(plans): dtm compose service landed in external base compose"
 ```
 
-- [ ] **Task complete**
+- [x] **Task complete**
 
 ---
 
 ### Task 3: schema 增量 DDL
+#### ⚠️ 执行记录：barrier DDL 两处修正 + 落点改到 micro 自有补丁（2026-10-13）
+
+**① Step 3.1 里那份 barrier DDL 是错的，已弃用。** 逐字改用 dtm 官方
+`sqls/dtmcli.barrier.mysql.sql`：草案缺 `trans_type` / `gid` 两列（dtm 写入直接报错），
+且唯一键写成 `(branch_id, barrier_id)` 而非官方 `(gid, branch_id, op, barrier_id)` ——
+后者会让不同全局事务里的同名分支互相判重，**跨事务丢账**。唯一键已实测为
+`uniq_barrier(gid,branch_id,op,barrier_id)`。
+
+**② 落点从 `examples/mall/scripts/schema.sql` 改到 `examples/micro/scripts/schema-micro.sql`。**
+依据是 schema-micro.sql 文件头自己写明的政策：「micro 的 DDL 真源 = 共用 schema.sql +
+本补丁……改共用文件会波及另一个案例」。DTM 增量属 micro 侧，故进本补丁文件。
+
+**③ 表落各域业务库（用户裁决：按域隔离），不建官方那个独立 `dtm_barrier` 库。**
+依据：`client/dtmcli/barrier.go` 的 `CallWithDB` 是 `tx := db.Begin()` 后在
+**业务连接的事务内** `InsertBarrier(tx, ...)`，同库才能与业务写原子提交。
+四域是独立进程，各自在自己连接上 `insert ignore into barrier`，互不干扰；
+装配期 `dtmcli.SetBarrierTableName("barrier")` 是进程级全局量，跨进程无共享。
+`InsertBarrier` 对 MySQL 走 `insert ignore into <表>` 不引用约束名
+（`GetInsertIgnoreTemplate` 的 pgConstraint 只在 postgres 分支用），故唯一键名不影响 MySQL 运行。
+
+**④ 落地的 DDL 清单**（全部按 information_schema + PREPARE 幂等，连灌两遍 exit=0）：
+`barrier`×4（四域各一）、`product_db.product_sales`、
+`stock_db.stocks.frozen`、`points_db.point_accounts.frozen`、`order_db.orders.dtm_gid`(+`idx_orders_dtm_gid`)。
+`orders.status` 已是 `VARCHAR(32)`，`presale_locked` 是取值不是 schema 变更，**无需 DDL**。
+`dtm_db` 的 `trans_*` 表归 Task 2 的官方 DDL，不进本文件。
+
 
 > **trace:** plan-ready.md → `### Task 3: schema 增量 DDL（对应 tasks.md 1.1）` | tasks.md → `- [ ] 1.1 schema 增量 DDL（登记进 \`examples/mall/scripts/schema.sql\` 系的四库 DDL 口径）：四域各建 dtm barrier 表；\`product_db\` 新增销量表（Saga 销量分支）；\`stock_db\` / \`points_db\` 增补冻结语义所需列（冻结量列或冻结辅助表，与现有可在读列并存）；\`order_db\` 订单状态机增列 \`presale_locked\` 语义。验收：DDL 幂等重放不报错、四库 schema 版本一致，\`dtm_db\` 表不在此口径内`
 > **sync:** tasks.md → `- [ ] 1.1 schema 增量 DDL（登记进 \`examples/mall/scripts/schema.sql\` 系的四库 DDL 口径）：四域各建 dtm barrier 表；\`product_db\` 新增销量表（Saga 销量分支）；\`stock_db\` / \`points_db\` 增补冻结语义所需列（冻结量列或冻结辅助表，与现有可在读列并存）；\`order_db\` 订单状态机增列 \`presale_locked\` 语义。验收：DDL 幂等重放不报错、四库 schema 版本一致，\`dtm_db\` 表不在此口径内` | plan-ready.md → `### Task 3: schema 增量 DDL（对应 tasks.md 1.1）`
@@ -220,7 +246,7 @@ git commit -m "docs(plans): dtm compose service landed in external base compose"
 **Files:**
 - 修改：`examples/mall/scripts/schema.sql`（在末尾追加「── DTM 增量（add-micro-dtm-saga-tcc）──」段落）
 
-- [ ] **Step 3.1：追加 DDL**
+- [x] **Step 3.1：追加 DDL**
 
 在 `examples/mall/scripts/schema.sql` 末尾追加（官方 barrier 表 DDL，来自 dtm 文档的 `dtm_barrier.barrier` 同构；官方 `Call` 会在事务内写这张表，列唯一键语义不可省）：
 
@@ -254,7 +280,7 @@ CREATE TABLE IF NOT EXISTS dtm_barrier.barrier (
 - `product_db` 新表：`sales_counters(product_id BIGINT PRIMARY KEY, order_gid VARCHAR(128) NOT NULL, qty INT NOT NULL, created_at DATETIME, index key (order_gid))`（按 order_gid 可回退）
 - `order_db.orders` 增列：`status VARCHAR(32)` 已有列表中支持 `presale_locked` 字面值（不需 DDL 时登记为「无需 DDL，状态机内约定」）
 
-- [ ] **Step 3.2：幂等重放与四库一致验证**
+- [x] **Step 3.2：幂等重放与四库一致验证**
 
 ```bash
 docker exec -i mysql mysql -urot -phubx123 < examples/mall/scripts/schema.sql
@@ -267,14 +293,14 @@ done
 预期：两遍执行均零错误退出；四业务库各自出现 `dtm_barrier.barrier`；`dtm_db` 表不混入业务库（`SHOW TABLES` 里业务四库无 `trans_*`）。
 （若 `CREATE DATABASE IF NOT EXISTS` 已在前文出现，无需重复；执行时以文件现状修正前缀语句为宜。）
 
-- [ ] **Step 3.3：Commit**
+- [x] **Step 3.3：Commit**
 
 ```bash
 git add examples/mall/scripts/schema.sql
 git commit -m "feat(schema): dtm barrier tables + presale/frozen/sales DDL"
 ```
 
-- [ ] **Task complete**
+- [x] **Task complete**
 
 ---
 
@@ -333,7 +359,7 @@ Task 4 必须把该字符串来源收敛到单一常量。
 - 创建：各域 `internal/dtm/setup.go` 模板（先以 一个域（srv-stock）落地，其余域在 Task 5-8 复用模板生成，模板本体在本 Task 已完整给出）
 - 修改：`examples/micro/scripts/gen.sh`、`examples/micro/srv-*/config.yaml`、`examples/micro/bff/config.yaml`
 
-- [ ] **Step 4.1：载荷公共件 `pkg/dtmx/payload.go`**
+- [x] **Step 4.1：载荷公共件 `pkg/dtmx/payload.go`**
 
 ```go
 // Package dtmx micro 示例的 DTM 公共件：分支载荷、traceparent 续链、官方 barrier 包装、
@@ -385,7 +411,7 @@ func Decode(data string) (Payload, error) {
 // 与 launchx.Inject 同源（都是 W3C traceparent），故这边用 otel 全局传播器
 // 直接 Extract 即可与 webx/kitex 双边 suite 的注入约定互通。
 // tp 为空（dtm 定时补偿/重启续推等异步回调）原样返回——这些段落本就按
-// 「新根 + biz.dtm.gid 关联」口径处理。
+// 与正向同一条 trace + biz.dtm.gid 关联（真机实测，见 design.md D4）。
 func ExtractParent(ctx context.Context, tp string) context.Context {
 	tp = strings.TrimSpace(tp)
 	if tp == "" {
@@ -395,7 +421,7 @@ func ExtractParent(ctx context.Context, tp string) context.Context {
 }
 ```
 
-- [ ] **Step 4.2：失败语义件 `pkg/dtmx/result.go`**
+- [x] **Step 4.2：失败语义件 `pkg/dtmx/result.go`**
 
 ```go
 package dtmx
@@ -491,7 +517,7 @@ func Normalize(ctx context.Context, err error) error {
 }
 ```
 
-- [ ] **Step 4.3：barrier 包装件 `pkg/dtmx/barrier.go`**
+- [x] **Step 4.3：barrier 包装件 `pkg/dtmx/barrier.go`**
 
 ```go
 package dtmx
@@ -628,7 +654,7 @@ func (b *Barrier) Call(ctx context.Context, sqlDB *sql.DB, cb func(ctx context.C
 }
 ```
 
-- [ ] **Step 4.4：公共件单测 `pkg/dtmx/dtmx_test.go`（不起 dtm，拦截语义可测）**
+- [x] **Step 4.4：公共件单测 `pkg/dtmx/dtmx_test.go`（不起 dtm，拦截语义可测）**
 
 ```go
 package dtmx_test
@@ -670,7 +696,7 @@ func TestBusinessFailureSentinelFlowsThroughNormalize(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4.5：各域分支 proto（busi.proto，×4 域）**
+- [x] **Step 4.5：各域分支 proto（busi.proto，×4 域）**
 
 每域一份（落地 `examples/micro/srv-<域>/internal/dtm/protos/busi.proto`），`go_package` 按域指到本域生成目录；共用消息与「service 名 + 方法名」两个量按域落（proto 语言级约束：一文件一 service）：
 
@@ -715,7 +741,7 @@ service StockBusi {
 >   - product：Saga `BumpSales`、 Compensation `UnbumpSales`（纯两段）
 > proto 文件按上表落方法名，Task 5-8 的 grpc 实现与之同构。
 
-- [ ] **Step 4.6：gen.sh 扩展（产物落 `internal/dtm/protos`，显式不进 `pkg/kitex_gen`）**
+- [x] **Step 4.6：gen.sh 扩展（产物落 `internal/dtm/protos`，显式不进 `pkg/kitex_gen`）**
 
 在 `examples/micro/scripts/gen.sh` 追加段（置于既有 kitex 生成段之后）：
 
@@ -740,7 +766,7 @@ fi
 echo "dtm proto gen: OK (4 domains)"
 ```
 
-- [ ] **Step 4.7：分支面装配模板（`srv-stock/internal/dtm/setup.go`——其余域复用同一模板粘到各自 `internal/dtm/`）**
+- [x] **Step 4.7：分支面装配模板（`srv-stock/internal/dtm/setup.go`——其余域复用同一模板粘到各自 `internal/dtm/`）**
 
 ```go
 // Package dtm srv-stock 的 DTM 分支面。
@@ -870,7 +896,7 @@ go func() {
 
 其中 `appCtx` 为 OnSetup可获得的生命周期 ctx（若无现成句柄，用 `context.Background()` 持一篇——GracefulStop 消息在 a.OnStop 里调 dtm.Shutdown 一并收；落地时用 launchx的 OnStop 挂 `gs.GracefulStop()`一等目标。）
 
-- [ ] **Step 4.8：config 新段**
+- [x] **Step 4.8：config 新段**
 
 `examples/micro/srv-stock/config.yaml` 追加（四域同构，端口 9041(product) / 9042(order) / 9043(stock) / 9044(points)）：
 
@@ -898,7 +924,7 @@ xmiddleware:
     grpc_addr: "127.0.0.1:36790"
 ```
 
-- [ ] **Step 4.9：build/vet + 守卫回归**
+- [x] **Step 4.9：build/vet + 守卫回归**
 
 运行：
 ```bash
@@ -907,7 +933,7 @@ go test . -run 'TestServiceSourceHasNoHardcodedLoopbackAddr' -count=1
 ```
 预期：PASS；无硬编码回环地址告警；`go vet ./...` 干净。
 
-- [ ] **Step 4.10：Commit**
+- [x] **Step 4.10：Commit**
 
 ```bash
 git add examples/micro pkg_goes_here../..
@@ -915,6 +941,6 @@ git add go.mod go.sum examples/micro pkg
 git commit -m "feat(micro): dtm branch facade common pkg + proto gen + branch setup template + config"
 ```
 
-- [ ] **Task complete**
+- [x] **Task complete**
 
 ---

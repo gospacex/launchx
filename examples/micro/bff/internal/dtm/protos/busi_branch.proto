@@ -56,3 +56,20 @@ message BusiReq {
   // fail_inject 失败注入目标分支名（演示用）。
   string fail_inject = 3;
 }
+
+// BusiResp dtm 分支响应（bff 侧只解不编）。TCC 专用。
+//
+// 为什么 TCC 需要它而 Saga 不需要：`dtmgrpc.(*TccGrpc).CallBranch` 的第五参
+// `reply interface{}` 会被 grpc-go 的 proto codec 当成待反序列化的目标，
+// 而 grpc v1.83 的 `messageV2Of(nil)` 直接返回 nil → Unmarshal 报
+// "failed to unmarshal, message is <nil>, want proto.Message"。Saga 的
+// `Add` 不收 reply（dtm 拿 raw codec 从不解析响应体），故此前不需要这个类型。
+//
+// 字段编号与类型逐字对齐四域的 StockBusiResp / OrderBusiResp / PointsBusiResp
+// （1:int64 code、2:string message）。**dtm server 不读这两个字段**（它只看
+// gRPC status，见各域 busi.proto 里 Resp 的注释）—— 留着的唯一理由是 grpc
+// 要有个合法的反序列化目标，所以这里不解析、不据此判成败。
+message BusiResp {
+  int64 code = 1;
+  string message = 2;
+}

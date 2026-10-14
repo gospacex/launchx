@@ -129,26 +129,37 @@ func Setup(a *launchx.App) error {
 	if err != nil {
 		return err
 	}
+	// TCC 编排器与 Saga 共用同一份 dtm 地址配置（同一个 dtm server、同一批分支
+	// 监听口），但**不复用 saga 那个实例**：两链的分支方法、载荷、失败分档都是
+	// 各自独立的，共用一个编排器等于让「改 Saga 顺带改了 TCC」。
+	tcc, err := installDtmTCC(a, cfg, logger)
+	if err != nil {
+		return err
+	}
 
-	h := handler.New(
-		downstream.New(downstream.Clients{
-			Product: productCli,
-			Stock:   stockCli,
-			Order:   orderCli,
-			Points:  pointsCli,
-		}, traceOn),
-		saga,
-		traceOn,
-	)
+	// 两个 handler 共用**同一个** downstream 客户端集：下游 RPC 客户端里带连接
+	// 池，为两条编排各建一份等于凭空翻倍连接数，而它们调的是同样的四个域。
+	down := downstream.New(downstream.Clients{
+		Product: productCli,
+		Stock:   stockCli,
+		Order:   orderCli,
+		Points:  pointsCli,
+	}, traceOn)
 
-	engine.Engine.GET("/ping", h.Ping)
-	engine.Engine.GET("/product/:id", h.GetProduct)
-	engine.Engine.GET("/stock/:product_id", h.GetStock)
-	engine.Engine.GET("/order/:id", h.GetOrder)
-	engine.Engine.GET("/points/:user_id", h.GetAccount)
+	mallH := handler.New(down, saga, traceOn)
+	presaleH := handler.NewPresale(down, tcc, traceOn)
+
+	engine.Engine.GET("/ping", mallH.Ping)
+	engine.Engine.GET("/product/:id", mallH.GetProduct)
+	engine.Engine.GET("/stock/:product_id", mallH.GetStock)
+	engine.Engine.GET("/order/:id", mallH.GetOrder)
+	engine.Engine.GET("/points/:user_id", mallH.GetAccount)
 	// 复合编排：预检商品 + 提交 dtm Saga（dtm 推进四分支并负责逆序补偿）——
 	// 全链路验收就看这一条。
-	engine.Engine.POST("/order", h.PlaceOrder)
+	engine.Engine.POST("/order", mallH.PlaceOrder)
+	// 第二条复合编排：预检商品 + 提交 dtm TCC（bff 只发三个 Try，
+	// Confirm / Cancel 由 dtm 在 Submit 之后驱动）。
+	engine.Engine.POST("/api/presale/lock", presaleH.Lock)
 	return nil
 }
 
@@ -188,6 +199,42 @@ func installDtmSaga(a *launchx.App, cfg configx.Config, logger logx.Logger) (*bf
 		logx.String("hint", "补齐 xmiddleware.dtm.grpc_addr 与 dtm.branches.<domain>；"+
 			"置 strict.dtm: true 可让这类配置缺失在装配期即退"))
 	return bffdtm.Unavailable(cause), nil
+}
+
+// installDtmTCC 构造预售锁定 TCC 的编排器（装配期一次）。
+//
+// 与 installDtmSaga 同构、共用同一段配置，但**独立失败**：Saga 构造失败不
+// 影响 TCC 可用，反之亦然。合成一个成败会把「预售不可用」表现成「下单也
+// 挂了」，排查方向直接被带偏。
+//
+// 失败姿态同样由 `strict.dtm` 裁决（config.yaml 显式写 false）：dtm 配置缺失
+// 时 Warn 后装一个恒失败的编排器，进程照常起来，`POST /api/presale/lock`
+// 返回 5xx，其余路由不受影响。
+func installDtmTCC(a *launchx.App, cfg configx.Config, logger logx.Logger) (*bffdtm.TCCOrchestrator, error) {
+	dtmAddr := cfg.GetString(bffdtm.KeyDTMAddr)
+	orch, err := bffdtm.NewTCC(bffdtm.TCCConfig{
+		DTMAddr:     dtmAddr,
+		BranchAddrs: bffdtm.BranchAddrsFrom(cfg),
+		Logger:      logger,
+	})
+	if err == nil {
+		logger.Info("bff: dtm tcc orchestrator installed",
+			logx.String("dtm_addr", dtmAddr),
+			logx.String("branches", strings.Join(bffdtm.DescribeTCCBranchAddrs(cfg), " ")),
+			logx.String("tcc_order", bffdtm.DescribeTCCBranchOrder()))
+		return orch, nil
+	}
+	// 为什么不把地址原样塞进 UnavailableTCC（同 installDtmSaga）：调用方要的是
+	// 结论，运维要的是配置键。
+	cause := fmt.Errorf("bff: dtm tcc 编排器不可用: %w", err)
+	if cfg.IsSet("strict.dtm") && cfg.GetBool("strict.dtm") {
+		return nil, cause
+	}
+	logger.Warn("bff: dtm tcc 编排器不可用，预售锁定将 5xx（全局事务不会建立，四域无写入；其余路由正常）",
+		logx.Err(cause),
+		logx.String("hint", "补齐 xmiddleware.dtm.grpc_addr 与 dtm.branches.{stock,points,order}；"+
+			"置 strict.dtm: true 可让这类配置缺失在装配期即退"))
+	return bffdtm.UnavailableTCC(cause), nil
 }
 
 // authSkipPrefixes 免鉴权路径前缀。

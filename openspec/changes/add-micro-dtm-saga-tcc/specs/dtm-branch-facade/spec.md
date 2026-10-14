@@ -23,14 +23,19 @@ repository` 六层链完成。
 - **THEN** dtm 分支 pb 生成产物只落在 `internal/dtm/proto/`，kitex_gen 保持
   原样（该面与 kitex 传输面互不渗透）
 
-### Requirement: 分支调用链 SHALL 覆盖正向同 trace 与补偿新根关联
+### Requirement: 分支调用链 SHALL 覆盖正向与补偿同 trace 且可按 gid 检索
 
 正向分支 SHALL 在分支面 handler 入口从业务载荷中的 traceparent 字段 Extract，
 开 `rpc.dtm.<entity>.<Method>` span（属性 `biz.dtm.gid`、`biz.dtm.branch`），
 使各域 service/repository/db span 挂到与 bff 提交请求相同的 trace 下。
-补偿/Cancel 由 dtm 异步发起，SHALL 以新根 trace 记录并携带 `biz.dtm.gid`；
-补偿/Cancel 分支的 span SHALL 另置 `biz.compensation=true`。
-链路内 MUST NOT 出现伪造同 ID 的孤儿 span。
+
+补偿/Cancel 分支 SHALL 与其正向分支**同处一条 trace**：dtm 按 step 共享载荷
+（Saga 的 compensate 与 action 同取 `BinPayloads[i]`；TCC 的 cancel 与 confirm
+是同一份 `TransBranch` 的副本），两侧拿到同一份 traceparent，故补偿段 Extract
+后挂回正向那条链。补偿/Cancel 的 span SHALL 另置 `biz.compensation=true`，
+并 SHALL 携带与正向链相同的 `biz.dtm.gid`。
+链路内 MUST NOT 出现伪造同 ID 的孤儿 span —— 补偿段挂的是真实前序 span 的合法
+子节点，不是另起一个同 ID 的假根。
 
 #### Scenario: 正向链一条 trace 看完下单
 
@@ -38,11 +43,18 @@ repository` 六层链完成。
 - **THEN** Jaeger 单条 trace 含：bff 提交 handler span、四域 `rpc.dtm.*`
   分支入口 span、各域 `service.*` / `repository.*` 与 `db.*` span，父子链正确
 
-#### Scenario: 补偿段新根可按 gid 关联
+#### Scenario: 补偿段与正向同 trace 且按 gid 关联
 
 - **WHEN** fail inject 触发补偿
-- **THEN** 补偿各分支 span 落在新根 trace 上，每个 span 携带与正向链相同的
-  `biz.dtm.gid` 与 `biz.compensation=true`；按该 gid 检索能同时召回正向与补偿线
+- **THEN** 补偿各分支 span 与其正向分支落在**同一条 traceID** 上（不是新根），
+  每个 span 携带与正向链相同的 `biz.dtm.gid` 与 `biz.compensation=true`；
+  按该 gid 检索能同时召回正向与补偿两类 span
+
+#### Scenario: 补偿段不是伪造的孤儿 span
+
+- **WHEN** 检查补偿分支 span 的 parentSpanID
+- **THEN** 它指向同 trace 内真实存在的前序 span，Jaeger 上无游离 span、
+  无重复 traceID 的假根
 
 ### Requirement: 分支写操作 SHALL 经 dtm 官方 barrier 守护幂等
 

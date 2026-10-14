@@ -32,7 +32,7 @@
 - 创建：`../dtmx/go.mod`、`../dtmx/go.sum`、`../dtmx/.gitignore`
 - 创建：`../dtmx/interface.go`、`../dtmx/interface_test.go`、`../dtmx/README.md`
 
-- [ ] **Step 16.1：建仓与 module 骨架**
+- [x] **Step 16.1：建仓与 module 骨架**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx
@@ -52,7 +52,7 @@ EOF
 
 `go 1.25.0` 与同级 `otelx` 对齐（`otelx/go.mod:3`）。
 
-- [ ] **Step 16.2：拉依赖并固化 go.sum**
+- [x] **Step 16.2：拉依赖并固化 go.sum**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/dtmx
@@ -63,7 +63,7 @@ go list -m all | head -5
 预期：退出 0，`go.sum` 生成。**若 `go mod tidy` 报 "no Go files"**，说明源码还没移过来 ——
 这是预期的，下一个 Step 会移；`go mod tidy` 留到 Step 17.1 之后再跑一次。
 
-- [ ] **Step 16.3：写 `.gitignore`（对齐 otelx 体例）**
+- [x] **Step 16.3：写 `.gitignore`（对齐 otelx 体例）**
 
 ```gitignore
 # 编译产物
@@ -80,7 +80,7 @@ go list -m all | head -5
 *.local.yaml
 ```
 
-- [ ] **Step 16.4：写 `interface_test.go`（先 RED）**
+- [x] **Step 16.4：写 `interface_test.go`（先 RED）**
 
 组件仓的 `interface_test.go` 在本仓的职责是**契约守卫**：钉死「dtmx 不得依赖 launchx」与
 「失败哨兵必须是 dtm 官方的」。这两条用 import 图直接判。
@@ -157,19 +157,19 @@ func TestDtmxDoesNotDependOnLaunchx(t *testing.T) {
 }
 ```
 
-- [ ] **Step 16.5：运行守卫，预期 RED（源码还没移进来 → 一个文件没扫到）**
+- [x] **Step 16.5：运行守卫，预期 RED（源码还没移进来 → 一个文件没扫到）**
 
 运行：`cd /Users/hyx/work/gowork/src/hubx/dtmx && go test ./... -v`
 预期：FAIL，报 `一个 .go 都没扫到`。Task 17 移入源码后转绿。
 
-- [ ] **Step 16.6：Commit**
+- [x] **Step 16.6：Commit**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/dtmx
 git add -A && git commit -q -m "chore(dtmx): 组件仓骨架（module github.com/gospacex/dtmx）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
 
 ---
 
@@ -185,7 +185,7 @@ git add -A && git commit -q -m "chore(dtmx): 组件仓骨架（module github.com
 - 修改：srv-stock / srv-points 下 15 个导入方的 import 路径
 - 删除：`examples/micro/pkg/dtmx/`
 
-- [ ] **Step 17.1：迁移文件**
+- [x] **Step 17.1：迁移文件**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx
@@ -198,7 +198,7 @@ ls dtmx/ && ls examples/micro/pkg/ | grep dtmx || echo "✓ 源目录已空"
 
 预期：`../dtmx` 下 6 个 .go 文件；`examples/micro/pkg/` 下不再有 `dtmx`。
 
-- [ ] **Step 17.2：改 `ExtractParent` 的依赖来源**
+- [x] **Step 17.2：改 `ExtractParent` 的依赖来源**
 
 `../dtmx/payload.go` 中把
 
@@ -231,7 +231,7 @@ import "github.com/gospacex/otelx/propagation"
 	))
 ```
 
-- [ ] **Step 17.3：组件仓独立跑测试**
+- [x] **Step 17.3：组件仓独立跑测试**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/dtmx
@@ -245,7 +245,7 @@ go test ./... -v -count=1 2>&1 | grep -E "^(--- PASS|--- FAIL|ok|FAIL)"
 `TestBarrierFromCtxRejectsMissingGrpcMeta` / `TestSetBarrierTableNameDefaultsToPerDomain` /
 `TestPayloadRoundTripCarriesTraceparentAndFailInject`。
 
-- [ ] **Step 17.4：launchx 接线**
+- [x] **Step 17.4：launchx 接线**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx
@@ -257,7 +257,7 @@ go build ./... 2>&1 | head -20
 预期：此时**会报 15 处 `no required module provides package github.com/gospacex/dtmx` 之外的问题**
 —— 正常，因为导入方还没改路径，下一步改。
 
-- [ ] **Step 17.5：改全部导入方**
+- [x] **Step 17.5：改全部导入方**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx
@@ -270,7 +270,7 @@ grep -r 'examples/micro/pkg/dtmx' --include="*.go" . && echo "❌ 仍有残留" 
 
 预期：15 个文件被改；最后一行打印 `✓ 无残留引用`。
 
-- [ ] **Step 17.6：验证迁移没有打破既有行为**
+- [x] **Step 17.6：验证迁移没有打破既有行为**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/launchx
@@ -283,7 +283,7 @@ CGO_ENABLED=0 go test ./examples/micro/... -count=1 2>&1 | grep -E "^(ok|FAIL|--
 预期：build exit=0；srv-stock 与 srv-points 的既有测试（Task 5/6 产物）仍全绿 ——
 它们引用 dtmx 的方式没变，只是路径换了。
 
-- [ ] **Step 17.7：写 `../dtmx/README.md`**
+- [x] **Step 17.7：写 `../dtmx/README.md`**
 
 ```markdown
 # dtmx
@@ -308,9 +308,11 @@ dtm（distributed transaction manager）的 Go 客户端公共件。三件套，
 3. **不得 import launchx / configx / dbx。** 本仓是独立组件仓，被 launchx 以
    `replace => ../dtmx` 消费，反向 import 会成环。由
    `TestDtmxDoesNotDependOnLaunchx` 守卫。
-4. **`ExtractParent` 空 traceparent 原样放行。** dtm 的异步补偿/重启续推不带
-   traceparent，这类回调按「新根 trace + `biz.dtm.gid` 关联」处理，
-   凭空造同 ID 孤儿 span 是自欺。
+4. **`ExtractParent` 空 traceparent 原样放行。** 常规补偿/二阶段**不带**空
+   traceparent —— dtm 按 step 共享载荷，补偿分支拿到的是真 traceparent，会挂回
+   正向那条 trace（真机实测，见 design.md D4）。只有 dtm 重启续推这类没有原始
+   载荷上下文的推进才会落新 trace；那种情况按 `biz.dtm.gid` 关联，凭空造同 ID
+   孤儿 span 才是自欺。
 
 ## 分支寻址
 
@@ -338,7 +340,7 @@ if err != nil {
 ```
 ```
 
-- [ ] **Step 17.8：Commit（两个仓分别提交）**
+- [x] **Step 17.8：Commit（两个仓分别提交）**
 
 ```bash
 cd /Users/hyx/work/gowork/src/hubx/dtmx
@@ -348,4 +350,4 @@ cd /Users/hyx/work/gowork/src/hubx/launchx
 git add go.mod go.sum examples/ && git commit -q -m "refactor(examples/micro): dtmx 改用 hubx 平级组件仓 github.com/gospacex/dtmx"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 对应行同步）

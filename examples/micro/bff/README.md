@@ -131,6 +131,7 @@ consul 不在时按 A3 降级：一条 `register failed, running unregistered` �
 | GET | `/order/:id?user_id=N` | 订单域 `demo-order` → `GetOrder` |
 | GET | `/points/:user_id` | 积分域 `demo-points` → `GetAccount` |
 | POST | `/order` | **复合下单**：预检商品（普通 RPC）→ 提交 dtm Saga（扣库存 → 建单 → 加销量 → 扣积分），响应带 `dtm_gid` |
+| POST | `/api/presale/lock` | **预售锁定**：预检商品（普通 RPC）→ 提交 dtm TCC（冻结库存 → 冻结积分 → 建占位单），响应带 `dtm_gid` |
 
 `POST /order` 请求体：`{"product_id":1,"quantity":2}`；可选 `"fail_inject":"AddSales"`
 （演示用，点火某个分支的逆序补偿链，真机留空）。响应含 `dtm_gid`（全局事务号）、
@@ -140,6 +141,34 @@ consul 不在时按 A3 降级：一条 `register failed, running unregistered` �
 提交失败（dtm 不可达 / Submit 被拒）一律 **500 + Warn**：全局事务**没有建立**，
 四域没有任何写入，调用方可原样重试。`strict.dtm: false`（config.yaml 显式声明）
 保证这类故障**不会**让进程退出，其余路由照常服务。
+
+### 4.1 `POST /api/presale/lock`（TCC）
+
+第二条复合编排入口，与 `POST /order`（Saga）在同一 bff / 同一四域服上构成对照：
+**共用** dtm 地址配置与 trace 续链口径，**不复用**任何分支方法。
+
+请求体同 `POST /order`：`{"product_id":1,"quantity":2}`；可选 `"fail_inject":"TryPlace"`
+（演示用，点火 TCC 的逆序 Cancel 链，真机留空）。
+
+bff **只发三个 Try**，`Confirm` / `Cancel` 全部由 dtm 在 `Submit` 之后驱动：
+
+| 阶段 | stock(:9043) | points(:9044) | order(:9042) |
+|---|---|---|---|
+| Try | `TryFreeze`（可售↓、冻结↑） | `TryFreeze`（可用↓、冻结↑） | `TryPlace`（`presale_locked` 占位单，**不写 outbox**） |
+| Confirm | 冻结 → 实扣 | 冻结 → 消账+流水 | 占位单 → `paid` 正式单（**此刻才写 outbox**） |
+| Cancel | 冻结 → 可售 | 冻结 → 可用 | 废占位单（**不写 outbox**） |
+
+响应含 `dtm_gid` / `order_no` / `total_amount` / `branches`（每个域的
+`try`·`confirm`·`cancel` 三个方法名）—— **不含 `order_id` / `reservation_id`**：
+TCC 二阶段是异步的，提交返回时三个分支一个都没跑完，此刻报 id 就是编的。
+
+失败一律 500，但**错误文案带后果**（编排器 `TCCOrchestrator.Lock` 的三档）：
+
+- `全局事务未建立…可原样重试` —— gid 拿不到或 Prepare 失败，四域零写入；
+- `dtm 已 Abort…请勿立刻重试` —— 某个 Try 业务失败，dtm 正在逆序 Cancel 已冻结的分支；
+- `dtm 尚未收到 Submit…超时后 Abort` —— 三个 Try 已冻结，等 dtm cron 超时后回滚。
+
+只有第一档可以原样重试，另两档必须先拿 `dtm_gid` 确认事务已 `failed` 再发起下一次。
 
 `user_id` 是可选查询参数（下游按它做归属校验，缺省 0）。
 

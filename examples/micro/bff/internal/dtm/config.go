@@ -82,3 +82,38 @@ func joinWith(parts []string, sep string) string {
 	}
 	return out
 }
+
+// ---------- TCC 侧的回显（tcc.go 的配套） ----------
+//
+// 与上面 Saga 那两个同构但分开：两链的分支序不同、涉及的域不同（日志里把两串
+// 挨着打出来，运维一眼能看出「哪串是 Saga、哪串是 TCC」），共用一个函数就得
+// 加参数区分，那还不如各写各的。
+
+// DescribeTCCBranchAddrs 供启动日志回显：TCC 分支序 × 地址。
+//
+// 顺序取自 tccBranchPlan（= 真实 Try 序），且**只含 TCC 涉及的三个域** ——
+// 把 product 也打进来会让人以为预售锁单要动商品域。
+func DescribeTCCBranchAddrs(cfg configx.Config) []string {
+	addrs := BranchAddrsFrom(cfg)
+	out := make([]string, 0, len(tccBranchPlan()))
+	for _, b := range tccBranchPlan() {
+		out = append(out, b.domain+"="+addrs[b.domain])
+	}
+	return out
+}
+
+// DescribeTCCBranchOrder 供启动日志回显 TCC 分支序（含 confirm / cancel 名）。
+//
+// 三段一起打：真机上最常被反复确认的就是「dtm 到底会回调哪个 confirm」，
+// 而答案只存在于编排代码的一行 slice 里。
+func DescribeTCCBranchOrder() string {
+	plan := tccBranchPlan()
+	parts := make([]string, 0, len(plan))
+	for i, b := range plan {
+		if i > 0 {
+			parts = append(parts, "→")
+		}
+		parts = append(parts, b.domain+"."+b.try+"/"+b.confirm+"/"+b.cancel)
+	}
+	return joinWith(parts, " ")
+}

@@ -86,6 +86,16 @@ dtm:
     # 逐字对应（同一个进程、两个监听口：kitex 面 + dtm 分支面）。
     # 分支 URL 由编排侧拼成 `<host:port>/<proto-service>/<method>`，
     # **不带 scheme** —— dtm 的默认 driver 见到 "://" 会直接报错。
+    #
+    # **键是「域」不是「分支方法」**：Saga 与 TCC 共用这四个域地址，两链的方法
+    # 名不同（TCC：stock/points 的 TryFreeze·ConfirmFreeze·CancelFreeze 与
+    # order 的 TryPlace·ConfirmFreeze·CancelFreeze；Saga：Deduct·Release /
+    # CreateOrder·CancelOrder / AddSales·ReduceSales / Debit·Refund），
+    # 由编排侧拼进 URL，不需要在配置里另开一段。
+    #
+    # TCC 只读 stock / points / order 三个键 —— 商品域没有冻结语义，它的分支面
+    # 只有 Saga 的加销量/减销量，故 product 配没配与预售锁单无关
+    # （NewTCC 的 validate 也不查它，见 internal/dtm/tcc.go）。
     stock:   "127.0.0.1:9043"
     order:   "127.0.0.1:9042"
     product: "127.0.0.1:9041"
@@ -94,7 +104,9 @@ dtm:
 xmiddleware:
   # ----- dtm：全局事务管理器（Saga / TCC 的提交面）-----
   # launchx 不构造 dtm 组件（它不是内建组件），编排地址由本档的 app/setup.go
-  # 直接读，见那里的 installDtmSaga。
+  # 直接读，见那里的 installDtmSaga（Saga）与 installDtmTCC（TCC）。
+  # 两条链共用这一个地址：同一台 dtm server 同时推进两种事务，分开配只会让
+  # 分成两台、而分支 URL 全在另一台上。
   dtm:
     grpc_addr: "127.0.0.1:36790"
 

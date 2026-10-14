@@ -619,3 +619,36 @@ handler 级的四向测试证明「链条的裁决逻辑」是对的，证明不
 它的 Use 写在被调函数的函数体里（行号在路由注册之后），要判准需要调用图 —— 成本高风险大，
 而脆弱的判据本身就是新的假红源（正是本轮刚治理完的东西）。
 四个示例已逐一人工核对，Use / installAuth 的调用点都早于路由注册，现状无违约。
+
+---
+
+## 后续变更（2026-10-12）：读策略与传播器封装的跨仓收口
+
+⚠️ **本文档上文（§10.11 / §10.12、第 324 / 362 / 514 行等）描述的
+`examples/pkg/cacheutil` 与 `examples/pkg/traceparent` 已不再是当前实现**。
+下文保留了当时的决策原文（那是历史记录），但**勿据此去找文件**。
+
+| 原位置 | 现位置 | 为什么 |
+|---|---|---|
+| `examples/pkg/cacheutil` | `cachex/loadthrough` | 它只依赖 `logx` + `otel`，**不 import launchx** ⇒ 无循环障碍；`cachex.Cache` 天然是其 `Store` 窄接口的超集。落**子包**而非根包：根包是「连接 SDK + 驱动注册表」，load-through 是**读策略**，混进根包会让它同时承担两件事 |
+| `examples/pkg/traceparent` | `otelx/propagation` | 它内部仍调 `launchx.Inject` ⇒ 平移到任何 x 仓都会构成 launchx ↔ x 的编译期循环（实测：15 个 x 仓中 **0 处** import launchx，依赖方向单向）。改由 otelx 承载 —— 子包只依赖 otel 核心三项，与 `otelx/layer` 同构，故 mqx 这类中间件也可达而不被拖进导出链 |
+| `examples/pkg/outbox` | **不动** | 2026-10-07 的结论（见 `outbox.go:9-21`）复核仍成立；另补一条它没写的：`Event` 把表结构写死（`TableName()="outbox"`，列名 `topic/event_type/...`），那是**业务约定**，不是中间件能力 |
+
+连带效果：
+
+- `launchx/trace.go` 保留为**库侧入口**，改为薄转发（API 与原有 4 条测试不变）。
+- 三处等价的全局传播器封装（launchx / mqx / traceparent）收口到 `otelx/propagation` 一处。
+  其中 **`mqx/propagation.go` 本次未改**：它面向 `*Message.Headers` 的适配是不同层次，
+  且 mqx 的 otel 是 1.29 而 otelx 是 1.46，加依赖会强制跨版本升级 —— 代价高于收益。
+- **顺带修掉 mall 的漂移**：mall 四域此前各留一份逐字相同的 `traceparentOf`
+  （2026-10-10 从 `examples/micro/pkg` 上提到 `examples/pkg` 时漏迁，且常量名已与
+  micro/mesh 不同 —— `events.TraceHeaderKey` vs `traceparent.Key`，行为一致纯属巧合）。
+  本次删除这四个方法，统一改调 `propagation.TraceparentIf(ctx, s.traceOn)`。
+- 管 **examples 布局**的四条判据（读缓存接线 / mesh `Validatable` / monolith typed-nil /
+  Create 后失效）从被删的包迁到**根包** `examples_cache_loadthrough_test.go`：
+  它们管的是 examples 的布局而不是策略本身，且路径基准改为**仓根**（与
+  `examples_addr_hygiene_test.go` 一致），不再随包挪动而静默失效。
+
+验证：`gofmt -l` 干净、`go vet ./...` 干净、`go build ./...` 通过；
+`launchx` / `examples/mesh/apps` / `cachex` / `otelx` / `mqx` 五个 module 的
+`go test ./...` **全部 exit=0**。

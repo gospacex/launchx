@@ -128,6 +128,70 @@ func (x *BusiReq) GetFailInject() string {
 	return ""
 }
 
+// BusiResp dtm 分支响应（bff 侧只解不编）。TCC 专用。
+//
+// 为什么 TCC 需要它而 Saga 不需要：`dtmgrpc.(*TccGrpc).CallBranch` 的第五参
+// `reply interface{}` 会被 grpc-go 的 proto codec 当成待反序列化的目标，
+// 而 grpc v1.83 的 `messageV2Of(nil)` 直接返回 nil → Unmarshal 报
+// "failed to unmarshal, message is <nil>, want proto.Message"。Saga 的
+// `Add` 不收 reply（dtm 拿 raw codec 从不解析响应体），故此前不需要这个类型。
+//
+// 字段编号与类型逐字对齐四域的 StockBusiResp / OrderBusiResp / PointsBusiResp
+// （1:int64 code、2:string message）。**dtm server 不读这两个字段**（它只看
+// gRPC status，见各域 busi.proto 里 Resp 的注释）—— 留着的唯一理由是 grpc
+// 要有个合法的反序列化目标，所以这里不解析、不据此判成败。
+type BusiResp struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Code          int64                  `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BusiResp) Reset() {
+	*x = BusiResp{}
+	mi := &file_protos_busi_branch_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BusiResp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BusiResp) ProtoMessage() {}
+
+func (x *BusiResp) ProtoReflect() protoreflect.Message {
+	mi := &file_protos_busi_branch_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BusiResp.ProtoReflect.Descriptor instead.
+func (*BusiResp) Descriptor() ([]byte, []int) {
+	return file_protos_busi_branch_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *BusiResp) GetCode() int64 {
+	if x != nil {
+		return x.Code
+	}
+	return 0
+}
+
+func (x *BusiResp) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_protos_busi_branch_proto protoreflect.FileDescriptor
 
 const file_protos_busi_branch_proto_rawDesc = "" +
@@ -137,7 +201,10 @@ const file_protos_busi_branch_proto_rawDesc = "" +
 	"\x03biz\x18\x01 \x01(\tR\x03biz\x12 \n" +
 	"\vtraceparent\x18\x02 \x01(\tR\vtraceparent\x12\x1f\n" +
 	"\vfail_inject\x18\x03 \x01(\tR\n" +
-	"failInjectBNZLgithub.com/gospacex/launchx/examples/micro/bff/internal/dtm/protos;bffbranchb\x06proto3"
+	"failInject\"8\n" +
+	"\bBusiResp\x12\x12\n" +
+	"\x04code\x18\x01 \x01(\x03R\x04code\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessageBNZLgithub.com/gospacex/launchx/examples/micro/bff/internal/dtm/protos;bffbranchb\x06proto3"
 
 var (
 	file_protos_busi_branch_proto_rawDescOnce sync.Once
@@ -151,9 +218,10 @@ func file_protos_busi_branch_proto_rawDescGZIP() []byte {
 	return file_protos_busi_branch_proto_rawDescData
 }
 
-var file_protos_busi_branch_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_protos_busi_branch_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_protos_busi_branch_proto_goTypes = []any{
-	(*BusiReq)(nil), // 0: dtmbranch.bff.BusiReq
+	(*BusiReq)(nil),  // 0: dtmbranch.bff.BusiReq
+	(*BusiResp)(nil), // 1: dtmbranch.bff.BusiResp
 }
 var file_protos_busi_branch_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
@@ -174,7 +242,7 @@ func file_protos_busi_branch_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protos_busi_branch_proto_rawDesc), len(file_protos_busi_branch_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   1,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

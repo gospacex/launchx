@@ -83,7 +83,7 @@
 
 ### Task 13: 真机集成测试（对应 4.2）
 - [ ] **任务完成**
-- 目标：Go test（无 dtm/底座即 Skip 且日志写明原因）：Saga 四库断言、fail 注入重建基线、TCC Confirm/Cancel、dtm kill 重启续推进、trace 集成断言（正向单 trace 四域 span 齐全；补偿新根带 `biz.dtm.gid`）
+- 目标：Go test（无 dtm/底座即 Skip 且日志写明原因）：Saga 四库断言、fail 注入重建基线、TCC Confirm/Cancel、dtm kill 重启续推进、trace 集成断言（正向单 trace 四域 span 齐全；补偿段与正向同一条 traceID、带 `biz.dtm.gid` 与 `biz.compensation=true`）
 - 改动文件：`examples/micro/trace_e2e_test.go`（扩展）或新增 `examples/micro/dtm_e2e_test.go`
 - 验证方式：起底座 + dtm + 六进程时全绿；无底座时 Skip 输出可见（不写成 PASS）
 
