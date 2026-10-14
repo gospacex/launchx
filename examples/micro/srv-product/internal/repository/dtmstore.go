@@ -126,7 +126,7 @@ func (r *ProductRepository) DtmAddSales(ctx context.Context, tx *sql.Tx, cmd mod
 		return errors.New("repository/dtm: 销量写必须在 barrier 事务内执行（nil *sql.Tx）")
 	}
 	q, pid := cmd.Quantity, int64(cmd.ProductID)
-	if _, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+	if _, err := dtmx.ExecTx(ctx, tx,
 		sqlAddSales, r.traceOn, pid, q, q); err != nil {
 		// 执行失败是基础设施故障：原样上抛，dtm 按退避重试。**不能**包成业务失败
 		// —— 那等于告诉 dtm「别重试了，去回滚」，一次连接抖动会变成一次真实回退。
@@ -151,7 +151,7 @@ func (r *ProductRepository) DtmReduceSales(ctx context.Context, tx *sql.Tx, cmd 
 		return errors.New("repository/dtm: 销量写必须在 barrier 事务内执行（nil *sql.Tx）")
 	}
 	q, pid := cmd.Quantity, int64(cmd.ProductID)
-	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+	res, err := dtmx.ExecTx(ctx, tx,
 		sqlReduceSales, r.traceOn, q, pid, q)
 	if err != nil {
 		return fmt.Errorf("dtm reduce sales product %d x%d order %s: %w", cmd.ProductID, q, cmd.OrderNo, err)
@@ -185,7 +185,7 @@ func (r *ProductRepository) DtmReduceSales(ctx context.Context, tx *sql.Tx, cmd 
 // read-modify-write。
 func (r *ProductRepository) classifyReduceMiss(ctx context.Context, tx *sql.Tx, cmd model.DtmSalesCmd) (error, error) {
 	var sold int64
-	err := dtmx.QueryRowTx(ctx, tx, dtmx.OpQuery,
+	err := dtmx.QueryRowTx(ctx, tx,
 		sqlSelectSold, r.traceOn, []any{&sold}, int64(cmd.ProductID))
 	switch {
 	case errors.Is(err, sql.ErrNoRows):

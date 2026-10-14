@@ -177,7 +177,7 @@ func (s *DtmBranchStore) Debit(ctx context.Context, bar *dtmx.Barrier, b model.D
 		if err != nil || !inserted {
 			return err
 		}
-		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		res, err := dtmx.ExecTx(ctx, tx,
 			sqlDebit, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: debit %s: %w", b.OrderNo, err)
@@ -205,7 +205,7 @@ func (s *DtmBranchStore) Refund(ctx context.Context, bar *dtmx.Barrier, b model.
 		if err != nil || !inserted {
 			return err
 		}
-		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		res, err := dtmx.ExecTx(ctx, tx,
 			sqlRefund, s.traceOn, b.Cost, b.Cost, b.UserID)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: refund %s: %w", b.OrderNo, err)
@@ -233,7 +233,7 @@ func (s *DtmBranchStore) TryFreeze(ctx context.Context, bar *dtmx.Barrier, b mod
 		if err != nil {
 			return err
 		}
-		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		res, err := dtmx.ExecTx(ctx, tx,
 			sqlTryFreeze, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: try freeze %s: %w", b.OrderNo, err)
@@ -258,7 +258,7 @@ func (s *DtmBranchStore) ConfirmFreeze(ctx context.Context, bar *dtmx.Barrier, b
 		if err != nil || !inserted {
 			return err
 		}
-		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		res, err := dtmx.ExecTx(ctx, tx,
 			sqlConfirmFreeze, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: confirm freeze %s: %w", b.OrderNo, err)
@@ -278,7 +278,7 @@ func (s *DtmBranchStore) CancelFreeze(ctx context.Context, bar *dtmx.Barrier, b 
 		if err != nil {
 			return err
 		}
-		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		res, err := dtmx.ExecTx(ctx, tx,
 			sqlCancelFreeze, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: cancel freeze %s: %w", b.OrderNo, err)
@@ -296,7 +296,7 @@ func (s *DtmBranchStore) CancelFreeze(ctx context.Context, bar *dtmx.Barrier, b 
 // 两者都带官方哨兵 —— 都是重试一万次也不会变的业务事实。
 func (s *DtmBranchStore) lockAccount(ctx context.Context, tx *sql.Tx, userID int64) (account, error) {
 	var acc account
-	err := dtmx.QueryRowTx(ctx, tx, dtmx.OpQuery,
+	err := dtmx.QueryRowTx(ctx, tx,
 		sqlLockAccount, s.traceOn, []any{&acc.Balance, &acc.Frozen}, userID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -323,7 +323,7 @@ func (s *DtmBranchStore) insertLedger(ctx context.Context, tx *sql.Tx, orderNo s
 		// 同一个注定失败的分支。这里提前判成业务失败。
 		return false, dtmx.BusinessFailure(fmt.Errorf("ledger %q: %w (max %d)", orderNo, ErrDtmOrderNoTooLong, ledgerOrderNoMaxLen))
 	}
-	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+	res, err := dtmx.ExecTx(ctx, tx,
 		sqlInsertLedger, s.traceOn,
 		b.UserID, orderNo, typ, amount, balanceAfter, remark, orderNo, typ)
 	if err != nil {
