@@ -101,6 +101,22 @@ func TestEveryServiceDirIsGuarded(t *testing.T) {
 	}
 }
 
+// testDoubleDirs 是**测试替身**目录：跨包复用的纯 Go 假 database/sql 驱动
+// （内存库 + barrier 判重 + 事务快照回滚），供 repository / service / dtm 三个
+// 包的 _test.go 共用。
+//
+// 为什么它们不进红线扫描：它们必须 gorm.Open 一个内存驱动才跑得起来，
+// 而「服务源码不得自建连接」这条守的正是**真实**中间件连接。把这两种 gorm.Open
+// 混在一起判，红线就会因为两个合理的例外而失真 —— 而失真的判据最终会被整体忽略。
+//
+// **跳过是有代价的**：目录里的真代码会一并逃出红线。因此配套的反向守卫是
+// TestTestDoublesAreNotImportedByProductionCode —— 非测试文件一律不许 import
+// 这几个包。跳过 + 反向守卫成对，才等于没开洞。
+var testDoubleDirs = map[string]bool{
+	"dtmstub": true,
+	"dbmock":  true,
+}
+
 // shouldSkipSourceDir 判哪些子目录不进红线扫描。
 //
 // kitex_gen 是生成码（量大、且它由 IDL 决定，改临时区无意义）；testdata 是
@@ -112,7 +128,64 @@ func shouldSkipSourceDir(name string) bool {
 	case "kitex_gen", "testdata", "scripts":
 		return true
 	}
-	return false
+	return testDoubleDirs[name]
+}
+
+// TestTestDoublesAreNotImportedByProductionCode 是 shouldSkipSourceDir 跳过
+// testDoubleDirs 的**反向守卫**：这些目录里的东西必须只在测试里被用到。
+//
+// 为什么必须有它：跳过目录等于给该目录开了一张空白通行证 —— 之后谁往
+// testDoubleDirs 里放一段真业务代码，它都不会被任何红线扫到。判据把这条
+// 通行证收窄成「可以被 import，但只能被 _test.go import」。
+func TestTestDoublesAreNotImportedByProductionCode(t *testing.T) {
+	forbidden := map[string]bool{}
+	for name := range testDoubleDirs {
+		forbidden[name] = true
+	}
+
+	var bad []string
+	for _, dir := range guardedServiceDirs {
+		root := filepath.Join("examples", dir)
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if shouldSkipSourceDir(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			// 只有 _test.go 被允许 import 测试替身；其余一律不许。
+			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			rel := filepath.ToSlash(path)
+			fset := token.NewFileSet()
+			f, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+			if perr != nil {
+				t.Errorf("解析 %s 失败：%v（守卫失效）", rel, perr)
+				return nil
+			}
+			for _, imp := range f.Imports {
+				lit := strings.Trim(imp.Path.Value, `"`)
+				for seg := range forbidden {
+					if strings.Contains(lit, "/"+seg) || strings.HasSuffix(lit, "/"+seg) {
+						bad = append(bad, rel+": "+lit)
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("扫 %s 失败：%v", root, err)
+		}
+	}
+	if len(bad) > 0 {
+		t.Fatalf("生产源码 import 了测试替身（%d 处）——测试替身会随二进制出厂：\n  %s",
+			len(bad), strings.Join(bad, "\n  "))
+	}
+	t.Logf("测试替身未泄漏进生产源码：%v", testDoubleDirs)
 }
 
 // loopbackAddrPattern 回环相关的地址字面量。
