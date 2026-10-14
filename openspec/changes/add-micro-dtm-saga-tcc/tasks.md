@@ -28,8 +28,8 @@
 
 ## 3. bff 编排
 
-- [ ] 3.1 Saga 编排接入：bff 新增 `internal/dtm`（saga 编排器：分支序 `stock.Deduct → order.CreateOrder → product.销+1 → points.Debit`、补偿逆序、`DtmAddr` 读 config、traceparent 编入载荷、`fail_inject` 透传）；`POST /api/order` handler 改挂 saga 提交（预检 `product.GetProduct` 失败 4xx 不提交）；现有手动 `ReleaseStock` 补偿代码退役删除。验收：gin-less 单测断言分支序与载荷含 traceparent；全仓 grep 手动补偿调用点为零
-- [ ] 3.2 TCC 编排接入：bff 同包新增 tcc 编排器（Try 三分支：stock/points/order；Confirm/Cancel 二阶段；配置与 trace 口径与 saga 同构）与新增 `POST /api/presale/lock` 路由。验收：单测断言 Try 失败 → Cancel 逆序构造、Try 全绿 → Confirm 构造；路由注册可见
+- [x] 3.1 Saga 编排接入：bff 新增 `internal/dtm`（saga 编排器：分支序 `stock.Deduct → order.CreateOrder → product.销+1 → points.Debit`、补偿逆序、`DtmAddr` 读 config、traceparent 编入载荷、`fail_inject` 透传）；`POST /api/order` handler 改挂 saga 提交（预检 `product.GetProduct` 失败 4xx 不提交）；现有手动 `ReleaseStock` 补偿代码退役删除 <!-- 已实现: 真机全链跑通（trans_global succeed、四库对账、outbox traceparent 在 Jaeger 单树含五服务）；fail_inject 逆序补偿四库回基线；dtm 不可达 5xx+Warn 进程不退 -->验收：gin-less 单测断言分支序与载荷含 traceparent；全仓 grep 手动补偿调用点为零
+- [x] 3.2 TCC 编排接入：bff 同包新增 tcc 编排器（Try 三分支：stock/points/order；Confirm/Cancel 二阶段；配置与 trace 口径与 saga 同构）与新增 `POST /api/presale/lock` 路由。验收：单测断言 Try 失败 → Cancel 逆序构造、Try 全绿 → Confirm 构造；路由注册可见 <!-- 已实现: 真机 Try 全绿→Confirm（outbox 停在 63、Confirm 后才 +1，占位单 presale_locked→paid 见于 order_status_log）与 fail_inject→Cancel（三域解冻、零脏数据、confirm/cancel 严格镜像）双路径验过 -->
 
 ## 4. 测试、验收与文档
 

@@ -28,31 +28,31 @@
 - 验证方式：DDL 幂等重放（连跑两遍不报错）；各库 DESCRIBE 对新列/新表逐一存在；`dtm_db` 表不混入业务库
 
 ### Task 4: 公共件与装配面（对应 1.2）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：dtm 分支载荷公共结构（含 trace carrier 与 `fail_inject`）、traceparent 注入/Extract 成对工具；各域 dtm 分支 pb + `internal/dtm/proto/` 生成（gen.sh 扩展）；各域 `internal/dtm` grpc-go 分支面装配（:9041-9044、不注册 consul、开 `rpc.dtm.<entity>.<Method>` span 带 `biz.dtm.gid`/`biz.dtm.branch`）；四域 config 新 `dtm.branch.listen_addr`、bff config 新 `xmiddleware.dtm.grpc_addr`
 - 改动文件：`examples/micro/pkg/`（新增载荷/trace 工具）、`examples/micro/srv-*/internal/dtm/`（pb 与装配模板）、`examples/micro/srv-*/config.yaml`、`examples/micro/bff/config.yaml`、`examples/micro/scripts/gen.sh`
 - 验证方式：任一域服起服多一个分支面端口监听且启动日志可见；`gofmt`/`go vet` 干净；`TestServiceSourceHasNoHardcodedLoopbackAddr` 仍绿
 
 ### Task 5: srv-stock 分支集（对应 2.1）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：service 层 Saga `Deduct`/`Release`（多表事务 + barrier）与 TCC `TryFreeze`/`Confirm`/`Cancel`；业务失败（库存不足/冻结不足）→ `ResultFailure` 语义，基础失败 → 普通 error；分支面 handler 载荷转 service
 - 改动文件：`examples/micro/srv-stock/internal/{service,handler,dtm}/`、`internal/repository/`
 - 验证方式：该域单测（两类失败建模、barrier 重放）全绿；反向探针（`ResultFailure` 改普通 error）FAIL 记录在案
 
 ### Task 6: srv-points 分支集（对应 2.2）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：service 层 Saga `Debit`/`Refund`（两表事务 + barrier）与 TCC `TryFreeze`/`Confirm`/`Cancel`（冻结量）；余额不足业务失败分流
 - 改动文件：`examples/micro/srv-points/internal/{service,handler,dtm,repository}/`
 - 验证方式：同 Task 5 口径单测全绿
 
 ### Task 7: srv-order 分支集（对应 2.3）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：service 层 Saga `CreateOrder`/作废补偿（orders+items+outbox 三表事务；作废标记 + outbox 必不扣回）与 TCC `TryPlace`（占位单 `presale_locked`、不写 outbox）/`Confirm`（转 `paid`，此刻才写 outbox）/`Cancel`（废占位）；gid/barrier 幂等
 - 改动文件：`examples/micro/srv-order/internal/{service,handler,dtm,repository}/`
 - 验证方式：单测断言「outbox 行仅在 Confirm 后出现」「作废不重复落 outbox」全绿
 
 ### Task 8: srv-product 分支集（对应 2.4）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：service 层销量 +1/-1（新销量表，Saga 第三分支，使四服全参与）；barrier 幂等
 - 改动文件：`examples/micro/srv-product/internal/{service,handler,dtm,repository}/`
 - 验证方式：单测断言补偿回退后销量回基线
@@ -64,13 +64,13 @@
 - 验证方式：`go test ./examples/micro/... -count=1` 全绿，反向探针结果记录在案
 
 ### Task 10: bff Saga 编排接入（对应 3.1）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：bff `internal/dtm` saga 编排器（四分支序 + 补偿逆序 + `DtmAddr` 读 config + traceparent/`fail_inject` 入载荷）；`POST /api/order` 改挂 saga 提交（预检失败 4xx）；手动 `ReleaseStock` 补偿代码退役删除
 - 改动文件：`examples/micro/bff/internal/{dtm,handler,route}/`、相关测试
 - 验证方式：编排器单测（分支序/载荷 traceparent）全绿；全仓 grep 手动补偿调用点为零
 
 ### Task 11: bff TCC 编排接入（对应 3.2）
-- [ ] **任务完成**
+- [x] **任务完成**
 - 目标：同包 tcc 编排器（Try 三分支 stock/points/order、Confirm/Cancel 二阶段、与 saga 同构配置/trace 口径）+ `POST /api/presale/lock` 路由
 - 改动文件：`examples/micro/bff/internal/{dtm,handler,route}/`
 - 验证方式：单测断言 Try 失败→Cancel 逆序、Try 全绿→Confirm；路由注册可见
