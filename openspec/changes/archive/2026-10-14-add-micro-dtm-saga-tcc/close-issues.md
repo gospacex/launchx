@@ -96,7 +96,22 @@ span 名 `db.<op>`、属性 `db.operation` / `db.system` / `db.sql.table` / `db.
 `selectOrderID` 与 `srv-product` 的 `classifyReduceMiss` 由包级函数挂到各自 repository
 ——它们原本拿不到 `traceOn`。
 
-**验证**：`dtmx` 13 → 15 用例全绿（含一条反向探针：把 update 的修饰词组从
+**真机复核（Jaeger 上逐 span 核）**：修完先看 span 才发现 op 全错——20 处调用点
+传的是 `query`/`dtmLogSQL` 这类**变量名**而非 SQL 字面量，声明式 op 全部落到默认值
+`OpQuery`，于是 INSERT/UPDATE 在 Jaeger 上显示成 `db.query`（比没 span 更坏：写负载
+被算到读上）。已把 op 参数整个去掉、改由 SQL 首关键字推导；随后又查出 `insert ignore into`
+这一形态同样漏判（MySQL 允许 insert 后插修饰词）。两轮修完后 Jaeger 上的实际形态：
+
+| 场景 | 服务数 | span | 补偿 span | db.create | db.update |
+|---|---|---|---|---|---|
+| Saga 正向 | 6 | 45 | 0 | order_items / orders / outbox / product_sales / stock_logs | stocks |
+| Saga 补偿 | 6 | 60 | 4 | 上列 + order_status_log | stocks / product_sales / orders |
+| TCC 全绿 | 6 | 52 | 0 | orders / order_status_log / outbox / stock_logs | orders / stocks |
+| TCC Cancel | 6 | 40 | 3 | stock_logs | stocks |
+
+表名未解析数：0。
+
+**验证**：`dtmx` 13 → 16 用例全绿（含一条反向探针：把 update 的修饰词组从
 `(?:low_priority|ignore|only)` 放宽回 `(?:[a-z_]+)` 会让 `db.sql.table` 解析成 `set`
 而报红——这条探针抓到过一个真 bug）；launchx 全量测试 FAIL 集合与改动前**完全一致**
 （仍是那 3 个 cgo stub 包）。
