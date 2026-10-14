@@ -135,7 +135,8 @@ func (r *OrderRepository) DtmCreateOrder(
 	if err := requireTx(tx); err != nil {
 		return 0, err
 	}
-	res, err := tx.ExecContext(ctx, dtmInsertOrderSQL,
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		dtmInsertOrderSQL, r.traceOn,
 		int64(cmd.UserID), cmd.OrderNo, model.StatusCreated, cmd.Total(), cmd.DtmGID)
 	if err != nil {
 		return 0, fmt.Errorf("dtm 建单 %s: %w", cmd.OrderNo, err)
@@ -155,10 +156,10 @@ func (r *OrderRepository) DtmCreateOrder(
 		// 是一张查不出明细的单。整笔失败（barrier 行随之回滚，dtm 会重试）。
 		return 0, fmt.Errorf("dtm 建单 %s: 读不到自增 order_id: %w", cmd.OrderNo, lerr)
 	}
-	if err := insertItems(ctx, tx, cmd, uint64(id)); err != nil {
+	if err := r.insertItems(ctx, tx, cmd, uint64(id)); err != nil {
 		return 0, err
 	}
-	if err := insertOutbox(ctx, tx, cmd, uint64(id), fill); err != nil {
+	if err := r.insertOutbox(ctx, tx, cmd, uint64(id), fill); err != nil {
 		return 0, err
 	}
 	return uint64(id), nil
@@ -205,7 +206,8 @@ func (r *OrderRepository) DtmTryPlace(
 	if err := requireTx(tx); err != nil {
 		return 0, err
 	}
-	res, err := tx.ExecContext(ctx, dtmInsertOrderSQL,
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		dtmInsertOrderSQL, r.traceOn,
 		int64(cmd.UserID), cmd.OrderNo, model.StatusPresaleLocked, cmd.Total(), cmd.DtmGID)
 	if err != nil {
 		return 0, fmt.Errorf("dtm 占位 %s: %w", cmd.OrderNo, err)
@@ -240,7 +242,8 @@ func (r *OrderRepository) DtmConfirmFreeze(
 	if err := requireTx(tx); err != nil {
 		return 0, err
 	}
-	res, err := tx.ExecContext(ctx, dtmConfirmFreezeSQL,
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		dtmConfirmFreezeSQL, r.traceOn,
 		model.StatusPaid, cmd.OrderNo, cmd.DtmGID, model.StatusPresaleLocked)
 	if err != nil {
 		return 0, fmt.Errorf("dtm 确认冻结 %s: %w", cmd.OrderNo, err)
@@ -254,14 +257,14 @@ func (r *OrderRepository) DtmConfirmFreeze(
 		// 发出去的事件会通知下游去扣款，而这张单根本不该成立。
 		return 0, dtmx.BusinessFailure(fmt.Errorf("dtm 确认冻结 %s: %w", cmd.OrderNo, ErrStatusNotAllowed))
 	}
-	id, err := selectOrderID(ctx, tx, cmd)
+	id, err := r.selectOrderID(ctx, tx, cmd)
 	if err != nil {
 		return 0, err
 	}
-	if err := insertStatusLog(ctx, tx, id, model.StatusPresaleLocked, model.StatusPaid); err != nil {
+	if err := r.insertStatusLog(ctx, tx, id, model.StatusPresaleLocked, model.StatusPaid); err != nil {
 		return 0, err
 	}
-	if err := insertOutbox(ctx, tx, cmd, id, fill); err != nil {
+	if err := r.insertOutbox(ctx, tx, cmd, id, fill); err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -299,7 +302,8 @@ func (r *OrderRepository) transition(
 	if err := requireTx(tx); err != nil {
 		return 0, err
 	}
-	res, err := tx.ExecContext(ctx, query, to, cmd.OrderNo, cmd.DtmGID, from)
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		query, r.traceOn, to, cmd.OrderNo, cmd.DtmGID, from)
 	if err != nil {
 		return 0, fmt.Errorf("dtm 状态流转 %s → %s: %w", from, to, err)
 	}
@@ -311,20 +315,21 @@ func (r *OrderRepository) transition(
 		return 0, dtmx.BusinessFailure(
 			fmt.Errorf("dtm 状态流转 %s → %s（单 %s / gid %s）: %w", from, to, cmd.OrderNo, cmd.DtmGID, ErrStatusNotAllowed))
 	}
-	id, err := selectOrderID(ctx, tx, cmd)
+	id, err := r.selectOrderID(ctx, tx, cmd)
 	if err != nil {
 		return 0, err
 	}
-	if err := insertStatusLog(ctx, tx, id, from, to); err != nil {
+	if err := r.insertStatusLog(ctx, tx, id, from, to); err != nil {
 		return 0, err
 	}
 	return id, nil
 }
 
 // insertItems 明细插入（与建单同事务）。
-func insertItems(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderID uint64) error {
+func (r *OrderRepository) insertItems(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderID uint64) error {
 	for _, it := range cmd.Items {
-		if _, err := tx.ExecContext(ctx, dtmInsertItemSQL,
+		if _, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+			dtmInsertItemSQL, r.traceOn,
 			int64(orderID), int64(it.ProductID), it.Name, int64(it.Quantity), it.UnitPrice); err != nil {
 			// 明细写失败必须连订单一起回滚：两者构成同一笔账，只落一半就是
 			// 「有单没明细」—— 总额对得上、明细查不出来，对账时无法归因。
@@ -335,8 +340,9 @@ func insertItems(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderID
 }
 
 // insertStatusLog 状态流转日志（纪律④）。
-func insertStatusLog(ctx context.Context, tx *sql.Tx, orderID uint64, from, to string) error {
-	if _, err := tx.ExecContext(ctx, dtmInsertStatusLogSQL, int64(orderID), from, to); err != nil {
+func (r *OrderRepository) insertStatusLog(ctx context.Context, tx *sql.Tx, orderID uint64, from, to string) error {
+	if _, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		dtmInsertStatusLogSQL, r.traceOn, int64(orderID), from, to); err != nil {
 		return fmt.Errorf("dtm 记状态流转 %d (%s → %s): %w", orderID, from, to, err)
 	}
 	return nil
@@ -346,12 +352,13 @@ func insertStatusLog(ctx context.Context, tx *sql.Tx, orderID uint64, from, to s
 //
 // fill 为 nil 时写空 payload：outbox.Runner 见空 payload 直接放弃该行且不占重试
 // 配额（见 examples/pkg/outbox），语义与 HTTP 面一致。
-func insertOutbox(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderID uint64, fill OutboxFill) error {
+func (r *OrderRepository) insertOutbox(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderID uint64, fill OutboxFill) error {
 	var payload, traceparent string
 	if fill != nil {
 		payload, traceparent = fill(orderID)
 	}
-	if _, err := tx.ExecContext(ctx, dtmInsertOutboxSQL,
+	if _, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		dtmInsertOutboxSQL, r.traceOn,
 		events.TopicOrderCompleted, dtmOutboxEventType, payload, traceparent,
 		outbox.StatusPending, 0); err != nil {
 		return fmt.Errorf("dtm 落事件 %s: %w", cmd.OrderNo, err)
@@ -364,9 +371,10 @@ func insertOutbox(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderI
 // 读不到按**基础设施故障**上抛而不是业务失败：它紧跟在一条刚刚命中（affected>0）
 // 的 UPDATE 之后，读不到意味着「更新生效了却看不到它」—— 那不是判据不满足，
 // 是账漂了，标成业务失败会让 dtm 不重试，把一笔已生效的写永远留在这个状态。
-func selectOrderID(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd) (uint64, error) {
+func (r *OrderRepository) selectOrderID(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd) (uint64, error) {
 	var id uint64
-	err := tx.QueryRowContext(ctx, dtmSelectOrderIDSQL, cmd.OrderNo, cmd.DtmGID).Scan(&id)
+	err := dtmx.QueryRowTx(ctx, tx, dtmx.OpQuery,
+		dtmSelectOrderIDSQL, r.traceOn, []any{&id}, cmd.OrderNo, cmd.DtmGID)
 	if err != nil {
 		return 0, fmt.Errorf("dtm 回读 order_id %s: %w", cmd.OrderNo, err)
 	}

@@ -126,7 +126,8 @@ func (r *ProductRepository) DtmAddSales(ctx context.Context, tx *sql.Tx, cmd mod
 		return errors.New("repository/dtm: 销量写必须在 barrier 事务内执行（nil *sql.Tx）")
 	}
 	q, pid := cmd.Quantity, int64(cmd.ProductID)
-	if _, err := tx.ExecContext(ctx, sqlAddSales, pid, q, q); err != nil {
+	if _, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		sqlAddSales, r.traceOn, pid, q, q); err != nil {
 		// 执行失败是基础设施故障：原样上抛，dtm 按退避重试。**不能**包成业务失败
 		// —— 那等于告诉 dtm「别重试了，去回滚」，一次连接抖动会变成一次真实回退。
 		return fmt.Errorf("dtm add sales product %d x%d order %s: %w", cmd.ProductID, q, cmd.OrderNo, err)
@@ -150,7 +151,8 @@ func (r *ProductRepository) DtmReduceSales(ctx context.Context, tx *sql.Tx, cmd 
 		return errors.New("repository/dtm: 销量写必须在 barrier 事务内执行（nil *sql.Tx）")
 	}
 	q, pid := cmd.Quantity, int64(cmd.ProductID)
-	res, err := tx.ExecContext(ctx, sqlReduceSales, q, pid, q)
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		sqlReduceSales, r.traceOn, q, pid, q)
 	if err != nil {
 		return fmt.Errorf("dtm reduce sales product %d x%d order %s: %w", cmd.ProductID, q, cmd.OrderNo, err)
 	}
@@ -163,7 +165,7 @@ func (r *ProductRepository) DtmReduceSales(ctx context.Context, tx *sql.Tx, cmd 
 	if affected > 0 {
 		return nil
 	}
-	sentinel, diagErr := classifyReduceMiss(ctx, tx, cmd)
+	sentinel, diagErr := r.classifyReduceMiss(ctx, tx, cmd)
 	if diagErr != nil {
 		// 连「为什么没命中」都读不出来：这是基础设施故障，不能猜一个业务失败
 		// 上报 —— 猜错的后果是 dtm 判死这笔全局事务（或反过来无限重试）。
@@ -181,9 +183,10 @@ func (r *ProductRepository) DtmReduceSales(ctx context.Context, tx *sql.Tx, cmd 
 // 诊断读刻意放在条件更新**之后**：守卫与判 0 行都不依赖它，它只是把一个笼统的
 // 「没扣成」翻译成可处置的成因。先读后判的写法才是危险的那种 —— 那才是真正的
 // read-modify-write。
-func classifyReduceMiss(ctx context.Context, tx *sql.Tx, cmd model.DtmSalesCmd) (error, error) {
+func (r *ProductRepository) classifyReduceMiss(ctx context.Context, tx *sql.Tx, cmd model.DtmSalesCmd) (error, error) {
 	var sold int64
-	err := tx.QueryRowContext(ctx, sqlSelectSold, int64(cmd.ProductID)).Scan(&sold)
+	err := dtmx.QueryRowTx(ctx, tx, dtmx.OpQuery,
+		sqlSelectSold, r.traceOn, []any{&sold}, int64(cmd.ProductID))
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("dtm reduce sales product %d x%d order %s: %w",

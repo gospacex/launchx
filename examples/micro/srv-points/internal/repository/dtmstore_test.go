@@ -61,7 +61,7 @@ func newStore(t *testing.T, balance int64) (*DtmBranchStore, *dtmstub.DB) {
 	if err != nil {
 		t.Fatalf("开夹具库失败：%v", err)
 	}
-	st, err := NewDtmBranchStore(gdb)
+	st, err := NewDtmBranchStore(gdb, true)
 	if err != nil {
 		t.Fatalf("构造分支写通道失败：%v", err)
 	}

@@ -36,7 +36,7 @@ func TestBranchOverRealGrpc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("开夹具库失败：%v", err)
 	}
-	store, err := repository.NewDtmBranchStore(gdb)
+	store, err := repository.NewDtmBranchStore(gdb, true)
 	if err != nil {
 		t.Fatalf("构造分支写通道失败：%v", err)
 	}

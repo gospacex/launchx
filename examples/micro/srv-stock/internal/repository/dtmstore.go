@@ -179,7 +179,8 @@ func (r *StockRepository) apply(
 	if tx == nil {
 		return errors.New("repository: dtm 分支写必须在 barrier 事务内执行（nil *sql.Tx）")
 	}
-	res, err := tx.ExecContext(ctx, query, args...)
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		query, r.traceOn, args...)
 	if err != nil {
 		// 执行失败是基础设施故障：原样上抛，dtm 按退避重试。**不能**包成业务失败。
 		return fmt.Errorf("dtm branch write product %d: %w", cmd.ProductID, err)
@@ -193,7 +194,8 @@ func (r *StockRepository) apply(
 	if affected == 0 {
 		return dtmx.BusinessFailure(deficit)
 	}
-	if _, err := tx.ExecContext(ctx, dtmLogSQL,
+	if _, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		dtmLogSQL, r.traceOn,
 		int64(cmd.ProductID), int64(delta), fmt.Sprintf(reasonFmt, cmd.OrderNo), int64(cmd.UserID)); err != nil {
 		// 流水写失败必须连库存更新一起回滚：两者构成同一笔账，只落一半就是
 		// 「扣了没流水」——对账时既查不出原因也无法补。

@@ -134,10 +134,13 @@ func RawDB(gdb *gorm.DB) (*sql.DB, error) {
 // DtmBranchStore dtm 分支写通道。
 type DtmBranchStore struct {
 	db *sql.DB
+	// traceOn 决定分支面的裸 SQL 写要不要产 db.* span。barrier 只吃 *sql.Tx
+	// （gorm 无法外接事务），这层埋点因此不走 dbx 的 gorm callback，得自己开。
+	traceOn bool
 }
 
 // NewDtmBranchStore 从 gorm 句柄构造（句柄来源的纪律见 RawDB）。
-func NewDtmBranchStore(gdb *gorm.DB) (*DtmBranchStore, error) {
+func NewDtmBranchStore(gdb *gorm.DB, traceOn bool) (*DtmBranchStore, error) {
 	sdb, err := RawDB(gdb)
 	if err != nil {
 		return nil, err
@@ -166,15 +169,16 @@ func (s *DtmBranchStore) Debit(ctx context.Context, bar *dtmx.Barrier, b model.D
 		return err
 	}
 	return bar.Call(ctx, db, func(ctx context.Context, tx *sql.Tx) error {
-		acc, err := lockAccount(ctx, tx, b.UserID)
+		acc, err := s.lockAccount(ctx, tx, b.UserID)
 		if err != nil {
 			return err
 		}
-		inserted, err := insertLedger(ctx, tx, b.OrderNo, b, model.TypeConsume, b.Cost, acc.Balance-b.Cost, "dtm.saga.debit")
+		inserted, err := s.insertLedger(ctx, tx, b.OrderNo, b, model.TypeConsume, b.Cost, acc.Balance-b.Cost, "dtm.saga.debit")
 		if err != nil || !inserted {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, sqlDebit, b.Cost, b.Cost, b.UserID, b.Cost)
+		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+			sqlDebit, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: debit %s: %w", b.OrderNo, err)
 		}
@@ -193,15 +197,16 @@ func (s *DtmBranchStore) Refund(ctx context.Context, bar *dtmx.Barrier, b model.
 		return err
 	}
 	return bar.Call(ctx, db, func(ctx context.Context, tx *sql.Tx) error {
-		acc, err := lockAccount(ctx, tx, b.UserID)
+		acc, err := s.lockAccount(ctx, tx, b.UserID)
 		if err != nil {
 			return err
 		}
-		inserted, err := insertLedger(ctx, tx, b.OrderNo, b, model.TypeEarn, b.Cost, acc.Balance+b.Cost, "dtm.saga.refund")
+		inserted, err := s.insertLedger(ctx, tx, b.OrderNo, b, model.TypeEarn, b.Cost, acc.Balance+b.Cost, "dtm.saga.refund")
 		if err != nil || !inserted {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, sqlRefund, b.Cost, b.Cost, b.UserID)
+		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+			sqlRefund, s.traceOn, b.Cost, b.Cost, b.UserID)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: refund %s: %w", b.OrderNo, err)
 		}
@@ -224,11 +229,12 @@ func (s *DtmBranchStore) TryFreeze(ctx context.Context, bar *dtmx.Barrier, b mod
 		return err
 	}
 	return bar.Call(ctx, db, func(ctx context.Context, tx *sql.Tx) error {
-		acc, err := lockAccount(ctx, tx, b.UserID)
+		acc, err := s.lockAccount(ctx, tx, b.UserID)
 		if err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, sqlTryFreeze, b.Cost, b.Cost, b.UserID, b.Cost)
+		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+			sqlTryFreeze, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: try freeze %s: %w", b.OrderNo, err)
 		}
@@ -243,16 +249,17 @@ func (s *DtmBranchStore) ConfirmFreeze(ctx context.Context, bar *dtmx.Barrier, b
 		return err
 	}
 	return bar.Call(ctx, db, func(ctx context.Context, tx *sql.Tx) error {
-		acc, err := lockAccount(ctx, tx, b.UserID)
+		acc, err := s.lockAccount(ctx, tx, b.UserID)
 		if err != nil {
 			return err
 		}
-		inserted, err := insertLedger(ctx, tx, tccLedgerOrderNo(b.OrderNo), b,
+		inserted, err := s.insertLedger(ctx, tx, tccLedgerOrderNo(b.OrderNo), b,
 			model.TypeConsume, b.Cost, acc.Balance, "dtm.tcc.confirm")
 		if err != nil || !inserted {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, sqlConfirmFreeze, b.Cost, b.Cost, b.UserID, b.Cost)
+		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+			sqlConfirmFreeze, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: confirm freeze %s: %w", b.OrderNo, err)
 		}
@@ -267,11 +274,12 @@ func (s *DtmBranchStore) CancelFreeze(ctx context.Context, bar *dtmx.Barrier, b 
 		return err
 	}
 	return bar.Call(ctx, db, func(ctx context.Context, tx *sql.Tx) error {
-		acc, err := lockAccount(ctx, tx, b.UserID)
+		acc, err := s.lockAccount(ctx, tx, b.UserID)
 		if err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, sqlCancelFreeze, b.Cost, b.Cost, b.UserID, b.Cost)
+		res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+			sqlCancelFreeze, s.traceOn, b.Cost, b.Cost, b.UserID, b.Cost)
 		if err != nil {
 			return fmt.Errorf("repository/dtm: cancel freeze %s: %w", b.OrderNo, err)
 		}
@@ -286,9 +294,10 @@ func (s *DtmBranchStore) CancelFreeze(ctx context.Context, bar *dtmx.Barrier, b 
 // 账户不存在与余额不足必须可分辨（ErrDtmAccountNF vs ErrDtmInsufficient）：
 // 调用方对前者该去开户，对后者该去催款，混成一个码就没法处置。
 // 两者都带官方哨兵 —— 都是重试一万次也不会变的业务事实。
-func lockAccount(ctx context.Context, tx *sql.Tx, userID int64) (account, error) {
+func (s *DtmBranchStore) lockAccount(ctx context.Context, tx *sql.Tx, userID int64) (account, error) {
 	var acc account
-	err := tx.QueryRowContext(ctx, sqlLockAccount, userID).Scan(&acc.Balance, &acc.Frozen)
+	err := dtmx.QueryRowTx(ctx, tx, dtmx.OpQuery,
+		sqlLockAccount, s.traceOn, []any{&acc.Balance, &acc.Frozen}, userID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return account{}, dtmx.BusinessFailure(fmt.Errorf("lock point_accounts %d: %w", userID, ErrDtmAccountNF))
@@ -306,7 +315,7 @@ func lockAccount(ctx context.Context, tx *sql.Tx, userID int64) (account, error)
 // false = (order_no, type) 已有行，即这一笔此前已经记过账。调用方必须据此
 // **跳过余额改动并返回成功**：这不是错误（dtm 重试是常态），也不是「照做」
 // （照做就是重复记账）。这条判据是 barrier 之外唯一的幂等闸。
-func insertLedger(ctx context.Context, tx *sql.Tx, orderNo string, b model.DtmBiz,
+func (s *DtmBranchStore) insertLedger(ctx context.Context, tx *sql.Tx, orderNo string, b model.DtmBiz,
 	typ int32, amount, balanceAfter int64, remark string) (bool, error) {
 
 	if len(orderNo) > ledgerOrderNoMaxLen {
@@ -314,7 +323,8 @@ func insertLedger(ctx context.Context, tx *sql.Tx, orderNo string, b model.DtmBi
 		// 同一个注定失败的分支。这里提前判成业务失败。
 		return false, dtmx.BusinessFailure(fmt.Errorf("ledger %q: %w (max %d)", orderNo, ErrDtmOrderNoTooLong, ledgerOrderNoMaxLen))
 	}
-	res, err := tx.ExecContext(ctx, sqlInsertLedger,
+	res, err := dtmx.ExecTx(ctx, tx, dtmx.OpQuery,
+		sqlInsertLedger, s.traceOn,
 		b.UserID, orderNo, typ, amount, balanceAfter, remark, orderNo, typ)
 	if err != nil {
 		return false, fmt.Errorf("repository/dtm: insert ledger %s/%d: %w", orderNo, typ, err)

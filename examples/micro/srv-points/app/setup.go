@@ -122,7 +122,7 @@ func Setup(a *launchx.App) error {
 	// *sql.DB，因为官方 barrier 要在自己的事务里插行（见 repository/dtmstore.go
 	// 的包注释）。构造失败即启动失败：分支面不可用却照常起服务的话，dtm 会一直
 	// 重试一个永远调不通的分支，那笔全局事务悬到超时。
-	dtmStore, err := repository.NewDtmBranchStore(db)
+	dtmStore, err := repository.NewDtmBranchStore(db, traceOn)
 	if err != nil {
 		return errors.New("srv-points: " + err.Error())
 	}

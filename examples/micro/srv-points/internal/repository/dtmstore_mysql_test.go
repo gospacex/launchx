@@ -107,7 +107,7 @@ func realMySQLStore(t *testing.T) (*DtmBranchStore, *gorm.DB) {
 			t.Fatalf("清表 %s 失败：%v", tbl, err)
 		}
 	}
-	store, err := NewDtmBranchStore(db)
+	store, err := NewDtmBranchStore(db, true)
 	if err != nil {
 		t.Fatalf("构造分支写通道失败：%v", err)
 	}
