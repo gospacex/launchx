@@ -14,7 +14,7 @@ require (
 	github.com/gospacex/configx v0.0.0
 	github.com/gospacex/coordx v0.0.0
 	github.com/gospacex/coordx/consul v0.0.0
-	github.com/gospacex/dbx v0.0.0-00010101000000-000000000000
+	github.com/gospacex/dbx v0.0.0
 	github.com/gospacex/dtmx v0.0.0
 	github.com/gospacex/kvx v0.0.0
 	github.com/gospacex/kvx/redis v0.0.0-00010101000000-000000000000
@@ -25,6 +25,7 @@ require (
 	github.com/gospacex/mqx v0.0.1
 	github.com/gospacex/mqx/kafka v0.0.0-00010101000000-000000000000
 	github.com/gospacex/otelx v0.0.0
+	github.com/gospacex/outboxx v0.0.0
 	github.com/gospacex/rpcx v0.0.0
 	github.com/gospacex/searchx v0.0.0
 	github.com/gospacex/searchx/elasticsearch v0.0.0-00010101000000-000000000000
@@ -212,6 +213,7 @@ replace (
 	github.com/gospacex/mqx/rabbitmq => ../mqx/rabbitmq
 	github.com/gospacex/mqx/rocketmq => ../mqx/rocketmq
 	github.com/gospacex/otelx => ../otelx
+	github.com/gospacex/outboxx => ../outboxx
 	github.com/gospacex/rpcx => ../rpcx
 	github.com/gospacex/traceflag => ../traceflag
 	github.com/gospacex/webx => ../webx

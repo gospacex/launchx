@@ -114,7 +114,7 @@ go test . -run 'TestEveryServiceDirIsGuarded' -count=1                  # PASS =
 | 原位置 | 现位置 | 依据 |
 |---|---|---|
 | `examples/micro/pkg/tracex`、`examples/mall/pkg/tracex` | `github.com/gospacex/otelx/layer` | 只依赖 otel 核心三项，与 dbx / mqx 同域；落 otelx **子包**而非根包 —— 根包要链 configx + 三个 exporter + logx/zap，而只想要这个封装的服务不该被拖上 |
-| `examples/micro/pkg/outbox`、`examples/mall/pkg/outbox` | `github.com/gospacex/launchx/examples/pkg/outbox` | **不能进 launchx 库源码**：本包整个就是对一个 gorm 表做簿记（`*gorm.DB`、`gorm.Expr` 自增），而库源码有硬约束 —— `dependency_surface_test.go` 的 `TestLibrarySourceHasNoDirectMiddlewareImports` 禁止直引 gorm（实测放进 `launchx/outbox` 后该守卫立即失败）。也不能进 mqx：mqx 不依赖 gorm，把 ORM 拖进消息层是同一个错误的反向版。而 dbx / mqx 谁都不单独拥有「事务发件箱」（一半是与业务行同事务的落库，一半是 MQ 的可靠投递）—— 这种跨域粘合是应用层的活，故合并成 examples 树内的一份 |
+| `examples/micro/pkg/outbox`、`examples/mall/pkg/outbox` | `github.com/gospacex/outboxx` | **不能进 launchx 库源码**：本包整个就是对一个 gorm 表做簿记（`*gorm.DB`、`gorm.Expr` 自增），而库源码有硬约束 —— `dependency_surface_test.go` 的 `TestLibrarySourceHasNoDirectMiddlewareImports` 禁止直引 gorm（实测放进 `launchx/outbox` 后该守卫立即失败）。也不能进 mqx：mqx 不依赖 gorm，把 ORM 拖进消息层是同一个错误的反向版。而 dbx / mqx 谁都不单独拥有「事务发件箱」（一半是与业务行同事务的落库，一半是 MQ 的可靠投递）—— 这种跨域粘合是应用层的活，2026-10-15 起上提为独立模块 `github.com/gospacex/outboxx`（hubx 根下，与 dbx / mqx 平级） |
 
 **副本账（合并前）**：tracex 三份（micro/pkg、mall/pkg、monolith/internal）+
 micro/srv/internal 的冻结副本；outbox 两份 + micro/srv/internal/service 的冻结副本。

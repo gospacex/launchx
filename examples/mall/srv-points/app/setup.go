@@ -30,7 +30,7 @@ import (
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/route"
 	srvrpc "github.com/gospacex/launchx/examples/mall/srv-points/internal/rpc"
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/service"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // orderEventsInstance 订阅侧 mqx 实例名（config.yaml 里的 `instances.<name>`）。
@@ -106,7 +106,7 @@ func Setup(a *launchx.App) error {
 	// outbox 补发器：MQ 生产者经 App.MQ() 取。未装配（或降级成 nil）时
 	// Runner 会显式 Error 而不静默跳过 —— 积分变动事件是链路终点，
 	// 丢了就没有对账依据。
-	runner := outbox.NewRunner(db, a.MQ(), logger, outbox.Config{
+	runner := outboxx.NewRunner(db, a.MQ(), logger, outboxx.Config{
 		TraceOn: a.Config().GetBool("trace.on.mq"),
 	})
 	runner.Start()

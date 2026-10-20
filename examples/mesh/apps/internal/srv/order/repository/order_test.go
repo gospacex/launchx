@@ -14,7 +14,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // newTestDB 建 sqlite 内存库并迁移四张表（含 outbox：事件与业务行同事务）。
@@ -27,7 +27,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := db.AutoMigrate(
-		&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}, &outbox.Event{},
+		&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}, &outboxx.Event{},
 	); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
@@ -95,15 +95,15 @@ func TestCreatePersistsFourTables(t *testing.T) {
 	}
 
 	// outbox 待发事件：与业务行同事务落库（status=pending，payload/traceparent 由 fill 给出）。
-	var evs []outbox.Event
+	var evs []outboxx.Event
 	if err := db.Order("id ASC").Find(&evs).Error; err != nil {
 		t.Fatalf("read outbox: %v", err)
 	}
 	if len(evs) != 1 {
 		t.Fatalf("outbox 行数 = %d, want 1", len(evs))
 	}
-	if evs[0].Status != outbox.StatusPending {
-		t.Fatalf("outbox.status = %d, want pending(%d)", evs[0].Status, outbox.StatusPending)
+	if evs[0].Status != outboxx.StatusPending {
+		t.Fatalf("outbox.status = %d, want pending(%d)", evs[0].Status, outboxx.StatusPending)
 	}
 	if evs[0].Payload != `{"order_id":1}` || evs[0].Traceparent != "00-trace" {
 		t.Fatalf("outbox 事件体/traceparent 未被 fill 写入: %+v", evs[0])
@@ -282,7 +282,7 @@ func TestCreateRollsBackWhenStatusLogInsertFails(t *testing.T) {
 func TestCreateRollsBackWhenOutboxInsertFails(t *testing.T) {
 	db := newTestDB(t)
 	repo := New(db, false)
-	if err := db.Migrator().DropTable(&outbox.Event{}); err != nil {
+	if err := db.Migrator().DropTable(&outboxx.Event{}); err != nil {
 		t.Fatalf("drop outbox: %v", err)
 	}
 	_, err := repo.Create(context.Background(),

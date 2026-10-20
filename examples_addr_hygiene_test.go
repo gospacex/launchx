@@ -86,6 +86,12 @@ func TestEveryServiceDirIsGuarded(t *testing.T) {
 			if !e.IsDir() || skipDirs[e.Name()] {
 				continue
 			}
+			// 隐藏目录（.omc / .git / .workbuddy …）是工具产物，不是服务源码：
+			// 把它们算进来只会让这条守卫因为与业务无关的原因恒红，
+			// 而恒红的守卫最终会被整体忽略 —— 那才是真正的损失。
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
 			rel := example + "/" + e.Name()
 			if !guarded[rel] {
 				missing = append(missing, rel)

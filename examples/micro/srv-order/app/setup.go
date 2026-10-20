@@ -30,7 +30,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/route"
 	srvrpc "github.com/gospacex/launchx/examples/micro/srv-order/internal/rpc"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/service"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // 自保护参数（固定窗口限流）。非地址类常量，故留在代码里：
@@ -99,7 +99,7 @@ func Setup(a *launchx.App) error {
 	// outbox 补发器：MQ 生产者经 App.MQ() 取。未装配（或降级成 nil）时
 	// Runner 会显式 Error 而不静默跳过 —— 那种情况下下单仍在写 status=0
 	// 的事件却无人投递，表会无声膨胀。
-	runner := outbox.NewRunner(db, a.MQ(), logger, outbox.Config{
+	runner := outboxx.NewRunner(db, a.MQ(), logger, outboxx.Config{
 		TraceOn: cfg.GetBool("trace.on.mq"),
 	})
 	runner.Start()

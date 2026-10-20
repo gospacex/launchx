@@ -4,7 +4,7 @@
 // 全部按「缺失即降级 + 留日志」处理；db 是硬前提（app.Setup 已用 VerifyOrError 挡过）。
 //
 // 事件投递不走本层：2026-10-10 起下单事件与业务行同事务落 outbox 表，
-// 由 app.Setup 装配的 outbox.Runner 后台补发（此前事务外直发 producer，
+// 由 app.Setup 装配的 outboxx.Runner 后台补发（此前事务外直发 producer，
 // 「订单提交成功、事件丢失」只值一条 Warn —— 那是不能接受的一致性缺口）。
 package service
 
@@ -119,7 +119,7 @@ type CreateOrderResult struct {
 }
 
 // CreateOrder 下单：加锁 → 落库（订单 + 明细 + 流转日志 + outbox 事件，同一事务）。
-// 事件投递由 outbox.Runner 异步补发，不在请求路径上。
+// 事件投递由 outboxx.Runner 异步补发，不在请求路径上。
 func (s *OrderService) CreateOrder(ctx context.Context, in CreateOrderInput) (res CreateOrderResult, err error) {
 	ctx, end := layer.Begin(ctx, "service", "order", "CreateOrder", s.traceOn, nil)
 	defer func() { end(err) }()

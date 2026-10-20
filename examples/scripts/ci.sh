@@ -40,9 +40,8 @@ pkgs_for() {
     monolith) echo "./examples/monolith/..." ;;
     micro)    echo "./examples/micro/..." ;;
     mall)     echo "./examples/mall/..." ;;
-    pkg)      echo "./examples/pkg/..." ;;
     mesh)     echo "" ;; # 独立模块，走下面的 extra_modules
-    all)      echo "./examples/monolith/... ./examples/micro/... ./examples/mall/... ./examples/pkg/..." ;;
+    all)      echo "./examples/monolith/... ./examples/micro/... ./examples/mall/..." ;;
     *)        echo "" ;;
   esac
 }
@@ -66,7 +65,7 @@ scope="${1:-all}"
 # 最需要覆盖的模块（主模块的 ./... 扫不到它），却又在校验里自相矛盾地
 # 把它列在"可选"里。早期这个 bug 让 `ci.sh mesh` 永远跑不成。
 if [ -z "$(pkgs_for "$scope")" ] && [ -z "$(extra_modules "$scope")" ]; then
-  echo "未知示例：${scope}（可选：monolith / micro / mall / pkg / mesh / all）" >&2
+  echo "未知示例：${scope}（可选：monolith / micro / mall / mesh / all）" >&2
   exit 2
 fi
 

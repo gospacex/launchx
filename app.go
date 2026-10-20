@@ -613,6 +613,15 @@ func (a *App) stepComponents(e *pipeline.Env) error {
 	}
 	a.comp = cenv
 	a.graph = &graph
+
+	// 观测侧伪组件 debug：presence-based（debug.enabled 或 APP_DEBUG=1），
+	// 不入 wire 图（不产出业务句柄，见 internal/component/debug.go），故在图求解
+	// 之后直接调用 builder。其关闭钩子经 env.AddStop 落在组件停止相，先于 logger 关闭。
+	if b := component.Lookup("debug"); b != nil {
+		if err := b(cenv); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

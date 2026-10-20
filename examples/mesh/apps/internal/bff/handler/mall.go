@@ -135,7 +135,7 @@ type placeOrderItem struct {
 // srv-order 的 service 层；积分入账由 srv-points 的消费循环完成，不经 HTTP。
 //
 // 事件投递走**事务发件箱**（2026-10-10 起）：订单行与 outbox 行在 srv-order 的
-// 同一事务内落库，之后由 outbox.Runner 补发到 kafka —— 故本方法既不碰 MQ，也不会
+// 同一事务内落库，之后由 outboxx.Runner 补发到 kafka —— 故本方法既不碰 MQ，也不会
 // 「落库成功但事件丢失」。此前注释「本示例不带 outbox：投递失败只告警」已作废。
 func (h *MallHandler) createOrder(ctx context.Context, c *app.RequestContext) {
 	ctx, end := layer.Begin(ctx, "handler", "bff", "CreateOrder", h.traceOn, nil)

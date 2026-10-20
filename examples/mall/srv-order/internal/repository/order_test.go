@@ -12,7 +12,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/gospacex/launchx/examples/mall/srv-order/internal/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // newOrderTestDB 建 sqlite 内存库并迁移 3 张表（orders + order_items + outbox）。
@@ -24,7 +24,7 @@ func newOrderTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &outbox.Event{}); err != nil {
+	if err := db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &outboxx.Event{}); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
 	return db
@@ -84,7 +84,7 @@ func TestCreateOrderTxReplayIsIdempotent(t *testing.T) {
 		t.Fatalf("orders 行数 = %d, want 1（重放不得产生第二张单）", orders)
 	}
 	var events int64
-	if err := db.Model(&outbox.Event{}).Count(&events).Error; err != nil {
+	if err := db.Model(&outboxx.Event{}).Count(&events).Error; err != nil {
 		t.Fatalf("count outbox: %v", err)
 	}
 	if events != 1 {
@@ -134,7 +134,7 @@ func TestCreateOrderTxPersistsItems(t *testing.T) {
 	if items != 1 {
 		t.Fatalf("order_items 行数 = %d, want 1", items)
 	}
-	var ev outbox.Event
+	var ev outboxx.Event
 	if err := db.First(&ev).Error; err != nil {
 		t.Fatalf("outbox 事件未落库: %v", err)
 	}

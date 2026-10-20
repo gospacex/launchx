@@ -27,6 +27,10 @@ var wantSDKs = []string{
 	"mqx", "objectx", "otelx", "rpcx", "searchx", "vectorx", "webx",
 }
 
+// wantPseudoComponents 观测侧伪组件：无业务句柄、不入 wire 图，由 App.stepComponents
+// 直接调 builder。它们**不是** SDK，故单独列示，不与 15 个 SDK 混算。
+var wantPseudoComponents = []string{"debug"}
+
 func newEnvForTest(traceOn map[string]bool) *component.Env {
 	if traceOn == nil {
 		traceOn = map[string]bool{}
@@ -39,8 +43,10 @@ func TestCatalogCoversFifteenSDKs(t *testing.T) {
 	if len(bySDK) != len(Catalog) {
 		t.Fatalf("Catalog 有重名 SDK：条目 %d 去重后 %d", len(Catalog), len(bySDK))
 	}
-	if len(Catalog) != len(wantSDKs) {
-		t.Errorf("注册面条目数 = %d，应为 %d", len(Catalog), len(wantSDKs))
+	want := len(wantSDKs) + len(wantPseudoComponents)
+	if len(Catalog) != want {
+		t.Errorf("注册面条目数 = %d，应为 %d（%d 个 SDK + %d 个伪组件）",
+			len(Catalog), want, len(wantSDKs), len(wantPseudoComponents))
 	}
 	for _, sdk := range wantSDKs {
 		e, ok := bySDK[sdk]
@@ -53,6 +59,21 @@ func TestCatalogCoversFifteenSDKs(t *testing.T) {
 		}
 		if e.Category != CategoryFoundation && e.Note == "" && e.Builder == "" {
 			t.Errorf("SDK %s 缺 Note：没写「为什么是这样」，后人会当成遗漏", sdk)
+		}
+	}
+	for _, pc := range wantPseudoComponents {
+		e, ok := bySDK[pc]
+		if !ok {
+			t.Errorf("伪组件 %s 未登记在册", pc)
+			continue
+		}
+		// 伪组件按设计不入 wire 图：不得有 provider（否则与「直接调 builder」矛盾），
+		// 但必须有 Builder 指明谁负责构造。
+		if e.HasProvider {
+			t.Errorf("伪组件 %s 不应有 wire provider（不入图，由 stepComponents 直接调 builder）", pc)
+		}
+		if e.Builder == "" {
+			t.Errorf("伪组件 %s 缺 Builder：谁负责构造？", pc)
 		}
 	}
 	if _, ok := bySDK["hubx"]; ok {

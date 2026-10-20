@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // TestCreateIsIdempotentByOrderNo 重放同一个 order_no：回既有订单，不多插任何行。
@@ -62,7 +62,7 @@ func TestCreateIsIdempotentByOrderNo(t *testing.T) {
 	}
 
 	var events int64
-	db.Model(&outbox.Event{}).Count(&events)
+	db.Model(&outboxx.Event{}).Count(&events)
 	if events != 1 {
 		t.Errorf("重放不得再插一条 outbox 事件（否则积分域会再收一次「订单已完成」），实际 %d 条", events)
 	}

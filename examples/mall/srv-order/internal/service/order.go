@@ -17,7 +17,7 @@
 //  1. 参数校验（user ≤ 0 → 1004；明细空/数量非法 → 1001）
 //  2. 同用户并发互斥（lockx；锁器缺失时 fail-open 并留 Warn，见 withUserLock）
 //  3. 本地事务 orders + order_items + outbox（事件体 pkg/events.OrderCompleted）
-//  4. 后台 outbox.Runner 3s 补发（幂等：status 0→1；traceparent 随
+//  4. 后台 outboxx.Runner 3s 补发（幂等：status 0→1；traceparent 随
 //     mqx Message.Headers 透传，仅当调用链开）
 package service
 

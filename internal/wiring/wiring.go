@@ -1,4 +1,5 @@
 // Package wiring 是 launchx 的 SDK 注册面：15 个 hubx `*x` SDK 在此登记，
+// 外加 1 个观测侧伪组件（debug，无业务句柄、不入 wire 图），
 // 由 goforj/wire 在编译期求解依赖顺序，由 provider 在运行时裁决有无。
 //
 // 分工边界（改这个文件前先看懂，否则很容易把事做错）：
@@ -182,6 +183,12 @@ var Catalog = []Entry{
 	{
 		SDK: "vectorx", Category: CategoryOptional, PresenceKey: "vectorx", HasProvider: true,
 		Note: "同 objectx：依赖面代价过高（elasticsearch v9 等），登记在册、默认零值",
+	},
+
+	// 可选组件：观测侧伪组件（不产出业务句柄，故不入 wire 图）
+	{
+		SDK: "debug", Category: CategoryOptional, PresenceKey: "debug.enabled", Builder: "debug",
+		Note: "观测侧伪组件：debug.enabled(yaml) 或 APP_DEBUG=1(env) 时仅回环监听 127.0.0.1:6060 的 pprof；无业务句柄，不入 wire 图，由 App.stepComponents 直接调 builder，关闭钩子经 env.AddStop 落在组件停止相（先于 logger）",
 	},
 
 	// 形态装配产物

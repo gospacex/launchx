@@ -93,13 +93,23 @@ dtm:
     # CreateOrder·CancelOrder / AddSales·ReduceSales / Debit·Refund），
     # 由编排侧拼进 URL，不需要在配置里另开一段。
     #
+    # ⚠️ **必须是 host.docker.internal 而不是 127.0.0.1**。
+    #    dtm server 现在是 compose 里的容器（dockers/docker-compose.yml 的
+    #    `dtm` 服务），它回调分支时看到的 127.0.0.1 是**容器自己**，不是这台
+    #    宿主。实测症状极具欺骗性：事务登记成功（trans_global 有行、bff 返回
+    #    gid），但八个分支全停在 `status=prepared` / `finish_time` NULL，
+    #    dtm 每 10s 重试一次却永远借不到宿主进程 —— 端口在通、HTTP 面能
+    #    应答 newGid，只有去翻 trans_branch_op 才看得出来。
+    #    宿主侧 `ping host.docker.internal` 同样解析到 127.0.0.1，所以这个写法
+    #    对「进程版 dtm」（`$(go env GOPATH)/bin/dtm`）也一样成立。
+    #
     # TCC 只读 stock / points / order 三个键 —— 商品域没有冻结语义，它的分支面
     # 只有 Saga 的加销量/减销量，故 product 配没配与预售锁单无关
     # （NewTCC 的 validate 也不查它，见 internal/dtm/tcc.go）。
-    stock:   "127.0.0.1:9043"
-    order:   "127.0.0.1:9042"
-    product: "127.0.0.1:9041"
-    points:  "127.0.0.1:9044"
+    stock:   "host.docker.internal:9043"
+    order:   "host.docker.internal:9042"
+    product: "host.docker.internal:9041"
+    points:  "host.docker.internal:9044"
 
 xmiddleware:
   # ----- dtm：全局事务管理器（Saga / TCC 的提交面）-----

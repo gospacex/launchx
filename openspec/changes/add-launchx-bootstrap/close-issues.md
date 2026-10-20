@@ -180,3 +180,30 @@ Task 24 实测三条判据，两条与现状冲突，**判据口径过时而非�
       （现象：进程在监听、consul 里 `[]`、日志却打过 `service registered`）。
       coordx 的 TTL 心跳机制本身无问题。根治需给实例 ID 加唯一后缀
       （多实例滚动发布下必现）。
+
+## 八、静态演示令牌"自己过期"（2026-10-18 修）
+
+- 现象：micro 六进程连跑 4 天后，`TestT9TailSpansNotDropped` 失败，报错是
+  `POST /api/order 返回 HTTP 401：invalid token`。
+- 真因：装配期播种演示令牌时给了**固定 1 小时 TTL**（`store.GrantToken(...,
+  time.Hour)`）。进程跑过 1 小时，redis 里那条 `auth:token:*` 映射到期消失，
+  于是**所有业务路由一起 401**。
+- 坑在哪：报错说 "invalid token"（凭据无效），人照着"凭据配错了"去查 —— 比 yaml、
+  比 Secret、比注入，全是白费；真相是"曾经有效，自己过期了"。
+  即：`auth.ticket_ttl`（5m，给下游票据的短 TTL）与静态播种凭据被混为一谈。
+- 修法：新增 `TokenStore.SeedDemoToken`（不带 TTL）并在 bff 装配处改用它；
+  语义写进注释 —— 静态常量凭据没有签发者/轮换/吊销，给 TTL 换不来防线。
+  （`GrantToken(ttl>0)` 保留，供需要时效的票据使用。）
+- 判据：`pkg/auth/token_test.go` 两组用例 —— ①静态令牌推进 48h 仍可解析；
+  ②带 TTL 的令牌到点必须失效（反向对照，证明 ① 不是假件恒命中）。
+
+## 九、门禁脚本引用了已不存在的目录（2026-10-18 修）
+
+- 现象：`bash examples/scripts/ci.sh all` 以 `./examples/pkg/...
+  [setup failed]` 失败 —— 但每个包自身都是 `ok`。
+- 真因：`examples/pkg/`（原 `cacheutil` / `outbox`，已下沉为平级组件仓
+  `gospacex/cachex/loadthrough`、`gospacex/dtmx`）**目录已不存在**，
+  而 `pkgs_for` 的 `pkg` 分支和 `all` 分支仍列着它。
+  `go test` 对不存在的路径报 `[setup failed]`，且**不打印哪个包**，于是日志
+  看上去"全是 ok 却 FAIL" —— 一道只会误导人的闸门。
+- 修法：`ci.sh` 去掉 `pkg` 分支，`all` 也去掉该路径；帮助文案同步更新。

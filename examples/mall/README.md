@@ -55,7 +55,7 @@ RPC 口（9101-9104）**没有 HTTP 面**，拿 `curl` 打它只会得到
 
 | 能力 | 位置 | 为什么在 SDK 而不是 demo |
 |---|---|---|
-| 事务发件箱 | `github.com/gospacex/launchx/examples/pkg/outbox` | 落库 + 3s 补发是对一个 gorm 表做的簿记，各服务语义必须逐字一致；抄多份的代价是语义漂移（重试上限 / 空 payload / 轮询 ctx 是否入链）。它**不能**进 launchx 库源码：库有「不得直引 gorm」的硬守卫（`dependency_surface_test.go`） |
+| 事务发件箱 | `github.com/gospacex/outboxx` | 落库 + 3s 补发是对一个 gorm 表做的簿记，各服务语义必须逐字一致；抄多份的代价是语义漂移（重试上限 / 空 payload / 轮询 ctx 是否入链）。它**不能**进 launchx 库源码：库有「不得直引 gorm」的硬守卫（`dependency_surface_test.go`） |
 | 业务分层埋点 | `github.com/gospacex/otelx/layer` | `layer.Begin(...)` 的 `layer.<entity>.<op>` 命名与 quiet 豁免是跨示例约定，且它只依赖 otel 核心三项，故做成 otelx 的子包而非根包（根包要链整条导出栈） |
 
 两者的 tracer 都和 dbx / mqx 一样向 otel 全局取 —— 全局由 launchx 的 telemetry
@@ -81,8 +81,16 @@ srv-<domain>/
 ## 2. 跑起来
 
 ```bash
-export HUBX_DB_PW=hubx123
-mysql -h127.0.0.1 -P3306 -uroot -p < examples/mall/scripts/schema.sql
+export MYSQL_ROOT_PW=<底座 mysql root 口令>    # 必填，见 docker-compose.yml
+export HUBX_DB_PW=hubx123                      # 应用账号 mall_rw 的口令
+
+# 四库 DDL + 应用账号。⚠️ 别图省事写成 `mysql ... < scripts/schema.sql`：
+# 那份 SQL 里口令是 ${HUBX_DB_PW:-...} 占位，重定向不经过 shell 展开，
+# 占位会被当成口令灌进库 —— 账号照样建成功，应用却连不上（ERROR 1045，
+# 且报错完全看不出是灌库姿势的问题）。schema.sh 负责渲染 + 灌 + 灌完用
+# 应用账号真连一次验证。
+bash examples/scripts/schema.sh apply
+
 # 中间件：mysql:3306 / redis:6379 / kafka:9092 / consul:8500 / jaeger:4318
 
 cd examples/mall/srv-product && go run ./cmd   # 另开终端依次跑其余三个

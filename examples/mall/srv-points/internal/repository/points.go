@@ -28,8 +28,8 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mall/srv-points/internal/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/outboxx"
 )
 
 // 积分域哨兵错误（service 层据此翻译成 5xxx 业务码）
@@ -267,10 +267,10 @@ func (r *PointsRepository) ChangeTx(ctx context.Context, in ChangeInput) (out *C
 			// 唯一键冲突：并发下两个请求同时通过存在性检查，由数据库裁决
 			return fmt.Errorf("insert ledger %s: %w", in.OrderNo, err)
 		}
-		ev := outbox.Event{
+		ev := outboxx.Event{
 			Topic:     "points.changed.v1",
 			EventType: "points.changed",
-			Status:    outbox.StatusPending,
+			Status:    outboxx.StatusPending,
 		}
 		if in.OutboxFill != nil {
 			ev.Payload, ev.Traceparent = in.OutboxFill(lg.ID, a.Balance)

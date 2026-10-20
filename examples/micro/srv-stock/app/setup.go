@@ -30,7 +30,7 @@ import (
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/route"
 	srvrpc "github.com/gospacex/launchx/examples/micro/srv-stock/internal/rpc"
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/service"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // 自保护参数（固定窗口限流）。非地址类常量，故留在代码里：
@@ -100,7 +100,7 @@ func Setup(a *launchx.App) error {
 	// outbox 补发器：MQ 生产者经 App.MQ() 取。未装配（或降级成 nil）时
 	// Runner 会显式 Error 而不静默跳过 —— 预占事件丢了，订单域永远
 	// 等不到回执，症状是"订单卡在待确认"。
-	runner := outbox.NewRunner(db, a.MQ(), logger, outbox.Config{
+	runner := outboxx.NewRunner(db, a.MQ(), logger, outboxx.Config{
 		TraceOn: cfg.GetBool("trace.on.mq"),
 	})
 	runner.Start()

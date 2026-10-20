@@ -36,6 +36,23 @@ func (t TokenStore) GrantToken(ctx context.Context, token string, userID int64, 
 	return t.inst.Set(ctx, tokenKey(token), strconv.FormatInt(userID, 10), ttl)
 }
 
+// SeedDemoToken 播种一条**静态**演示令牌（demo 启动期的一次性写入）。
+//
+// 与 GrantToken 只差一处：静态令牌播种时**不带 TTL**。
+//
+// 为什么不给它 TTL（本机 2026-10-18 实测的坑）：静态令牌是 config.yaml 里
+// 写死的常量 —— 没有签发者、没有轮换、没有吊销。给它一个过期时间换不来任何
+// 防线，只会让进程跑过 TTL 之后**所有业务路由一起 401**；而那时的报错是
+// "invalid token"，恰好把人引向"凭据配错了"（比 yaml、比 Secret、比注入），
+// 与真相（曾经有效，自己过期了）正好相反。签发出来的**票据**才需要短 TTL，
+// 那玩意儿有重放风险 —— 见 gate.go / DefaultTicketTTL，两者别混。
+//
+// 顺带回答"那永久键不会残留吗"：播种是启动期的动作，进程重启即重写同一条
+// 键，不会累积；而它只有一个 key，也没有扫描负担。
+func (t TokenStore) SeedDemoToken(ctx context.Context, token string, userID int64) error {
+	return t.inst.Set(ctx, tokenKey(token), strconv.FormatInt(userID, 10), 0)
+}
+
 // Resolve 反查令牌对应的用户 ID；false 表示令牌不存在或已失效。
 //
 // 缓存报错与"查不到"返回同一个 false（不区分）：对调用方而言两者后果一致

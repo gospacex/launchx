@@ -122,8 +122,8 @@ a.Lock() / a.RPCServerOptions()` 取句柄，跨域异步事件用 outbox 落库
 
 | 环节 | 落点 | 做什么 |
 |---|---|---|
-| 落库 | 业务事务内 `tx.Create(&outbox.Event{...})` | 把当前 `traceparent` 随事件行一起持久化 |
-| 投递 | `examples/pkg/outbox/outbox.go` 的 `sendOne` | 从事件行还原上下文，开 `messaging.outbox.send` span |
+| 落库 | 业务事务内 `tx.Create(&outboxx.Event{...})` | 把当前 `traceparent` 随事件行一起持久化 |
+| 投递 | `outboxx` 模块的 `sendOne`（`hubx/outboxx/outbox.go`） | 从事件行还原上下文，开 `messaging.outbox.send` span |
 | 注入 | `mqx.Producer.Send` → `mqx.InjectTrace` | 把当前 span 上下文写进消息 header |
 | 还原 | `mqx.Consumer.Consume` → `mqx.ExtractTrace` | 从 header 还原上下文后再交给业务 handler |
 

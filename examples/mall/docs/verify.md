@@ -22,7 +22,10 @@ Jaeger REST 响应（`GET /api/traces/<traceID>`），不是估算。
 
 ```bash
 export HUBX_DB_PW=hubx123
-docker exec -i mysql mysql -uroot -prootpass < examples/mall/scripts/schema.sql
+# ⚠️ 不要裸灌（`docker exec -i mysql mysql -uroot -prootpass < schema.sql`）：
+# 那份 SQL 里的应用账号口令是 ${HUBX_DB_PW:-...} 占位，重定向不过 shell，
+# 占位会以字面量形式成为口令。schema.sh = 渲染 + 灌 + 用应用账号回连验证。
+MYSQL_ROOT_PW=rootpass bash examples/scripts/schema.sh apply
 bash examples/mall/scripts/topics.sh          # 建四个事件 topic，**别跳过**（见 §4-④）
 
 # 四个终端（或用 run_in_background 的任务），CWD 必须是各自服务目录：

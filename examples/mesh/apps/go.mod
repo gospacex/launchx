@@ -33,6 +33,7 @@ replace (
 	github.com/gospacex/mqx/rabbitmq => ../../../../mqx/rabbitmq
 	github.com/gospacex/mqx/rocketmq => ../../../../mqx/rocketmq
 	github.com/gospacex/otelx => ../../../../otelx
+	github.com/gospacex/outboxx => ../../../../outboxx
 	github.com/gospacex/rpcx => ../../../../rpcx
 	github.com/gospacex/searchx => ../../../../searchx
 	github.com/gospacex/searchx/elasticsearch => ../../../../searchx/elasticsearch
@@ -52,7 +53,8 @@ require (
 	github.com/gospacex/lockx v0.0.0
 	github.com/gospacex/logx v0.0.0
 	github.com/gospacex/mqx v0.0.1
-	github.com/gospacex/otelx v0.0.0-00010101000000-000000000000
+	github.com/gospacex/otelx v0.0.0
+	github.com/gospacex/outboxx v0.0.0
 	github.com/gospacex/traceflag v0.0.0
 	github.com/gospacex/webx v0.0.0-00010101000000-000000000000
 	go.opentelemetry.io/otel v1.46.0
@@ -109,7 +111,7 @@ require (
 	github.com/gospacex/cachex/redis v0.0.0-00010101000000-000000000000 // indirect
 	github.com/gospacex/coordx v0.0.0 // indirect
 	github.com/gospacex/coordx/consul v0.0.0 // indirect
-	github.com/gospacex/dbx v0.0.0-00010101000000-000000000000 // indirect
+	github.com/gospacex/dbx v0.0.0 // indirect
 	github.com/gospacex/kvx/redis v0.0.0-00010101000000-000000000000 // indirect
 	github.com/gospacex/lockx/redis v0.0.0-00010101000000-000000000000 // indirect
 	github.com/gospacex/mongodbx v0.0.0-00010101000000-000000000000 // indirect

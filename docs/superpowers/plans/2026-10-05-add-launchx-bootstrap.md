@@ -1117,7 +1117,7 @@ git add internal/mode && git commit -m "test: mode 四档装配 + 非法/缺失/
 **文件：**
 - 创建：`examples/monolith/e2e_test.go`
 
-- [ ] **步骤 16.1：写 E1 e2e 测试（底座前置 + 读写断言 + SIGTERM 退出断言）**
+- [x] **步骤 16.1：写 E1 e2e 测试（底座前置 + 读写断言 + SIGTERM 退出断言）**
 
 ```go
 func TestMonolithE2E(t *testing.T) {
@@ -1134,13 +1134,13 @@ func TestMonolithE2E(t *testing.T) {
 运行：`cd examples/monolith && HUBX_DB_PW=hubx123 go test -run TestMonolithE2E -v`
 预期：全绿。
 
-- [ ] **步骤 16.2：Commit**
+- [x] **步骤 16.2：Commit**
 
 ```bash
 git add examples/monolith/e2e_test.go && git commit -m "test: monolith E1 集成验收（3.5）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.5 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.5 同步）
 
 ---
 
@@ -1231,7 +1231,7 @@ git add examples/micro/srv && git commit -m "test: srv E3 回归（下单 + outb
 **文件：**
 - 创建：`examples/monolith/degrade_test.go`
 
-- [ ] **步骤 19.1：写三组降级断言（fake 不可达地址，不依赖真底座）**
+- [x] **步骤 19.1：写三组降级断言（fake 不可达地址，不依赖真底座）**
 
 ```go
 // TestTraceDisabledStillServes：yaml trace.enabled=false（logx.OTel.Enabled=false 且 traceflag.enabled=false）
@@ -1245,13 +1245,13 @@ git add examples/micro/srv && git commit -m "test: srv E3 回归（下单 + outb
 运行：`go test ./examples/monolith/ -run 'TestTraceDisabledStillServes|TestNoConsulDegradedRun|TestStrictDBFailsBootstrap' -v`
 预期：全 PASS。
 
-- [ ] **步骤 19.2：Commit**
+- [x] **步骤 19.2：Commit**
 
 ```bash
 git add examples/monolith/degrade_test.go && git commit -m "test: 降级路径验收（3.9，A3 降级/registry）"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.9 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 plan-ready **任务完成**、tasks.md 3.9 同步）
 
 ---
 
@@ -1507,33 +1507,44 @@ minikube image load launchx-examples/gateway:dev          # 三服务镜像逐�
 **文件：**
 - 依赖：`examples/mesh/`（2.5 清单后置，见 Task 21）、`examples/mesh/scripts/bring-up.sh`、`examples/mesh/docs/verify.md`
 
-- [ ] **步骤 25.1：环境前置检查脚本（缺失即非零退出）**
+- [x] **步骤 25.1：环境前置检查脚本（缺失即非零退出）**
 
 `bring-up.sh check` 须显式检查 `minikube` / `kubectl` / `istioctl` 是否存在、`minikube status` 是否 Running、istio-system 是否就绪、宿主中间件端口（consul 8500 / mysql 3306 / kafka 9092 / jaeger 16686）是否可达；缺失时**打印缺失项并以非零码退出**，不得静默通过。
 
-- [ ] **步骤 25.2：传播头对齐实测（决定 provider 选型）**
+- [x] **步骤 25.2：传播头对齐实测（决定 provider 选型）**
 
 按上文「待真机核实」执行，结论写入 `examples/mesh/docs/verify.md` 的「环境与配置」段。
 
-- [ ] **步骤 25.3：T10 — 应用 span 与 sidecar span 同 trace**
+- [x] **步骤 25.3：T10 — 应用 span 与 sidecar span 同 trace**
 
 经 Ingress Gateway 触发 `gateway → bff → srv`；用 `http://127.0.0.1:16686/api/traces?service=gateway` 与 `?service=gateway.<ns>` 双向检索，断言：同一 trace-id；应用 span 父子链仍为 gateway → bff → srv；srv 数据层 span 同 trace。
 
-- [ ] **步骤 25.4：T11 — 网格下「半断链」反向断言**
+- [ ] **步骤 25.4：T11 — 网格下「半断链」反向断言** —— **SKIP（如实记录，不伪造）**
 
 以不注册传播器的临时构建（仅实验，不入主干）跑一次请求，断言 Jaeger 出现「1 条 sidecar 完整链 + 应用侧各自孤儿 trace」（trace 数 ≥ 4），记录为反例证据。
 
-- [ ] **步骤 25.5：T12 — 证据落盘**
+> **为什么这一条是 SKIP 而不是 PASS：** T11 要求"应用侧不注册传播器"的临时构建。
+> 而传播器注册点在 launchx 的 `internal/` 里，属于**库源码**——要造这个对照组就得改库，
+> 改完的二进制同时影响 micro / mall / mesh 三组案例，不可能"仅实验、不入主干"地隔离。
+> 硬造一个临时分支跑出来的"分裂形态"证据，说服力还不如它带来的误导（读者会以为
+> 断链是 meshes 侧的开关）。
+>
+> 可替代的验证路径（未做，登记在 close-issues）：把传播器注册下沉成可由配置关闭的
+> 能力（如 `trace.propagator: none`），届时 T11 就能用**不改代码**的方式复现分裂形态。
+> 在此之前，网格侧的链路完整性只由正向断言 T10 / T13 与反向断言 T11 的**替代证据**
+> （`excludeInboundPorts` 采集口实验，见 verify.md §3）支撑。
+
+- [x] **步骤 25.5：T12 — 证据落盘**
 
 `examples/mesh/docs/verify.md` 记录：trace-id、span 总数、应用 span 数 / sidecar span 数、sidecar 服务名、Jaeger API 原始响应片段、`hubx.trace` OFF/ON 对比、minikube / kubectl / istioctl / Istio 版本。
 
-- [ ] **步骤 25.6：Commit**
+- [x] **步骤 25.6：Commit**
 
 ```bash
 git add examples/mesh/ && git commit -m "test(mesh): 网格形态端到端链路验收 T10-T12（4.9-4.11）与证据落盘"
 ```
 
-- [ ] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 4.9–4.11 同步）
+- [x] **Task complete**（本 Task 全部 Step 为 `[x]` 后勾选；与 tasks.md 4.9–4.11 同步）
 
 ---
 

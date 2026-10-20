@@ -10,7 +10,7 @@
 //
 // 2026-10-10 起同样装配 outbox Runner（此前第三条差异「不带 outbox 表」
 // 是投递可靠性的已知缺口，已在企业级加固中补齐：事件与业务行同事务落库，
-// Runner 后台补发，语义与 examples/pkg/outbox 包注释一致）。
+// Runner 后台补发，语义与 outboxx 包注释一致）。
 package app
 
 import (
@@ -31,7 +31,7 @@ import (
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/handles"
 	orderrpc "github.com/gospacex/launchx/examples/mesh/apps/pkg/kitex_gen/order/order"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/rpcwire"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // Setup 注册给 App.OnSetup。
@@ -77,7 +77,7 @@ func Setup(a *launchx.App) error {
 	// ---- 3. outbox 补发器（先于分层装配，与 micro 同序）----
 	// MQ 生产者经 App.MQ() 取；未装配或降级为 nil 时 Runner 显式 Error 而不是
 	// 静默跳过 —— 那种情况下下单仍在写 status=0 的事件却无人投递，表会无声膨胀。
-	runner := outbox.NewRunner(db, a.MQ(), logger, outbox.Config{
+	runner := outboxx.NewRunner(db, a.MQ(), logger, outboxx.Config{
 		TraceOn: cfg.GetBool("trace.on.mq"),
 	})
 	runner.Start()

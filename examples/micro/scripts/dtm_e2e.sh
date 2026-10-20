@@ -22,7 +22,7 @@
 # 三条纪律（本脚本每处写法都是它们的直接后果）：
 #
 #  1. **变量后面紧跟中文必须写 ${name}**。macOS 自带 bash 3.2 不做多字节识别：
-#     写成「$name紧跟中文」会把变量名并进后面那些字节里 —— set -u 下报
+#     写成「$name 紧跟中文」会把变量名并进后面那些字节里 —— set -u 下报
 #     "unbound variable" 且名字带乱码，不带 -u 则静默展开成空串。两种情况都不
 #     指向真正的原因（e2e.sh 的文件头记着同一个坑）。
 #  2. **没有 || true**。结论只能由退出码给出；把失败吞掉再往下跑，得到的是
@@ -37,6 +37,9 @@ set -euo pipefail
 MICRO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GO_BIN="${GO_BIN:-go}"
 SCHEMA_MICRO_SQL="$MICRO_DIR/scripts/schema-micro.sql"
+# 灌四库 DDL + 建应用账号的唯一入口（渲染占位 + 灌完用应用账号真连一次）。
+# 本脚本不灌它，但要自己核查它灌出来的结果，见 require_base 里的 check。
+SCHEMA_SH="$MICRO_DIR/../../examples/scripts/schema.sh"
 
 GATEWAY="${MICRO_GATEWAY:-http://127.0.0.1:8080}"
 JAEGER="${MICRO_JAEGER:-http://127.0.0.1:16686}"
@@ -265,12 +268,25 @@ require_prereq() {
 }
 
 seed() {
-  # ① 四库基础 DDL **不**由本脚本灌。examples/mall/scripts/schema.sql 里有
-  #    DROP USER IF EXISTS + CREATE USER ... '${MALL_RW_PW:-hubx123}'，不先做
-  #    envsubst 就灌进去，等于把应用账号口令设成字面量 ${MALL_RW_PW:-hubx123}，
-  #    而此刻六进程正在用它连库 —— 那是一次自伤，且症状要到下次重连才出现。
-  #    基础 DDL 与应用账号归 scripts/e2e.sh（它已经处理这件事），本脚本只补
-  #    dtm 侧的增量，职责不重叠。
+  # ① 四库基础 DDL **不**由本脚本灌，归 examples/scripts/schema.sh。
+  #    那份 SQL 里应用账号的口令是 shell 占位：不先渲染就 `<` 进 mysql，
+  #    口令会被设成字面量，而此刻六进程正在用它连库 —— 一次自伤，且症状
+  #    要等到下次重连才暴露。所以这是"谁灌谁负责渲染"的活，本脚本不碰。
+  #
+  # ② 但"上游处理过了"这句话本身不能当作证据 —— 本脚本要求的四张基础表
+  #    是用 **root** 查的（见 require_base），root 说什么都 PASS，它对
+  #    "应用账号连不连得上"这个问题没有发言权。故这里先用应用账号 check 一次，
+  #    把锅甩回正确的那一方：`bash examples/scripts/schema.sh check`。
+  #    这一步的成本是一秒，替代的是一小时 1045 排障。
+  if [ -x "$SCHEMA_SH" ]; then
+    MYSQL_ROOT_PW="${MYSQL_ROOT_PW:-}" HUBX_DB_PW="${HUBX_DB_PW:-}" bash "$SCHEMA_SH" check || {
+      fail "应用账号连不上库：先跑 bash examples/scripts/schema.sh apply 修回来"
+      return 1
+    }
+  else
+    fail "找不到 ${SCHEMA_SH}（四库与应用账号的唯一入口）"
+    return 1
+  fi
   local base_missing=0 t
   for t in stock_db.stocks product_db.product_sales points_db.point_accounts \
            order_db.orders order_db.outbox stock_db.barrier; do

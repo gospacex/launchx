@@ -214,7 +214,7 @@ func TestCreateOrderHappyPathMultiItems(t *testing.T) {
 	if repo.created.OrderNo == "" {
 		t.Fatal("order_no 应已生成")
 	}
-	// outbox 事件体已由 fill 在事务内产出（投递归 outbox.Runner，不在本层；
+	// outbox 事件体已由 fill 在事务内产出（投递归 outboxx.Runner，不在本层；
 	// 本层要钉住的是事件内容本身）。
 	var ev events.OrderCompleted
 	if err := json.Unmarshal([]byte(repo.fillPayload), &ev); err != nil {

@@ -24,8 +24,8 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mall/srv-product/internal/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/outboxx"
 )
 
 // ErrNotFound 无记录（service 层据此翻译成 CodeProductNotFound / CodeCategoryNotFound）
@@ -235,10 +235,10 @@ func (r *ProductRepository) CreateProductTx(ctx context.Context, in CreateProduc
 		}).Error; err != nil {
 			return fmt.Errorf("insert product log: %w", err)
 		}
-		ev := outbox.Event{
+		ev := outboxx.Event{
 			Topic:     "product.created.v1",
 			EventType: "product.created",
-			Status:    outbox.StatusPending,
+			Status:    outboxx.StatusPending,
 		}
 		if in.OutboxFill != nil {
 			ev.Payload, ev.Traceparent = in.OutboxFill(p.ID)

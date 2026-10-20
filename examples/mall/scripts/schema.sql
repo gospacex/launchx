@@ -23,27 +23,37 @@
 -- 纪律：一域一库（product_db / order_db / stock_db / points_db），
 -- 跨域只存 ID，不建跨库外键 —— 外键会把"服务边界"变成"数据库耦合"。
 --
--- 用法（本机 compose 里的 MySQL，账号 mall_rw）：
---   mysql -h127.0.0.1 -P3306 -uroot -p < examples/mall/scripts/schema.sql
+-- 用法（本机 compose 里的 MySQL，应用账号 mall_rw）：
 --
--- 本机没有 mysql 客户端时走容器内执行（compose 的 mysql 服务）：
---   docker exec -i mysql mysql -uroot -prootpass < examples/mall/scripts/schema.sql
--- 验证：docker exec mysql mysql -umall_rw -p"${MALL_RW_PW:-hubx123}" -e "SHOW DATABASES"
+--   ⚠️ 本文件里的口令写成了 `${HUBX_DB_PW:-...}` 占位，**不能直接重定向给
+--   mysql**（`docker exec -i mysql mysql -uroot -prootpass < schema.sql`）。
+--   重定向不经过 shell 展开，占位会被当成口令本身灌进库里：账号照样建成功、
+--   GRANT 照样发、SHOW GRANTS 也正常，唯一症状是应用侧用真口令连得到
+--   ERROR 1045 —— 而 1045 不提"灌库姿势"，于是人去怀疑网络、host 通配符、
+--   MySQL 8 的认证插件，没人想到库里的口令就是那串字面量。本机 2026-10-14
+--   正是这么中招的。
+--
+--   先渲染再灌（渲染要靠调用方，本文件自己展开不了自己）：
+--     · micro 案例：`examples/micro/scripts/e2e.sh` 的 render_schema_sql()
+--       已封装（含"渲染后仍有占位就报错"的断言），跑 e2e.sh 自动走上这条路；
+--     · 手工场景：照抄上面那个函数里的 sed，或看 examples/mall/README.md。
 --
 -- ---------------------------- 口令（仅演示）----------------------------
--- 应用账号 mall_rw 的口令**不再硬编码在本文件里**：下面两处写成
--- `${MALL_RW_PW:-hubx123}`，由 shell 在灌脚本之前展开。
+-- 应用账号 mall_rw 的口令**不硬编码在本文件里**：IDENTIFIED BY 处写成
+-- `${HUBX_DB_PW:-hubx123}`，由**灌脚本的一方**在灌之前展开。
 --
---   ⚠️ 这里的 `hubx123` 是**演示默认值**，不是建议口令。生产环境口令必须走
---   Secret 注入（K8s Secret / Vault / CI 变量），绝不写进仓库，也别靠这里的
---   缺省值兜底 —— 缺省值存在的唯一理由是"本机一遍跑通"。
+--   变量名为什么是 HUBX_DB_PW：跟四服 config.yaml 里 DSN 的占位同名 ——
+--   「建账号」和「连库」是同一件事的两半，用两个不同名字的变量，迟早会喂出
+--   两个不同的值（本机旧版用 MALL_RW_PW 建号、HUBX_DB_PW 连库，就是这么炸的）。
+--   旧名 MALL_RW_PW 仍作为别名兼容，渲染时优先级 MALL_RW_PW > HUBX_DB_PW。
 --
--- 展开方式（二选一，二选一即可，别两种都不做就把脚本灌进 mysql ——
--- 那样账号口令会被设成字面量 `${MALL_RW_PW:-hubx123}`，应用侧连不上）：
---   export MALL_RW_PW='<你的口令>'
---   envsubst < examples/mall/scripts/schema.sql | mysql -h127.0.0.1 -P3306 -uroot -p
---   # 或容器内执行：
---   envsubst < examples/mall/scripts/schema.sql | docker exec -i mysql mysql -uroot -prootpass
+--   ⚠️ 这里的 `hubx123` 是**演示默认值**，不是建议口令。生产口令必须走
+--   Secret 注入（K8s Secret / Vault / CI 变量），绝不写进仓库，也别靠缺省值
+--   兜底 —— 缺省值存在的唯一理由是"本机一遍跑通"。
+--
+-- 灌完后这样验证（比 SHOW GRANTS 有用得多，GRANT 是对的也照样能连不上）：
+--   docker exec mysql mysql -umall_rw -p"${HUBX_DB_PW}" -h127.0.0.1 -N -B -e "SELECT 1"
+--   报 1045 就是上面的展开没做或做错了，不是网络问题。
 -- ============================================================
 
 -- ---------------------------- 应用账号 ----------------------------
@@ -52,7 +62,7 @@
 -- 演示没了。幂等：MySQL 8 没有 CREATE USER IF NOT EXISTS，故先 DROP 再建，
 -- 重跑本脚本不会报 "user already exists"。
 DROP USER IF EXISTS 'mall_rw'@'%';
-CREATE USER 'mall_rw'@'%' IDENTIFIED BY '${MALL_RW_PW:-hubx123}';
+CREATE USER 'mall_rw'@'%' IDENTIFIED BY '${HUBX_DB_PW:-hubx123}';
 GRANT SELECT, INSERT, UPDATE, DELETE ON product_db.* TO 'mall_rw'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON order_db.*  TO 'mall_rw'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON stock_db.*  TO 'mall_rw'@'%';

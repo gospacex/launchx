@@ -37,7 +37,7 @@ import (
 	"github.com/gospacex/dtmx"
 	"github.com/gospacex/launchx/examples/micro/pkg/events"
 	"github.com/gospacex/launchx/examples/micro/srv-order/internal/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // ErrStatusNotAllowed 分支的定位 + 状态判据没命中（订单不存在、属于别的全局事务、
@@ -99,7 +99,7 @@ const (
 	dtmInsertItemSQL = "insert into order_items (order_id, product_id, product_name, quantity, unit_price) values (?, ?, ?, ?, ?)"
 	// 状态流转日志（本域纪律④）。
 	dtmInsertStatusLogSQL = "insert into order_status_log (order_id, from_status, to_status) values (?, ?, ?)"
-	// 事件。列名取自 schema.sql 的 outbox（status=0 即 outbox.StatusPending，
+	// 事件。列名取自 schema.sql 的 outbox（status=0 即 outboxx.StatusPending，
 	// Runner 只挑 status=0 的行）。
 	dtmInsertOutboxSQL = "insert into outbox (topic, event_type, payload, traceparent, status, retry_count) values (?, ?, ?, ?, ?, ?)"
 	// 回读自增主键。**唯一**允许的 SELECT，且不参与任何判据（纪律①的例外），
@@ -350,8 +350,8 @@ func (r *OrderRepository) insertStatusLog(ctx context.Context, tx *sql.Tx, order
 
 // insertOutbox 事件落库（只有建单与确认冻结会走到这里，纪律③）。
 //
-// fill 为 nil 时写空 payload：outbox.Runner 见空 payload 直接放弃该行且不占重试
-// 配额（见 examples/pkg/outbox），语义与 HTTP 面一致。
+// fill 为 nil 时写空 payload：outboxx.Runner 见空 payload 直接放弃该行且不占重试
+// 配额（见 outboxx 包注释），语义与 HTTP 面一致。
 func (r *OrderRepository) insertOutbox(ctx context.Context, tx *sql.Tx, cmd model.DtmOrderCmd, orderID uint64, fill OutboxFill) error {
 	var payload, traceparent string
 	if fill != nil {
@@ -360,7 +360,7 @@ func (r *OrderRepository) insertOutbox(ctx context.Context, tx *sql.Tx, cmd mode
 	if _, err := dtmx.ExecTx(ctx, tx,
 		dtmInsertOutboxSQL, r.traceOn,
 		events.TopicOrderCompleted, dtmOutboxEventType, payload, traceparent,
-		outbox.StatusPending, 0); err != nil {
+		outboxx.StatusPending, 0); err != nil {
 		return fmt.Errorf("dtm 落事件 %s: %w", cmd.OrderNo, err)
 	}
 	return nil

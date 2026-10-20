@@ -45,7 +45,7 @@ func New(svc orderService, traceOn bool) *OrderHandler {
 
 // CreateOrder RPC 入口。这是 `POST /order` 的下游，也是 `order → MQ → points`
 // 异步链的起点：事件与业务行**同事务**落 outbox 表（service/repository 内），
-// 之后由 outbox.Runner 补发到 kafka —— 投递不在请求路径上，本层也不碰 MQ。
+// 之后由 outboxx.Runner 补发到 kafka —— 投递不在请求路径上，本层也不碰 MQ。
 //
 // 用生成的 Get* 取值而非直接读字段：kitex 传进来的 req 可能是 nil（客户端
 // 空请求），getter 对 nil 安全，直接取字段会当场 panic。

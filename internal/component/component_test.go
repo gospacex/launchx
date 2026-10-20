@@ -188,8 +188,9 @@ func TestDBFailureDegradesByDefault(t *testing.T) {
 }
 
 // presence-based：未配置任何中间件段时，八类组件都不构造、不报错、不告警。
+// （debug 伪组件显式关掉，避免宿主机 APP_DEBUG=1 污染本用例的"未配置"语义。）
 func TestPresenceBasedSkip(t *testing.T) {
-	env, w := newTestEnv(t, "service: {name: srv-order, mode: srv}\n")
+	env, w := newTestEnv(t, "service: {name: srv-order, mode: srv}\ndebug: {enabled: false}\n")
 	for _, name := range Names() {
 		if err := Lookup(name)(env); err != nil {
 			t.Fatalf("component %q must be skipped silently when unconfigured: %v", name, err)
@@ -204,9 +205,9 @@ func TestPresenceBasedSkip(t *testing.T) {
 	}
 }
 
-// 八类组件必须都已注册（D1/验收案例 T2–T4 的前提）。
+// 八类中间件组件 + 观测侧 debug 伪组件必须都已注册（D1/验收案例 T2–T4 的前提）。
 func TestAllComponentsRegistered(t *testing.T) {
-	want := []string{"db", "cache", "mq", "kv", "lock", "registry", "search", "mongodb"}
+	want := []string{"db", "cache", "mq", "kv", "lock", "registry", "search", "mongodb", "debug"}
 	got := Names()
 	for _, w := range want {
 		if Lookup(w) == nil {

@@ -10,7 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mesh/apps/internal/srv/order/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // OrderRepository 订单存储。
@@ -76,10 +76,10 @@ func (r *OrderRepository) Create(ctx context.Context, o *model.Order, items []mo
 		}).Error; err != nil {
 			return err
 		}
-		ev := outbox.Event{
+		ev := outboxx.Event{
 			Topic:     "order.completed.v1", // = events.TopicOrderCompleted；repository 不 import 事件包（分层纪律），对账时两处必须一致
 			EventType: "order.completed",
-			Status:    outbox.StatusPending,
+			Status:    outboxx.StatusPending,
 		}
 		if fill != nil {
 			ev.Payload, ev.Traceparent = fill(o.ID)

@@ -29,8 +29,8 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/micro/srv-stock/internal/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/outboxx"
 )
 
 // 库存域哨兵错误（service 层据此翻译成 4xxx 业务码）
@@ -270,10 +270,10 @@ func (r *StockRepository) ReserveTx(ctx context.Context, in ReserveInput) (out *
 		}).Error; err != nil {
 			return fmt.Errorf("insert stock log: %w", err)
 		}
-		ev := outbox.Event{
+		ev := outboxx.Event{
 			Topic:     "stock.reserved.v1",
 			EventType: "stock.reserved",
-			Status:    outbox.StatusPending,
+			Status:    outboxx.StatusPending,
 		}
 		if in.OutboxFill != nil {
 			ev.Payload, ev.Traceparent = in.OutboxFill(rv.ID)

@@ -44,7 +44,7 @@ import (
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/codes"
 	orderpb "github.com/gospacex/launchx/examples/mesh/apps/pkg/kitex_gen/order"
 	"github.com/gospacex/launchx/examples/mesh/apps/pkg/routing"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
+	"github.com/gospacex/outboxx"
 )
 
 // nopLogger 内嵌接口 + 只覆写 Warn：service / route 在这两条路径上只用 Warn。
@@ -300,7 +300,7 @@ func newRpcTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := db.AutoMigrate(
-		&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}, &outbox.Event{},
+		&model.Order{}, &model.OrderItem{}, &model.OrderStatusLog{}, &outboxx.Event{},
 	); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}

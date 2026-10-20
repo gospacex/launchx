@@ -651,3 +651,56 @@ meshConfig 的 extensionProvider 叫 `otel-tracing` 指向 `jaeger.mesh-external
 联网（docker.io 在本机不可达），即使 daemon 本地已有该镜像也**不回退**，必然 timeout。
 已在 `apps/Makefile` 的 image 目标固化为两步：`minikube image load alpine:3.20`
 预载 + `DOCKER_BUILDKIT=0` 走 legacy builder（直接用本地镜像）。
+
+---
+
+## 9. 治理下沉边界核对（2026-10-18，对应验收案例 3.15）
+
+边界总纲：网格只接管 **mTLS / L4 授权 / 连接级可观测 /（可选）注册发现平台化**；
+**配置中心不下沉**；注册发现下沉须以「替换 `Registry` 实现」达成而非删除业务侧调用；
+**Kitex 私有 TCP 下重试 / 超时 / 熔断 / L7 限流 / JWT 鉴权 / 灰度留应用侧，且两侧不得重复开启**（尤指重试）。
+每项「已下沉」结论均能在下方指出应用侧已撤除或已换实现的位置。
+
+### 9.1 mTLS（传输层）— 已下沉
+- 结论：命名空间级 STRICT mTLS 由 Istio 承担，应用侧零代码、零配置。
+- 位置：`deploy/shared/50-peer-authn.yaml:27-33`（`PeerAuthentication` + `mtls.mode: STRICT`）。
+- 边界：`host-middleware` 出向流量不在 STRICT 之内（`:23` 注释），中间件门面本就在宿主侧，不该被网格加密。应用侧无需撤除任何东西——传输层本就不归应用管。
+
+### 9.2 L4 授权（连接级授权）— 已下沉（业务字段级授权仍留应用侧）
+- 结论：基于 ServiceAccount 的 ALLOW 策略由 `AuthorizationPolicy` 承担；它**只看 L4 身份（sa/bff 等）**，看不到业务字段（谁能退谁的款）。
+- 位置：`deploy/apps/50-authz.yaml:16/31/46/61`（四份 `AuthorizationPolicy`，`selector` 单 workload）。
+- 边界：业务字段级鉴权**未被网格替换**，仍由应用侧 `routing.WithRequiredIdentity` 做（见 9.6）。两类授权各管一段，不重复。
+
+### 9.3 连接级可观测 — 已下沉（与应用侧业务指标共存，不冲突）
+- 结论：Envoy 提供连接/L4 级 RED 指标；应用侧仍保留业务语义指标。
+- 位置：应用侧 `rpcx_requests_total{rpc_role="client"}` 等由 rpcx 中间件产出（§7 实测 4/4）；网格侧由 Envoy 自带。
+- 边界：两者维度不同，**不互相取代**；关闭任一侧都不能假设另一侧覆盖（§7.3 已验证应用侧指标没被网格吞掉）。
+
+### 9.4 注册发现平台化 — 已下沉（apps 组用 K8s DNS 替换 coordx/consul）
+- 结论：apps 组**撤除**了应用侧 coordx/consul 注册/发现，改由 K8s Service + Istio EDS 接管——这正是「替换 `Registry` 实现」而非「删除业务侧调用」的落地形态。
+- 位置：
+  - srv 端不注册：`examples/mesh/apps/internal/srv/order/app/setup.go:8`（注释「不注册/不发现，没有 `xmiddleware.coordx` 段，launchx 也不会去注册」）；
+  - bff 端发现走 K8s FQDN：`examples/mesh/apps/internal/bff/downstream/clients.go:84`（`RPCClientOptions` → `service.upstream.<域>` → kitex DNS resolver）；
+  - 配置口径：`examples/mesh/deploy/apps/10-configmap.yaml:12-15`、`:43-49`（「无注册中心段」「服务发现交 K8s Service + Istio EDS」）。
+- 边界：micro 组仍用 coordx/consul 应用侧注册（两种形态并存是设计），下沉与否由形态决定，不是偷偷删调用。
+
+### 9.5 配置中心 — 不下沉
+- 结论：mesh **不介入**应用配置语义；应用配置仍由 configx 本地 yaml（可选 nacos）读取。
+- 位置：`10-configmap.yaml` 虽以 ConfigMap 分发业务配置，但只是**文件挂载**（subPath 挂 `/app/conf/<svc>.yaml`），configx 按本地文件读，**无动态下发/热更新**；与 micro 组的「回环→集群名」换算差异也说明它只是静态分发副本，不是配置中心。
+- 边界：不要把「ConfigMap 文件挂载」误读成「网格配置中心」——后者在本案例不存在，应用配置主权仍在 configx。
+
+### 9.6 Kitex 私有 TCP 治理 — 留应用侧，且不与网格重复开启
+bff→srv 这一跳走 Kitex TTHeader/TCP，Envoy 只按 `tcp_proxy` 处理，拿不到 L7 语义，故以下治理**必须**留在应用侧：
+
+- **JWT / 身份鉴权（应用侧，网格看不到业务字段）**：`bff/app/setup.go:152-163`（`routing.WithRequiredIdentity` + 令牌播种，闸门只在 `auth.require` 打开时装）；配置侧 `bff.yaml:97-113` 明确记载「曾经想把身份下沉给 Istio RequestAuthentication，但本示例无真实 issuer+JWKS，那个防护不存在，现在关在应用侧」。
+- **L7 限流（应用侧补 Envoy 短板）**：入口 `webx.rate_limit_rps/burst`（`bff.yaml:69-70`）；bff→srv 跳因 Envoy 无法 L7 限流，由 `kvx` 原子 Incr 在 route middleware 做计数（`srv-points.yaml:289-293`、`srv-product.yaml:381-382` 注释：缺 kvx 是 fail-open 静默放行，故这一处治理应用侧独担）。
+- **重试 / 超时 / 熔断 / 负载均衡（rpcx 出向治理，应用侧）**：`bff.yaml:117-144`（`xmiddleware.rpcx`）。
+  - **「未与网格重复开启」的铁证**：`retry.enabled: false`（`:129-140` 注释——本链有非幂等写，且一旦网格侧 VirtualService 也开 HTTP 跳重试，故障期双侧重试互相放大；故应用侧刻意关重试，把重试的开关权留给「唯一一处」）。
+  - 熔断 `circuit_breaker.enabled: true`（错误率 0.5 / 最小样本 200）；LB 闭集 `weighted_random`，**不给** `consistent_hash`（需业务 key 函数，配了会全打同一实例）。
+- **超时**：入口 `webx.timeout: 5s`（`bff.yaml:68`）、RPC 缺省 3s（rpcx），均应用侧。
+- **灰度**：本案例未启用；若启用须应用侧（mesh 的流量切分是 L4/L7 路由级，与本处 Kitex 私有跳无交集），不在此冲突。
+
+### 9.7 边界守门（防回潮）
+- 配置侧：`bring-up.sh check` 跑 grep 判据「`conf/` 里搜不到注册中心驱动段」——防止有人把 coordx 段悄悄加回 apps（`bff.yaml:44-45`）。
+- 代码侧：`dependency_surface_test.go` 锁死 launchx 库源码零 `cloudwego/*` 直引；`rpcx` 治理只在 `mode` 装配期权读 `Env`，不污染库源码（5.14 已固化）。
+- 文档侧：本 §9 与 `10-configmap.yaml` 头注、`bff.yaml` 注释三处口径一致，任一被改回「网格接管 X」须同步更新另两处。

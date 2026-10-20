@@ -194,7 +194,7 @@
 - 验证方式：`go test ./internal/mode/ -v` 全绿
 
 ### Task 18: monolith 集成验收（验收案例 E1）
-- [ ] **任务完成**（与 superpowers plan `Task 18`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 18`、`tasks.md` 对应条目同步勾选） <!-- 已实现: TestE1MonolithServesMySQLThenExitsGracefully 等 4 组用例，2026-10-18 复跑全绿（含 docker exec 直查 mysql 复核落库） -->
 - 目标：e2e 测试（`examples/monolith/e2e_test.go`，参考 webx/examples/e2e_test.go）：启动 App → GET/POST /orders 断言分层响应 → 发送 SIGTERM/调用 Close 断言优雅退出
 - 改动文件：`examples/monolith/e2e_test.go`
 - 验证方式：`go test ./examples/monolith/ -v` 全绿
@@ -218,7 +218,7 @@
 - 验证方式：(a) 全绿为必达；(b) 若本地无 minikube+Istio 环境，记录「环境未执行」到 verify.md，不阻塞 close
 
 ### Task 22: 降级路径验收（验收案例 A3 降级/registry）
-- [ ] **任务完成**（与 superpowers plan `Task 22`、`tasks.md` 对应条目同步勾选）
+- [x] **任务完成**（与 superpowers plan `Task 22`、`tasks.md` 对应条目同步勾选） <!-- 已实现: examples/monolith/degrade_test.go 五组用例（ES/Mongo/redis/consul 不可达 + strict 即退），2026-10-18 复跑全绿；函数名与计划原文不同，见下方偏差记录 -->
 - 目标：`trace.enabled=false` 启动 monolith+micro 各一次断言正常服务与退出；停掉 consul 启动断言 Warn 带病运行可服务；strict.db=true + 无 mysql 断言 Bootstrap 返回 `init db` error
 - 改动文件：`launchx_test.go` 或 `examples/*/degrade_test.go`
 - 验证方式：`go test ./... -run Degrade` 全绿

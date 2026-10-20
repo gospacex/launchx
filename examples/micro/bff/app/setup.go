@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/cloudwego/kitex/client"
 	"github.com/gospacex/configx"
@@ -286,9 +285,14 @@ func installAuth(engine *webx.App, a *launchx.App, cfg configx.Config, logger lo
 	// 成为一根孤儿单 span trace —— 正是 Jaeger 里最容易被读成"链路断了"的噪声。
 	// 关的是组件级开关，播完立刻还原为原值（不是写死 true，避免把"全局关埋点"
 	// 的部署悄悄打开）。
+	//
+	// ⚠️ 这里必须是 SeedDemoToken（不带 TTL），不能用 GrantToken(..., time.Hour)：
+	// 静态凭据一过 TTL 就会让六条业务路由全部 401，而 "invalid token" 这个报错
+	// 会让人去查"凭据是不是配错了"，方向恰好错反（本机 2026-10-18 实测）。
+	// 需要时效的是 Gate 签发的票据，不是这条播种常量。
 	before := traceflag.EnabledFor("cachex")
 	traceflag.SetComponent("cachex", false)
-	err := store.GrantToken(context.Background(), token, cfg.GetInt64("demo.seed_user_id"), time.Hour)
+	err := store.SeedDemoToken(context.Background(), token, cfg.GetInt64("demo.seed_user_id"))
 	traceflag.SetComponent("cachex", before)
 	if err != nil {
 		return fmt.Errorf("bff: seed demo token failed: %w", err)

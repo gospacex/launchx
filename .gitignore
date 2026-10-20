@@ -9,3 +9,6 @@ examples/**/bin/
 .claude/
 .omc/
 .sddflow/
+
+# 会话代理运行时残留
+.freebuff/

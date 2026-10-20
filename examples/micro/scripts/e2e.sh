@@ -37,6 +37,9 @@ GO_BIN="${GO_BIN:-$HOME/sdk/go1.24.3/bin/go}"
 DOCKER_BIN="${DOCKER_BIN:-/Applications/Docker.app/Contents/Resources/bin/docker}"
 COMPOSE_FILE="${COMPOSE_FILE:-/Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml}"
 SCHEMA_SQL="$REPO_ROOT/examples/mall/scripts/schema.sql"
+# 灌四库 DDL 与建应用账号的唯一入口（含"占位必须展开"的渲染与验证）：
+# 别的文件不要再各自实现一遍，也不要绕开它直接 `< schema.sql`。
+SCHEMA_SH="$REPO_ROOT/examples/scripts/schema.sh"
 # micro 自有的 DDL 补丁：共用 schema.sql 是 mall 案例的资产，micro 侧的约束
 #（库存预占流水唯一键）只加在自己这份里，见该文件头注释。
 SCHEMA_MICRO_SQL="$MICRO_DIR/scripts/schema-micro.sql"
@@ -156,13 +159,32 @@ mysql_exec() {
   fi
 }
 
+# ------------------------------------------------------------
+# 四库 DDL + 应用账号：**必须**经 examples/scripts/schema.sh 灌，不能裸灌。
+#
+# 那份 SQL 里应用账号的口令写成 shell 占位 ${HUBX_DB_PW:-...}，而重定向
+# 不经过 shell 展开 —— `mysql < schema.sql` 会把占位当成口令本身灌进去：
+# 账号建成功、GRANT 也发了、SHOW GRANTS 一切正常，唯一症状是应用侧带着
+# "每天都在用的那个口令"来连得到 ERROR 1045，而 1045 只说"访问被拒"，
+# 一句不提灌库姿势（本机 2026-10-14 中招，排障排到 host 通配符上去）。
+#
+# schema.sh 的三道防线就是为这件事存在的：渲染占位 → 灌 → **灌完立刻用应用
+# 账号真连一次**。这里不再自己实现一遍（曾经两处各写一份，改了一处漏了另一处）。
+# ------------------------------------------------------------
 seed() {
+  if [ ! -f "$SCHEMA_SH" ]; then
+    fail "找不到：$SCHEMA_SH"
+    return 1
+  fi
   if [ ! -f "$SCHEMA_SQL" ]; then
     fail "找不到 schema.sql：$SCHEMA_SQL"
     return 1
   fi
-  log "灌种子：$(basename "$SCHEMA_SQL")（四库 DDL + outbox 同构表，幂等）"
-  mysql_exec <"$SCHEMA_SQL" >/dev/null
+
+  log "灌种子：$(basename "$SCHEMA_SQL")（四库 DDL + 应用账号，经 schema.sh 渲染）"
+  MYSQL_ROOT_PW="${MYSQL_ROOT_PW:?请设置 MYSQL_ROOT_PW（mysql root 口令）}" \
+  HUBX_DB_PW="${APP_PW}" \
+    bash "$SCHEMA_SH" apply || return 1
 
   # micro 自有的 DDL 补丁：库存预占流水的 (order_no, product_id) 唯一键。
   # 不并进上面的共用 schema.sql —— 那是 mall 案例的资产，且唯一键属于 micro
@@ -314,13 +336,22 @@ assert_metrics() {
 main() {
   mkdir -p "$WORKDIR/log" "$WORKDIR/bin"
 
+  # 应用账号口令要在 require_base / seed **之前**就定下来：灌 schema.sql 的
+  # 时候要用它替换 CREATE USER 那句的占位（渲染），起六进程的时候要用它展开
+  # config.yaml 里 DSN 的 ${HUBX_DB_PW} —— 两处必须是同一个值。
+  # 旧写法把 export 放在 seed 之后，于是灌库那一步根本没有可用口令，
+  # 只能裸灌，占位原样进了 mysql（本机实测：mall_rw 的口令变成字面量
+  # `${...}`，四服一起 1045，而报错里完全看不出是灌库姿势的问题）。
+  local app_pw="${MALL_RW_PW:-}"
+  if [ -z "$app_pw" ]; then
+    app_pw="${HUBX_DB_PW:?请设置 HUBX_DB_PW（应用账号 mall_rw 的口令，灌库与起进程必须是同一个值）}"
+  fi
+  export APP_PW="$app_pw"
+  export HUBX_DB_PW="$app_pw"
+
   require_base
   seed
 
-  # 应用账号口令（注入 config.yaml 的 ${HUBX_DB_PW} 占位）：从环境取、缺省即报错。
-  # 给默认值 hubx123 的旧写法会让"口令没配"这件事静默过去 —— 连上的是哪个库
-  # 全凭运气，排障时看不出来。
-  export HUBX_DB_PW="${HUBX_DB_PW:?请设置 HUBX_DB_PW（应用账号 mall_rw 的口令）}"
   export CGO_ENABLED=0
 
   # 四个域服：90xx 是 kitex RPC 端口；业务数据都在各自私有库里。

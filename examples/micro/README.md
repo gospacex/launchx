@@ -38,19 +38,33 @@ dtm（[dtm-labs/dtm](https://github.com/dtm-labs/dtm)）承担两条分布式事
 写成 `grpc://…` 会让 dtm 的 `dtmdriver.ParseServerMethod` 直接报错，且失败只出现在
 dtm server 日志里 —— 编排与业务侧都看不到线索。
 
-**起停 dtm**：
+**起停 dtm**（原为手 `docker run` + `$(go env GOPATH)/bin/dtm` 进程式，
+2026-10-14 起正式收编进底座 compose）：
 
 ```bash
-export MYSQL_PWD=<底座 mysql root 口令>
-docker exec -i -e MYSQL_PWD mysql mysql -uroot \
-  -e "CREATE DATABASE IF NOT EXISTS dtm_db DEFAULT CHARACTER SET utf8mb4;"
-# 事务表 DDL：官方 sqls/dtmsvr.storage.mysql.sql，去掉 CREATE DATABASE 行、库前缀 dtm.→dtm_db.
-STORE_DRIVER=mysql STORE_HOST=127.0.0.1 STORE_PORT=3306 STORE_USER=root \
-  STORE_PASSWORD="$MYSQL_PWD" STORE_DB=dtm_db $(go env GOPATH)/bin/dtm
+docker compose -f /Users/hyx/work/gowork/src/hubx/dockers/docker-compose.yml up -d dtm
 ```
 
-健康判据：日志里 `recovered panic` 计数必须为 0（dtm **不会**自建事务表，不灌 DDL
-就会持续 panic 报 `Table 'dtm_db.trans_global' doesn't exist`）。
+一次 in place 的两件事都由 compose 负责（别再手工做，做了也容易漏一半）：
+
+1. `dtm-db-init`（一次性容器）：建 `dtm_db` 并灌
+   `dockers/dtm-sql/dtmsvr.mysql.sql`（幂等）。**dtm 不会自建事务表** —— 在一个
+   全新空库上起 dtm，它每 3 秒 recover 一次 `Table 'dtm_db.trans_global'
+   doesn't exist` 继续活着（实测 20 分钟 328 次 panic），端口照样监听、HTTP
+   照样应答 `newGid`，看上去完全正常，可一条事务也登记不进去。
+2. `dtm`：官方镜像，HTTP 36789 / gRPC 36790，`STORE_DB=dtm_db`。
+
+健康判据：日志里 `recovered panic` 计数必须为 0 ——
+`docker logs dtm 2>&1 | grep -c "recovered panic"`。
+**容器 healthy / 端口通都不算数**：缺表时那些也全是绿的。
+
+⚠️ **dtm 进了容器之后，分支回调地址不能写 `127.0.0.1`**（见下方"为什么"）。
+`examples/micro/bff/config.yaml` 的 `dtm.branches.*` 现在是
+`host.docker.internal:904x`：容器里它解析到宿主的 docker 入口 IP 并被转回宿主
+loopback，宿主上它自身也解析成 `127.0.0.1` —— 两种形态共用一份配置。
+写回 `127.0.0.1` 的症状极难发现：事务登记成功（有 gid、有 `submitted` 行），
+但八个分支全停在 `prepared`、`finish_time` 为 NULL，dtm 每 10s 重试一次却永远
+借不到宿主进程。这与 Kafka advertised `127.0.0.1:9092` 是同一个坑。
 
 **验收脚本**：`bash examples/micro/scripts/dtm_e2e.sh`（三段：Saga 正向 / Saga 补偿 /
 TCC 二阶段；Want/Observed 分离、退出码即结论、每段带反向探针）。
@@ -64,6 +78,85 @@ TCC 二阶段；Want/Observed 分离、退出码即结论、每段带反向探�
   且不报错。
 
 `examples/micro/srv`（`demo-srv`，9013）同属 srv 档，采集口是 `127.0.0.1:9030`。
+
+### 1ter. 两条事务线的业务 / 入口 / 分层函数全貌
+
+以下两张对照表回答「每种模式的业务是谁、从哪个入口进、bff 到各域服的
+路由与函数怎么落」，行号以 2026-10 代码为准（漂移时以符号名为准查文件）。
+
+**A. Saga 线（`POST /api/order`）**
+
+业务：下单跨四域最终一致——商品加销量 → 订单建单（三表事务 + outbox）→
+库存扣减 → 积分扣减；任一分支失败由 dtm 逆序补偿
+（ReduceSales → CancelOrder → Release → Refund），四库回基线，正向与补偿
+**同一条 trace**（补偿 span 带 `biz.compensation=true`）。
+
+| 层 | 入口 | 地址/服务名 |
+|---|---|---|
+| 网关 | `POST /api/order`（剥 `/api` 前缀） | `demo-gateway` 8080 |
+| bff 路由 | `POST /order`（`bff/app/setup.go:159` 注册） | `demo-bff` 8081 |
+| 分支面 | `host.docker.internal:904x`（dtm 回调，不走网关） | 四域 9041–9044 |
+| 事务中枢 | dtm server，库 `dtm_db` | 容器 `dtm` |
+
+bff 内部分层：
+
+| 层 | 函数 |
+|---|---|
+| handler | `bff/internal/handler/mall.go:210 (MallHandler) PlaceOrder`（开 span、身份只取鉴权） |
+| 预检 | `bff/internal/downstream/clients.go:78 (Downstream) GetProduct`（kitex 调 product 9021，商品在架才提交） |
+| 编排 | `bff/internal/dtm/saga.go:452 (Orchestrator) Submit`（`branchPlan` :370 定四分支；`JoinBranchURL` :516 拼 URL；`NewGRPCSaga` :532 提交，响应带 `dtm_gid`） |
+
+四域分支面（`internal/dtm/busi_server.go` 入口开 `rpc.dtm.<域>.<方法>` span，traceparent 由 dtm 传入 payload 恢复）：
+
+| 域 | 分支入口（action / compensate） | service（`internal/service/dtm_*.go`） | repository（`internal/repository/dtmstore.go`） |
+|---|---|---|---|
+| stock | `Deduct`(:72) / `Release`(:77) | `DtmDeduct` / `:52 DtmRelease` | `:107 DtmDeduct` / `:122 DtmRelease`（冻结列 + barrier） |
+| order | `CreateOrder`(:68) / `CancelOrder`(:73) | `DtmCreateOrder` / `:61 DtmCancelOrder` | `:129 DtmCreateOrder`（三表事务 + outbox，`:329 insertItems` `:355 insertOutbox`）/ `:176 DtmCancelOrder` |
+| product | `AddSales`(:101) / `ReduceSales`(:106) | `:47 DtmAddSales` / `:62 DtmReduceSales` | `:121 DtmAddSales` / `:146 DtmReduceSales`（`:186 classifyReduceMiss` 判空补偿） |
+| points | `Debit`(:82) / `Refund`(:87) | `:30 DtmDebit` / `:40 DtmRefund` | `:166 DtmBranchStore.Debit` / `:194 Refund`（barrier 幂等 + `:318 insertLedger`） |
+
+**B. TCC 线（`POST /api/presale/lock`）**
+
+业务：预售锁单——Try（库存可售→冻结、建 `presale_locked` 占位单**不写 outbox**、
+积分扣冻结）→ Confirm（冻结→实扣、占位单转 `paid`、**此刻才写 outbox**）；
+任一步失败 Cancel 逆序撤掉，三域冻结归零、占位单零残留。商品域无冻结语义，
+**不参与**（`tcc.go:378 tccBranchPlan` 只读 stock/points/order 三键，9041 配了也不被 TCC 读）。
+
+| 层 | 入口 | 地址/服务名 |
+|---|---|---|
+| 网关 | `POST /api/presale/lock` | `demo-gateway` 8080 |
+| bff 路由 | `POST /presale/lock`（`bff/app/setup.go:168` 注册，bff 侧**不带** `/api`） | `demo-bff` 8081 |
+| 分支面 | 9043 / 9042 / 9044（三域；9041 不用） | demo-stock / demo-order / demo-points |
+| 事务中枢 | dtm server，库 `dtm_db`（`trans_type='tcc'`） | 容器 `dtm` |
+
+bff 内部分层：
+
+| 层 | 函数 |
+|---|---|
+| handler | `bff/internal/handler/presale.go:96 (PresaleHandler) Lock`（零参 400 不落数据；预检在 :124 调 `clients.go:78 GetProduct`） |
+| 编排 | `bff/internal/dtm/tcc.go:472 (TCCOrchestrator) Lock`（`LockCmd.Validate` :277；`GlobalTCC` :116 登记三域 Try；Confirm/Cancel 由 dtm 驱动，bff 不发） |
+
+三域分支面（Try → Confirm → Cancel）：
+
+| 域 | 分支入口（`busi_server.go`） | service | repository |
+|---|---|---|---|
+| stock | `TryFreeze`(:82) / `ConfirmFreeze`(:87) / `CancelFreeze`(:92) | `dtm_stock.go:60/:68/:80` | `:133/:144/:159 Dtm*Freeze`（可售→冻结→实扣） |
+| points | `TryFreeze`(:97) / `ConfirmFreeze` / `CancelFreeze`（:102 附近） | `dtm_points.go:47/:54/:61` | `:226/:246/:271` 同名三方法 |
+| order | `TryPlace`(:78) / `ConfirmFreeze`(:83) / `CancelFreeze`(:88) | `dtm_order.go:69 DtmTryPlace` / `:77 DtmConfirmFreeze` / `:90 DtmCancelFreeze` | `:200 DtmTryPlace`（不写 outbox）/ `:236 DtmConfirmFreeze`（转 paid 写 outbox）/ `:281 DtmCancelFreeze` |
+
+**两线对照**
+
+| | Saga | TCC |
+|---|---|---|
+| bff 入口 | `POST /order` → `PlaceOrder` + `saga.go:Submit` | `POST /presale/lock` → `Lock` + `tcc.go:Lock` |
+| 参与域 | 四域（product 也进） | 三域（stock/points/order） |
+| 分支方法对 | action/compensate（Deduct↔Release、CreateOrder↔CancelOrder、AddSales↔ReduceSales、Debit↔Refund） | Try/Confirm/Cancel（stock/points 的 `*Freeze` 三件 + order 的 TryPlace） |
+| 数据语义 | 实扣，靠逆序补偿回退 | 先冻结，Confirm 实扣 / Cancel 原样退回 |
+| outbox 时机 | `DtmCreateOrder` 分支落 | `DtmConfirmFreeze` 分支才落 |
+
+两条线的分支数据操作都经 `分支面入口（rpc.dtm.*）→ service → repository（dbx 句柄，
+db.* span）` 入 Jaeger 链，按 `biz.dtm.gid` tag 可整条召回；验收口径与 trace
+样例见 `scripts/dtm_e2e.sh` 与 §4。
 
 ## 2. 分层链（每个域服内部）
 
@@ -180,7 +273,11 @@ for d in product order stock points; do (cd srv-$d && go run ./cmd &); done
 (cd gateway && go run ./cmd &)
 ```
 
-建表用 `examples/mall/scripts/schema.sql`（四库 DDL + outbox 同构表）。
+建表用 `examples/mall/scripts/schema.sql`（四库 DDL + outbox 同构表），且**必须经
+`bash examples/scripts/schema.sh apply` 灌** —— 那份 SQL 里的应用账号口令是占位符，
+重定向喂给 mysql 客户端不会经过 shell 展开，占位会被当成口令本身写进库里；
+症状是六进程一起 ERROR 1045，而报错只说「凭据无效」，看不出是灌库姿势的问题
+（`examples/micro/scripts/e2e.sh` 与 `dtm_e2e.sh` 都已经走这个入口）。
 
 ## 6. 纪律
 

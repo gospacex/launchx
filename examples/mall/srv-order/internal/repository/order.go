@@ -26,8 +26,8 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/gospacex/launchx/examples/mall/srv-order/internal/model"
-	"github.com/gospacex/launchx/examples/pkg/outbox"
 	"github.com/gospacex/otelx/layer"
+	"github.com/gospacex/outboxx"
 )
 
 // ErrNotFound 无记录（service 层据此翻译成 CodeOrderNotFound）
@@ -295,10 +295,10 @@ func (r *OrderRepository) CreateOrderTx(ctx context.Context, in CreateOrderInput
 				return fmt.Errorf("insert order items: %w", err)
 			}
 		}
-		ev := outbox.Event{
+		ev := outboxx.Event{
 			Topic:     "order.completed.v1",
 			EventType: "order.completed",
-			Status:    outbox.StatusPending,
+			Status:    outboxx.StatusPending,
 		}
 		if in.OutboxFill != nil {
 			ev.Payload, ev.Traceparent = in.OutboxFill(o.ID)
